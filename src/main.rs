@@ -355,6 +355,14 @@ async fn execute_commands(
                     continue;
                 }
 
+                // Force sidebar to exactly 30 columns (join-pane -l can drift)
+                let _ = tmux
+                    .send_command(&format!(
+                        "resize-pane -t {} -x 30",
+                        model.sidebar_pane_id
+                    ))
+                    .await;
+
                 // Focus sidebar pane
                 let _ = tmux
                     .send_command(&format!("select-pane -t {}", model.sidebar_pane_id))
@@ -409,6 +417,14 @@ async fn execute_commands(
                         model.sidebar_pane_id, orig_window
                     );
                     let _ = tmux.send_command(&join_cmd).await;
+
+                    // Force sidebar to exactly 30 columns
+                    let _ = tmux
+                        .send_command(&format!(
+                            "resize-pane -t {} -x 30",
+                            model.sidebar_pane_id
+                        ))
+                        .await;
 
                     // Switch back to original window
                     model.ignore_next_window_change = true;
@@ -490,6 +506,14 @@ async fn execute_commands(
                     queue.push_front(Cmd::Render);
                     continue;
                 }
+
+                // Force sidebar to exactly 30 columns (join-pane -l can drift)
+                let _ = tmux
+                    .send_command(&format!(
+                        "resize-pane -t {} -x 30",
+                        model.sidebar_pane_id
+                    ))
+                    .await;
 
                 // Find new home pane (any pane in the target window that isn't the sidebar)
                 let pane_list = tmux
