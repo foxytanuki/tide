@@ -64,11 +64,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
 fn handle_cursor_up(model: &mut Model) -> Vec<Cmd> {
     if let Some(prev) = prev_visible_item(&model.flat_items, model.cursor) {
         model.cursor = prev;
-        let mut cmds = vec![Cmd::Render];
-        if let Some(info) = model.selected_window_info() {
-            cmds.insert(0, Cmd::SelectWindow { id: info.id.clone() });
-        }
-        cmds
+        vec![Cmd::Render]
     } else {
         vec![]
     }
@@ -77,11 +73,7 @@ fn handle_cursor_up(model: &mut Model) -> Vec<Cmd> {
 fn handle_cursor_down(model: &mut Model) -> Vec<Cmd> {
     if let Some(next) = next_visible_item(&model.flat_items, model.cursor) {
         model.cursor = next;
-        let mut cmds = vec![Cmd::Render];
-        if let Some(info) = model.selected_window_info() {
-            cmds.insert(0, Cmd::SelectWindow { id: info.id.clone() });
-        }
-        cmds
+        vec![Cmd::Render]
     } else {
         vec![]
     }

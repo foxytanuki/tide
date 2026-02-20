@@ -52,10 +52,41 @@ impl Drop for TerminalGuard {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // If inside tmux but not already in a sidebar pane, re-launch as split
+    if env::var("TMUX").is_ok() && env::var("TMUXIDE_SIDEBAR").is_err() {
+        let exe = env::current_exe()
+            .unwrap_or_else(|_| "tmuxide".into())
+            .display()
+            .to_string();
+        let args: Vec<String> = env::args().skip(1).collect();
+        let mut inner_cmd = format!("TMUXIDE_SIDEBAR=1 {exe}");
+        for arg in &args {
+            inner_cmd.push(' ');
+            inner_cmd.push_str(arg);
+        }
+        let status = std::process::Command::new("tmux")
+            .args(["split-window", "-hb", "-l", "30", "--", "sh", "-c", &inner_cmd])
+            .status();
+        std::process::exit(status.map(|s| s.code().unwrap_or(0)).unwrap_or(1));
+    }
+
+    // Debug log for startup diagnostics (remove once stable)
+    let dbg = |msg: &str| {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/tmuxide.log")
+        {
+            let _ = writeln!(f, "[{:?}] {}", std::time::Instant::now(), msg);
+        }
+    };
+
     let session_name = match env::args().nth(1) {
         Some(s) if !s.trim().is_empty() => s,
         _ => detect_session_name().await,
     };
+    dbg(&format!("session: {session_name}"));
 
     install_panic_hook();
     enable_raw_mode()?;
@@ -68,10 +99,14 @@ async fn main() -> Result<()> {
 
     let mut model = Model::new(session_name.clone());
 
+    dbg("connecting to tmux...");
     let mut tmux = match TmuxControl::new(&session_name).await {
-        Ok(t) => t,
+        Ok(t) => {
+            dbg("tmux control connected");
+            t
+        }
         Err(err) => {
-            eprintln!("failed to start tmux control for session '{session_name}': {err}");
+            dbg(&format!("tmux control failed: {err}"));
             return Err(err);
         }
     };
@@ -79,27 +114,36 @@ async fn main() -> Result<()> {
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<Event>();
     spawn_input_thread(ui_tx);
 
+    dbg("calling list_windows...");
     let startup_cmds = match tmux.list_windows().await {
-        Ok(windows) => update(&mut model, Msg::WindowListLoaded(windows)),
+        Ok(windows) => {
+            dbg(&format!("list_windows ok: {} windows", windows.len()));
+            update(&mut model, Msg::WindowListLoaded(windows))
+        }
         Err(err) => {
+            dbg(&format!("list_windows failed: {err}"));
             model.error_message = Some(format!("initial list_windows failed: {err}"));
             vec![Cmd::Render]
         }
     };
 
     if !execute_commands(&mut model, &mut tmux, &mut terminal, startup_cmds).await {
+        dbg("startup commands requested quit");
         tmux.shutdown().await;
         return Ok(());
     }
+    dbg("entering main loop");
 
     loop {
         if model.should_quit {
+            dbg("should_quit is true");
             break;
         }
 
         tokio::select! {
             maybe_ui = ui_rx.recv() => {
                 let Some(evt) = maybe_ui else {
+                    dbg("ui channel closed");
                     break;
                 };
 
@@ -118,10 +162,12 @@ async fn main() -> Result<()> {
 
             maybe_tmux = tmux.event_stream().recv() => {
                 let Some(tmux_event) = maybe_tmux else {
+                    dbg("tmux event stream closed");
                     model.error_message = Some("tmux event stream closed".to_string());
                     let _ = terminal.draw(|f| render(&model, f));
                     break;
                 };
+                dbg(&format!("tmux event: {:?}", tmux_event));
 
                 let cmds = match tmux_event {
                     TmuxEvent::WindowAdd(id) => update(&mut model, Msg::WindowAdded(id)),

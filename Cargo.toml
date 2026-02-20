@@ -10,3 +10,4 @@ tokio = { version = "1", features = ["full"] }
 tui-tree-widget = "0.22"
 unicode-width = "0.2"
 anyhow = "1"
+libc = "0.2"

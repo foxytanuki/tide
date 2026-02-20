@@ -1,10 +1,11 @@
 use std::collections::VecDeque;
+use std::os::unix::io::FromRawFd;
 use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::io::AsyncWriteExt;
+use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, Duration};
 
@@ -12,7 +13,7 @@ use super::parser::{parse_control_marker, parse_line, ControlMarker};
 use super::WindowInfo;
 
 pub struct TmuxControl {
-    stdin: ChildStdin,
+    stdin: tokio::fs::File,
     events: mpsc::Receiver<super::TmuxEvent>,
     waiters: Arc<Mutex<VecDeque<oneshot::Sender<Result<String>>>>>,
     child: Child,
@@ -21,26 +22,102 @@ pub struct TmuxControl {
 
 impl TmuxControl {
     pub async fn new(session: &str) -> Result<Self> {
+        let (pty_master, pty_slave) =
+            open_pty().context("failed to allocate pty for tmux control mode")?;
+
+        // tmux gets the pty slave for stdin, stdout, and stderr
+        // so control mode output goes through the tty
+        let slave_stdin = pty_slave.try_clone().context("dup pty slave for stdin")?;
+        let slave_stdout = pty_slave.try_clone().context("dup pty slave for stdout")?;
+
         let mut child = Command::new("tmux")
             .arg("-CC")
             .arg("attach")
             .arg("-t")
             .arg(session)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .env_remove("TMUX")
+            .stdin(Stdio::from(slave_stdin))
+            .stdout(Stdio::from(slave_stdout))
+            .stderr(Stdio::from(pty_slave))
             .spawn()
             .with_context(|| format!("failed to spawn tmux -CC attach -t {session}"))?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("failed to capture tmux stdin"))?;
+        // Give the child a moment to fail (e.g. bad session name)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Some(status) = child.try_wait()? {
+            // Try to read error output from pty master
+            let mut err_buf = [0u8; 1024];
+            let err_msg = {
+                use std::io::Read;
+                let mut master_clone = pty_master.try_clone().unwrap_or_else(|_| {
+                    // fallback: just use the master directly (we'll lose it but we're erroring out)
+                    unsafe { std::fs::File::from_raw_fd(-1) }
+                });
+                // Set non-blocking for this read so we don't hang
+                unsafe {
+                    let flags = libc::fcntl(master_clone.as_raw_fd(), libc::F_GETFL);
+                    libc::fcntl(
+                        master_clone.as_raw_fd(),
+                        libc::F_SETFL,
+                        flags | libc::O_NONBLOCK,
+                    );
+                }
+                use std::os::unix::io::AsRawFd;
+                match master_clone.read(&mut err_buf) {
+                    Ok(n) => String::from_utf8_lossy(&err_buf[..n]).trim().to_string(),
+                    Err(_) => String::new(),
+                }
+            };
+            return Err(anyhow!(
+                "tmux -CC exited immediately ({}): {}",
+                status,
+                if err_msg.is_empty() {
+                    "no output"
+                } else {
+                    &err_msg
+                }
+            ));
+        }
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("failed to capture tmux stdout"))?;
+        // Split pty master into reader and writer
+        let master_for_write = pty_master.try_clone().context("dup pty master for write")?;
+        let master_for_read = pty_master;
+
+        let stdin = tokio::fs::File::from_std(master_for_write);
+
+        // Spawn a blocking thread to read lines from the pty master
+        let (line_tx, mut line_rx) = mpsc::channel::<String>(512);
+        std::thread::Builder::new()
+            .name("tmux-reader".into())
+            .spawn(move || {
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(master_for_read);
+                let mut reader = reader;
+                let mut buf = Vec::<u8>::new();
+
+                loop {
+                    buf.clear();
+                    match reader.read_until(b'\n', &mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if matches!(buf.last(), Some(b'\n')) {
+                                buf.pop();
+                            }
+                            if matches!(buf.last(), Some(b'\r')) {
+                                buf.pop();
+                            }
+
+                            let line = String::from_utf8_lossy(&buf).into_owned();
+                            if line_tx.blocking_send(line).is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+            })
+            .context("failed to spawn tmux reader thread")?;
 
         let (event_tx, event_rx) = mpsc::channel::<super::TmuxEvent>(256);
         let waiters: Arc<Mutex<VecDeque<oneshot::Sender<Result<String>>>>> =
@@ -48,27 +125,17 @@ impl TmuxControl {
 
         let waiters_for_task = Arc::clone(&waiters);
         let reader_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout).lines();
             let mut in_progress: Option<String> = None;
 
             loop {
-                let line = match reader.next_line().await {
-                    Ok(Some(line)) => line,
-                    Ok(None) => break,
-                    Err(err) => {
-                        let _ = event_tx
-                            .send(super::TmuxEvent::Error(format!(
-                                "failed to read tmux control output: {err}"
-                            )))
-                            .await;
-                        break;
-                    }
+                let line = match line_rx.recv().await {
+                    Some(line) => line,
+                    None => break,
                 };
 
                 if let Some(marker) = parse_control_marker(&line) {
                     match marker {
                         ControlMarker::Begin => {
-                            // If already in a block, resolve the old waiter with error
                             if let Some(old_data) = in_progress.take() {
                                 let mut waiters = waiters_for_task.lock().await;
                                 if let Some(waiter) = waiters.pop_front() {
@@ -84,8 +151,6 @@ impl TmuxControl {
                             let is_error = matches!(marker, ControlMarker::ErrorEnd);
                             match in_progress.take() {
                                 Some(data) => {
-                                    // Resolve the oldest pending waiter (FIFO)
-                                    // Skip cancelled waiters (rx dropped due to timeout)
                                     let mut waiters = waiters_for_task.lock().await;
                                     while let Some(waiter) = waiters.pop_front() {
                                         let result = if is_error {
@@ -102,8 +167,6 @@ impl TmuxControl {
                                             Ok(data.clone())
                                         };
 
-                                        // If send succeeds, the waiter was alive. Done.
-                                        // If send fails, rx was dropped (timeout). Skip to next.
                                         if waiter.send(result).is_ok() {
                                             break;
                                         }
@@ -111,7 +174,6 @@ impl TmuxControl {
                                 }
                                 None => {
                                     // Unsolicited %end/%error (e.g., from attach init)
-                                    // Silently discard
                                 }
                             }
                         }
@@ -128,14 +190,12 @@ impl TmuxControl {
                     continue;
                 }
 
-                // Non-% lines: accumulate inside a begin/end block
                 if let Some(data) = in_progress.as_mut() {
                     data.push_str(&line);
                     data.push('\n');
                 }
             }
 
-            // Resolve any remaining waiters with errors
             let mut waiters = waiters_for_task.lock().await;
             while let Some(waiter) = waiters.pop_front() {
                 let _ = waiter.send(Err(anyhow!("tmux control stream closed")));
@@ -180,11 +240,7 @@ impl TmuxControl {
         match timeout(Duration::from_secs(5), rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(anyhow!("tmux command response channel closed")),
-            Err(_) => {
-                // Timeout — rx is dropped, reader will skip this waiter's tx
-                // (send will fail → reader pops next live waiter)
-                Err(anyhow!("timed out waiting for tmux response"))
-            }
+            Err(_) => Err(anyhow!("timed out waiting for tmux response")),
         }
     }
 
@@ -225,6 +281,51 @@ impl Drop for TmuxControl {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
         self.reader_task.abort();
+    }
+}
+
+/// Allocate a pty pair with raw mode (no echo, no output processing).
+/// Returns (master, slave) as std Files.
+fn open_pty() -> Result<(std::fs::File, std::fs::File)> {
+    unsafe {
+        let master_fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        if master_fd < 0 {
+            anyhow::bail!("posix_openpt: {}", std::io::Error::last_os_error());
+        }
+
+        if libc::grantpt(master_fd) != 0 {
+            libc::close(master_fd);
+            anyhow::bail!("grantpt: {}", std::io::Error::last_os_error());
+        }
+
+        if libc::unlockpt(master_fd) != 0 {
+            libc::close(master_fd);
+            anyhow::bail!("unlockpt: {}", std::io::Error::last_os_error());
+        }
+
+        let slave_name = libc::ptsname(master_fd);
+        if slave_name.is_null() {
+            libc::close(master_fd);
+            anyhow::bail!("ptsname: {}", std::io::Error::last_os_error());
+        }
+
+        let slave_fd = libc::open(slave_name, libc::O_RDWR | libc::O_NOCTTY);
+        if slave_fd < 0 {
+            libc::close(master_fd);
+            anyhow::bail!("open pty slave: {}", std::io::Error::last_os_error());
+        }
+
+        // Set raw mode: no echo, no signals, no output processing
+        let mut tio: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave_fd, &mut tio) == 0 {
+            libc::cfmakeraw(&mut tio);
+            libc::tcsetattr(slave_fd, libc::TCSANOW, &tio);
+        }
+
+        Ok((
+            std::fs::File::from_raw_fd(master_fd),
+            std::fs::File::from_raw_fd(slave_fd),
+        ))
     }
 }
 
