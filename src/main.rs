@@ -88,7 +88,13 @@ async fn main() -> Result<()> {
             .display()
             .to_string();
         let args: Vec<String> = env::args().skip(1).collect();
-        let mut inner_cmd = format!("TMUXIDE_SIDEBAR=1 {exe}");
+        let mut inner_cmd = String::from("TMUXIDE_SIDEBAR=1");
+        if let Ok(log) = env::var("TMUXIDE_LOG") {
+            inner_cmd.push_str(" TMUXIDE_LOG=");
+            inner_cmd.push_str(&log);
+        }
+        inner_cmd.push(' ');
+        inner_cmd.push_str(&exe);
         for arg in &args {
             inner_cmd.push(' ');
             inner_cmd.push_str(arg);
@@ -136,6 +142,12 @@ async fn main() -> Result<()> {
             return Err(err);
         }
     };
+
+    // Exclude control client from window sizing calculations.
+    // "no-output" flag tells tmux this client doesn't display output,
+    // so it should be ignored for window-size decisions (tmux 3.2+).
+    // Falls back silently on older tmux versions.
+    let _ = tmux.send_command("refresh-client -f no-output").await;
 
     // Detect sidebar pane, its window, and sibling (home) pane
     let sidebar_pane_id = env::var("TMUX_PANE").unwrap_or_default();
@@ -331,10 +343,29 @@ async fn execute_commands(
                     } => (original_window_id.clone(), original_home_pane_id.clone()),
                 };
 
+                // Suppress session-window-changed events from join-pane + select-window
+                model.ignore_window_changes = 2;
+                let source_window = model.sidebar_window_id.clone();
+                remember_window_layout_without_sidebar(model, tmux, &target_window_id).await;
+
+                // Anchor join target to a concrete pane in the destination window
+                // so tmux doesn't pick different targets and slowly mutate layout.
+                let target_home = choose_home_pane_in_window(
+                    tmux,
+                    &target_window_id,
+                    &model.sidebar_pane_id,
+                )
+                .await;
+                let join_target = if target_home.is_empty() {
+                    target_window_id.clone()
+                } else {
+                    target_home.clone()
+                };
+
                 // Move sidebar to target window
                 let join_cmd = format!(
-                    "join-pane -dfhb -l 30 -s {} -t {}",
-                    model.sidebar_pane_id, target_window_id
+                    "join-pane -dfhb -s {} -t {}",
+                    model.sidebar_pane_id, join_target
                 );
                 if let Err(err) = tmux.send_command(&join_cmd).await {
                     warn!(%err, "preview join-pane failed");
@@ -342,9 +373,9 @@ async fn execute_commands(
                     queue.push_front(Cmd::Render);
                     continue;
                 }
+                restore_window_layout_without_sidebar(model, tmux, &source_window).await;
 
                 // Switch active window to target
-                model.ignore_next_window_change = true;
                 if let Err(err) = tmux
                     .send_command(&format!("select-window -t {}", target_window_id))
                     .await
@@ -355,35 +386,31 @@ async fn execute_commands(
                     continue;
                 }
 
-                // Force sidebar to exactly 30 columns (join-pane -l can drift)
-                let _ = tmux
-                    .send_command(&format!(
-                        "resize-pane -t {} -x 30",
-                        model.sidebar_pane_id
-                    ))
-                    .await;
-
                 // Focus sidebar pane
                 let _ = tmux
                     .send_command(&format!("select-pane -t {}", model.sidebar_pane_id))
                     .await;
 
-                // Update home_pane_id to a pane in the target window
-                let pane_list = tmux
-                    .send_command(&format!(
-                        "list-panes -t {} -F '#{{pane_id}}'",
-                        target_window_id
-                    ))
-                    .await
-                    .unwrap_or_default();
-                let new_home = pane_list
-                    .lines()
-                    .map(|l| l.trim())
-                    .find(|l| !l.is_empty() && *l != model.sidebar_pane_id)
-                    .unwrap_or("")
-                    .to_string();
+                // Keep the original anchor pane as home when possible.
+                let new_home = if !target_home.is_empty() {
+                    target_home
+                } else {
+                    choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id).await
+                };
                 if !new_home.is_empty() {
                     model.home_pane_id = new_home.clone();
+                }
+
+                // Force sidebar to exactly 30 columns LAST — after select-window
+                // and select-pane, which can trigger layout recalculation
+                if let Err(err) = tmux
+                    .send_command(&format!(
+                        "resize-pane -t {} -x 30",
+                        model.sidebar_pane_id
+                    ))
+                    .await
+                {
+                    warn!(%err, "preview resize-pane failed");
                 }
 
                 debug!(
@@ -411,23 +438,26 @@ async fn execute_commands(
 
                     debug!(orig_window = %orig_window, "restoring preview");
 
-                    // Move sidebar back to original window
-                    let join_cmd = format!(
-                        "join-pane -dfhb -l 30 -s {} -t {}",
-                        model.sidebar_pane_id, orig_window
-                    );
-                    let _ = tmux.send_command(&join_cmd).await;
+                    // Suppress session-window-changed events from join-pane + select-window
+                    model.ignore_window_changes = 2;
+                    let source_window = model.sidebar_window_id.clone();
+                    remember_window_layout_without_sidebar(model, tmux, &orig_window).await;
 
-                    // Force sidebar to exactly 30 columns
-                    let _ = tmux
-                        .send_command(&format!(
-                            "resize-pane -t {} -x 30",
-                            model.sidebar_pane_id
-                        ))
-                        .await;
+                    // Move sidebar back to original window
+                    let join_cmd_by_home = format!(
+                        "join-pane -dfhb -s {} -t {}",
+                        model.sidebar_pane_id, orig_home
+                    );
+                    if tmux.send_command(&join_cmd_by_home).await.is_err() {
+                        let join_cmd_by_window = format!(
+                            "join-pane -dfhb -s {} -t {}",
+                            model.sidebar_pane_id, orig_window
+                        );
+                        let _ = tmux.send_command(&join_cmd_by_window).await;
+                    }
+                    restore_window_layout_without_sidebar(model, tmux, &source_window).await;
 
                     // Switch back to original window
-                    model.ignore_next_window_change = true;
                     let _ = tmux
                         .send_command(&format!("select-window -t {}", orig_window))
                         .await;
@@ -436,6 +466,18 @@ async fn execute_commands(
                     let _ = tmux
                         .send_command(&format!("select-pane -t {}", model.sidebar_pane_id))
                         .await;
+
+                    // Force sidebar to exactly 30 columns LAST — select-window
+                    // triggers layout recalculation that can override earlier resize
+                    if let Err(err) = tmux
+                        .send_command(&format!(
+                            "resize-pane -t {} -x 30",
+                            model.sidebar_pane_id
+                        ))
+                        .await
+                    {
+                        warn!(%err, "restore resize-pane failed");
+                    }
 
                     model.sidebar_window_id = orig_window;
                     model.home_pane_id = orig_home;
@@ -498,10 +540,27 @@ async fn execute_commands(
 
                 info!(target = %target_window_id, "following to window");
 
+                // Suppress session-window-changed events triggered by join-pane
+                model.ignore_window_changes = 2;
+                let source_window = model.sidebar_window_id.clone();
+                remember_window_layout_without_sidebar(model, tmux, &target_window_id).await;
+
+                let target_home = choose_home_pane_in_window(
+                    tmux,
+                    &target_window_id,
+                    &model.sidebar_pane_id,
+                )
+                .await;
+                let join_target = if target_home.is_empty() {
+                    target_window_id.clone()
+                } else {
+                    target_home.clone()
+                };
+
                 // Move sidebar pane to the new window (left split, 30 cols, don't focus)
                 let join_cmd = format!(
-                    "join-pane -dfhb -l 30 -s {} -t {}",
-                    model.sidebar_pane_id, target_window_id
+                    "join-pane -dfhb -s {} -t {}",
+                    model.sidebar_pane_id, join_target
                 );
                 if let Err(err) = tmux.send_command(&join_cmd).await {
                     warn!(%err, "follow join-pane failed");
@@ -509,32 +568,27 @@ async fn execute_commands(
                     queue.push_front(Cmd::Render);
                     continue;
                 }
+                restore_window_layout_without_sidebar(model, tmux, &source_window).await;
 
-                // Force sidebar to exactly 30 columns (join-pane -l can drift)
-                let _ = tmux
+                let new_home = if !target_home.is_empty() {
+                    target_home
+                } else {
+                    choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id).await
+                };
+
+                if !new_home.is_empty() {
+                    model.home_pane_id = new_home;
+                }
+
+                // Force sidebar to exactly 30 columns LAST
+                if let Err(err) = tmux
                     .send_command(&format!(
                         "resize-pane -t {} -x 30",
                         model.sidebar_pane_id
                     ))
-                    .await;
-
-                // Find new home pane (any pane in the target window that isn't the sidebar)
-                let pane_list = tmux
-                    .send_command(&format!(
-                        "list-panes -t {} -F '#{{pane_id}}'",
-                        target_window_id
-                    ))
                     .await
-                    .unwrap_or_default();
-                let new_home = pane_list
-                    .lines()
-                    .map(|l| l.trim())
-                    .find(|l| !l.is_empty() && *l != model.sidebar_pane_id)
-                    .unwrap_or("")
-                    .to_string();
-
-                if !new_home.is_empty() {
-                    model.home_pane_id = new_home;
+                {
+                    warn!(%err, "follow resize-pane failed");
                 }
 
                 debug!(
@@ -543,6 +597,17 @@ async fn execute_commands(
                     "follow complete"
                 );
                 model.sidebar_window_id = target_window_id;
+            }
+            Cmd::EnsureSidebarWidth => {
+                if let Err(err) = tmux
+                    .send_command(&format!(
+                        "resize-pane -t {} -x 30",
+                        model.sidebar_pane_id
+                    ))
+                    .await
+                {
+                    warn!(%err, "ensure resize-pane failed");
+                }
             }
             Cmd::ListWindows => match tmux.list_windows().await {
                 Ok(windows) => {
@@ -594,6 +659,89 @@ async fn detect_session_name() -> String {
             }
         }
         _ => "main".to_string(),
+    }
+}
+
+async fn choose_home_pane_in_window(
+    tmux: &mut TmuxControl,
+    window_id: &str,
+    sidebar_pane_id: &str,
+) -> String {
+    let pane_list = tmux
+        .send_command(&format!(
+            "list-panes -t {} -F '#{{pane_id}}\t#{{pane_active}}'",
+            window_id
+        ))
+        .await
+        .unwrap_or_default();
+
+    let mut first_non_sidebar = String::new();
+    for line in pane_list.lines() {
+        let mut parts = line.split('\t');
+        let pane_id = parts.next().unwrap_or("").trim();
+        let active = parts.next().unwrap_or("").trim();
+        if pane_id.is_empty() || pane_id == sidebar_pane_id {
+            continue;
+        }
+        if first_non_sidebar.is_empty() {
+            first_non_sidebar = pane_id.to_string();
+        }
+        if active == "1" {
+            return pane_id.to_string();
+        }
+    }
+
+    first_non_sidebar
+}
+
+async fn read_window_layout(tmux: &mut TmuxControl, window_id: &str) -> Option<String> {
+    if window_id.is_empty() {
+        return None;
+    }
+    let out = tmux
+        .send_command(&format!(
+            "display-message -t {} -p '#{{window_layout}}'",
+            window_id
+        ))
+        .await
+        .ok()?;
+    let layout = out.trim();
+    if layout.is_empty() {
+        None
+    } else {
+        Some(layout.to_string())
+    }
+}
+
+async fn remember_window_layout_without_sidebar(
+    model: &mut Model,
+    tmux: &mut TmuxControl,
+    window_id: &str,
+) {
+    if let Some(layout) = read_window_layout(tmux, window_id).await {
+        model
+            .layout_without_sidebar_by_window
+            .insert(window_id.to_string(), layout);
+    }
+}
+
+async fn restore_window_layout_without_sidebar(
+    model: &Model,
+    tmux: &mut TmuxControl,
+    window_id: &str,
+) {
+    let Some(layout) = model.layout_without_sidebar_by_window.get(window_id) else {
+        return;
+    };
+    if let Err(err) = tmux
+        .send_command(&format!(
+            "select-layout -t {} {}",
+            window_id,
+            quote_tmux(layout)
+        ))
+        .await
+    {
+        warn!(%err, window = window_id, layout = %layout, "restore window layout failed");
     }
 }
 

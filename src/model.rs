@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::tree::{flatten, get_node, FlatItem, TreeNode, WindowInfo};
 
 pub struct Model {
@@ -14,7 +16,10 @@ pub struct Model {
     pub home_pane_id: String,
     pub sidebar_window_id: String,
     pub preview: PreviewState,
-    pub ignore_next_window_change: bool,
+    pub layout_without_sidebar_by_window: HashMap<String, String>,
+    /// Number of session-window-changed events to suppress.
+    /// join-pane and select-window can each trigger events; set to 2 to absorb both.
+    pub ignore_window_changes: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +58,8 @@ impl Model {
             home_pane_id,
             sidebar_window_id,
             preview: PreviewState::Home,
-            ignore_next_window_change: false,
+            layout_without_sidebar_by_window: HashMap::new(),
+            ignore_window_changes: 0,
         }
     }
 

@@ -36,16 +36,20 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         Msg::RenameWindow => handle_rename_window(model),
         Msg::CloseWindow => handle_close_window(model),
         Msg::WindowFocusChanged(window_id) => {
-            if model.ignore_next_window_change {
-                model.ignore_next_window_change = false;
-                return vec![];
+            if model.ignore_window_changes > 0 {
+                model.ignore_window_changes -= 1;
+                return vec![Cmd::EnsureSidebarWidth];
             }
             if window_id == model.sidebar_window_id {
-                return vec![];
+                return vec![Cmd::EnsureSidebarWidth];
             }
             // User explicitly switched windows; clear preview state
             model.preview = PreviewState::Home;
-            vec![Cmd::FollowToWindow { window_id }, Cmd::ListWindows]
+            vec![
+                Cmd::FollowToWindow { window_id },
+                Cmd::EnsureSidebarWidth,
+                Cmd::ListWindows,
+            ]
         }
         Msg::WindowAdded(_) | Msg::WindowClosed(_) | Msg::WindowRenamed(_, _) => {
             vec![Cmd::ListWindows]
