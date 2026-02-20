@@ -56,7 +56,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         Msg::Tick => vec![],
         Msg::Quit => {
             model.should_quit = true;
-            vec![Cmd::Quit]
+            vec![Cmd::RestorePreview, Cmd::Quit]
         }
     }
 }
@@ -64,7 +64,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
 fn handle_cursor_up(model: &mut Model) -> Vec<Cmd> {
     if let Some(prev) = prev_visible_item(&model.flat_items, model.cursor) {
         model.cursor = prev;
-        vec![Cmd::Render]
+        preview_current_item(model)
     } else {
         vec![]
     }
@@ -73,9 +73,18 @@ fn handle_cursor_up(model: &mut Model) -> Vec<Cmd> {
 fn handle_cursor_down(model: &mut Model) -> Vec<Cmd> {
     if let Some(next) = next_visible_item(&model.flat_items, model.cursor) {
         model.cursor = next;
-        vec![Cmd::Render]
+        preview_current_item(model)
     } else {
         vec![]
+    }
+}
+
+/// Preview: if cursor is on a window, swap its pane into the right slot.
+fn preview_current_item(model: &Model) -> Vec<Cmd> {
+    if let Some(info) = model.selected_window_info() {
+        vec![Cmd::PreviewWindow { id: info.id.clone() }, Cmd::Render]
+    } else {
+        vec![Cmd::Render]
     }
 }
 
@@ -96,7 +105,7 @@ fn handle_select_item(model: &mut Model) -> Vec<Cmd> {
         FlatNodeKind::Window => {
             if let Some(info) = model.selected_window_info() {
                 vec![
-                    Cmd::SelectWindow { id: info.id.clone() },
+                    Cmd::PreviewWindow { id: info.id.clone() },
                     Cmd::FocusRightPane,
                 ]
             } else {

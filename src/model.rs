@@ -9,6 +9,11 @@ pub struct Model {
     pub input_buffer: String,
     pub should_quit: bool,
     pub error_message: Option<String>,
+    // Preview state
+    pub sidebar_pane_id: String,
+    pub home_pane_id: String,
+    pub sidebar_window_id: String,
+    pub preview: PreviewState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,8 +23,22 @@ pub enum Mode {
     ConfirmClose { window_id: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewState {
+    Home,
+    Previewing {
+        window_id: String,
+        swapped_pane_id: String,
+    },
+}
+
 impl Model {
-    pub fn new(session_name: String) -> Self {
+    pub fn new(
+        session_name: String,
+        sidebar_pane_id: String,
+        home_pane_id: String,
+        sidebar_window_id: String,
+    ) -> Self {
         Self {
             tree: Vec::new(),
             flat_items: Vec::new(),
@@ -29,6 +48,10 @@ impl Model {
             input_buffer: String::new(),
             should_quit: false,
             error_message: None,
+            sidebar_pane_id,
+            home_pane_id,
+            sidebar_window_id,
+            preview: PreviewState::Home,
         }
     }
 

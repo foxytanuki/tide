@@ -181,18 +181,20 @@ impl TmuxControl {
                     continue;
                 }
 
+                // If inside a response block, all non-marker lines are response data
+                if let Some(data) = in_progress.as_mut() {
+                    data.push_str(&line);
+                    data.push('\n');
+                    continue;
+                }
+
+                // Outside a response block, %-prefixed lines are events
                 if line.starts_with('%') {
                     if let Some(event) = parse_line(&line) {
                         if event_tx.send(event).await.is_err() {
                             break;
                         }
                     }
-                    continue;
-                }
-
-                if let Some(data) = in_progress.as_mut() {
-                    data.push_str(&line);
-                    data.push('\n');
                 }
             }
 

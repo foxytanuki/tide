@@ -1,7 +1,8 @@
 #[derive(Debug, Clone)]
 pub enum Cmd {
-    // tmux commands
-    SelectWindow { id: String },
+    // Preview: swap target window's pane into right slot
+    PreviewWindow { id: String },
+    RestorePreview,
     FocusRightPane,
     NewWindow { name: String },
     RenameWindow { id: String, name: String },
