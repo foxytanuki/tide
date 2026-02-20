@@ -11,3 +11,5 @@ tui-tree-widget = "0.22"
 unicode-width = "0.2"
 anyhow = "1"
 libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

@@ -21,6 +21,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
 
 use crate::cmd::Cmd;
 use crate::model::Model;
@@ -30,6 +31,34 @@ use crate::update::update;
 use crate::view::render;
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
+
+fn init_logging() {
+    use std::sync::Mutex;
+    use tracing_subscriber::EnvFilter;
+
+    let log_val = match env::var("TMUXIDE_LOG") {
+        Ok(v) => v,
+        Err(_) => return, // logging disabled
+    };
+
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/tmuxide.log")
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let filter = EnvFilter::try_new(&log_val).unwrap_or_else(|_| EnvFilter::new("debug"));
+
+    tracing_subscriber::fmt()
+        .with_writer(Mutex::new(file))
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_target(false)
+        .init();
+}
 
 fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
@@ -79,23 +108,13 @@ async fn main() -> Result<()> {
         std::process::exit(status.map(|s| s.code().unwrap_or(0)).unwrap_or(1));
     }
 
-    // Debug log for startup diagnostics (remove once stable)
-    let dbg = |msg: &str| {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/tmuxide.log")
-        {
-            let _ = writeln!(f, "[{:?}] {}", std::time::Instant::now(), msg);
-        }
-    };
+    init_logging();
 
     let session_name = match env::args().nth(1) {
         Some(s) if !s.trim().is_empty() => s,
         _ => detect_session_name().await,
     };
-    dbg(&format!("session: {session_name}"));
+    info!(session = %session_name, "starting tmuxide");
 
     install_panic_hook();
     enable_raw_mode()?;
@@ -106,21 +125,21 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    dbg("connecting to tmux...");
+    debug!("connecting to tmux control mode");
     let mut tmux = match TmuxControl::new(&session_name).await {
         Ok(t) => {
-            dbg("tmux control connected");
+            info!("tmux control connected");
             t
         }
         Err(err) => {
-            dbg(&format!("tmux control failed: {err}"));
+            error!(%err, "tmux control failed");
             return Err(err);
         }
     };
 
     // Detect sidebar pane, its window, and sibling (home) pane
     let sidebar_pane_id = env::var("TMUX_PANE").unwrap_or_default();
-    dbg(&format!("sidebar_pane_id: {sidebar_pane_id}"));
+    debug!(sidebar_pane_id, "detected sidebar pane");
 
     let sidebar_window_id = tmux
         .send_command(&format!(
@@ -129,7 +148,7 @@ async fn main() -> Result<()> {
         .await
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
-    dbg(&format!("sidebar_window_id: {sidebar_window_id}"));
+    debug!(sidebar_window_id, "detected sidebar window");
 
     let pane_list = tmux
         .send_command(&format!(
@@ -143,7 +162,7 @@ async fn main() -> Result<()> {
         .find(|l| !l.is_empty() && *l != sidebar_pane_id)
         .unwrap_or("")
         .to_string();
-    dbg(&format!("home_pane_id: {home_pane_id}"));
+    debug!(home_pane_id, "detected home pane");
 
     let mut model = Model::new(
         session_name.clone(),
@@ -160,36 +179,36 @@ async fn main() -> Result<()> {
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<Event>();
     spawn_input_thread(ui_tx);
 
-    dbg("calling list_windows...");
+    debug!("loading initial window list");
     let startup_cmds = match tmux.list_windows().await {
         Ok(windows) => {
-            dbg(&format!("list_windows ok: {} windows", windows.len()));
+            info!(count = windows.len(), "loaded windows");
             update(&mut model, Msg::WindowListLoaded(windows))
         }
         Err(err) => {
-            dbg(&format!("list_windows failed: {err}"));
+            error!(%err, "initial list_windows failed");
             model.error_message = Some(format!("initial list_windows failed: {err}"));
             vec![Cmd::Render]
         }
     };
 
     if !execute_commands(&mut model, &mut tmux, &mut terminal, startup_cmds).await {
-        dbg("startup commands requested quit");
+        info!("startup commands requested quit");
         tmux.shutdown().await;
         return Ok(());
     }
-    dbg("entering main loop");
+    info!("entering main loop");
 
     loop {
         if model.should_quit {
-            dbg("should_quit is true");
+            debug!("should_quit is true, exiting");
             break;
         }
 
         tokio::select! {
             maybe_ui = ui_rx.recv() => {
                 let Some(evt) = maybe_ui else {
-                    dbg("ui channel closed");
+                    warn!("ui channel closed");
                     break;
                 };
 
@@ -208,12 +227,12 @@ async fn main() -> Result<()> {
 
             maybe_tmux = tmux.event_stream().recv() => {
                 let Some(tmux_event) = maybe_tmux else {
-                    dbg("tmux event stream closed");
+                    warn!("tmux event stream closed");
                     model.error_message = Some("tmux event stream closed".to_string());
                     let _ = terminal.draw(|f| render(&model, f));
                     break;
                 };
-                dbg(&format!("tmux event: {:?}", tmux_event));
+                debug!(?tmux_event, "received tmux event");
 
                 let cmds = match tmux_event {
                     TmuxEvent::WindowAdd(id) => update(&mut model, Msg::WindowAdded(id)),
@@ -238,6 +257,7 @@ async fn main() -> Result<()> {
 
     let _ = tmux.send_command("unbind-key f").await;
     tmux.shutdown().await;
+    info!("tmuxide shut down");
     Ok(())
 }
 
@@ -286,6 +306,7 @@ async fn execute_commands(
                 } = model.preview
                 {
                     if target_window_id == *original_window_id {
+                        debug!(target = %target_window_id, "preview target is original, restoring");
                         queue.push_front(Cmd::Render);
                         queue.push_front(Cmd::RestorePreview);
                         continue;
@@ -296,6 +317,8 @@ async fn execute_commands(
                 if target_window_id == model.sidebar_window_id {
                     continue;
                 }
+
+                debug!(target = %target_window_id, "previewing window");
 
                 // Record original state if starting fresh preview
                 let (orig_window, orig_home) = match &model.preview {
@@ -314,6 +337,7 @@ async fn execute_commands(
                     model.sidebar_pane_id, target_window_id
                 );
                 if let Err(err) = tmux.send_command(&join_cmd).await {
+                    warn!(%err, "preview join-pane failed");
                     model.error_message = Some(format!("preview join-pane: {err}"));
                     queue.push_front(Cmd::Render);
                     continue;
@@ -325,6 +349,7 @@ async fn execute_commands(
                     .send_command(&format!("select-window -t {}", target_window_id))
                     .await
                 {
+                    warn!(%err, "preview select-window failed");
                     model.error_message = Some(format!("preview select-window: {err}"));
                     queue.push_front(Cmd::Render);
                     continue;
@@ -350,8 +375,15 @@ async fn execute_commands(
                     .unwrap_or("")
                     .to_string();
                 if !new_home.is_empty() {
-                    model.home_pane_id = new_home;
+                    model.home_pane_id = new_home.clone();
                 }
+
+                debug!(
+                    sidebar_window = %target_window_id,
+                    home_pane = %model.home_pane_id,
+                    orig_window = %orig_window,
+                    "preview active"
+                );
 
                 model.sidebar_window_id = target_window_id;
                 model.preview = PreviewState::Previewing {
@@ -368,6 +400,8 @@ async fn execute_commands(
                 {
                     let orig_window = original_window_id.clone();
                     let orig_home = original_home_pane_id.clone();
+
+                    debug!(orig_window = %orig_window, "restoring preview");
 
                     // Move sidebar back to original window
                     let join_cmd = format!(
@@ -393,22 +427,27 @@ async fn execute_commands(
                 }
             }
             Cmd::FocusRightPane => {
-                // select-pane -R: focus the pane to the right of the active (sidebar) pane
+                debug!("focusing right pane");
                 if let Err(err) = tmux.send_command("select-pane -R").await {
+                    warn!(%err, "select-pane -R failed");
                     model.error_message = Some(format!("select-pane: {err}"));
                     queue.push_front(Cmd::Render);
                 }
             }
             Cmd::NewWindow { name } => {
+                debug!(name, "creating new window");
                 let new_cmd = format!("new-window -d -n {}", quote_tmux(&name));
                 if let Err(err) = tmux.send_command(&new_cmd).await {
+                    warn!(%err, "new-window failed");
                     model.error_message = Some(format!("new-window: {err}"));
                     queue.push_front(Cmd::Render);
                 }
             }
             Cmd::RenameWindow { id, name } => {
+                debug!(id, name, "renaming window");
                 let cmd_str = format!("rename-window -t {} {}", id, quote_tmux(&name));
                 if let Err(err) = tmux.send_command(&cmd_str).await {
+                    warn!(%err, "rename-window failed");
                     model.error_message = Some(format!("rename-window: {err}"));
                     queue.push_front(Cmd::Render);
                 }
@@ -417,13 +456,16 @@ async fn execute_commands(
                 // If sidebar is in the window being closed, restore preview first
                 if let crate::model::PreviewState::Previewing { .. } = &model.preview {
                     if model.sidebar_window_id == id {
+                        debug!(id, "closing previewed window, restoring first");
                         queue.push_front(Cmd::CloseWindow { id });
                         queue.push_front(Cmd::RestorePreview);
                         continue;
                     }
                 }
+                debug!(id, "closing window");
                 let cmd_str = format!("kill-window -t {id}");
                 if let Err(err) = tmux.send_command(&cmd_str).await {
+                    warn!(%err, "kill-window failed");
                     model.error_message = Some(format!("kill-window: {err}"));
                     queue.push_front(Cmd::Render);
                 }
@@ -435,12 +477,15 @@ async fn execute_commands(
                     continue;
                 }
 
+                info!(target = %target_window_id, "following to window");
+
                 // Move sidebar pane to the new window (left split, 30 cols, don't focus)
                 let join_cmd = format!(
                     "join-pane -dfhb -l 30 -s {} -t {}",
                     model.sidebar_pane_id, target_window_id
                 );
                 if let Err(err) = tmux.send_command(&join_cmd).await {
+                    warn!(%err, "follow join-pane failed");
                     model.error_message = Some(format!("follow join-pane: {err}"));
                     queue.push_front(Cmd::Render);
                     continue;
@@ -465,16 +510,23 @@ async fn execute_commands(
                     model.home_pane_id = new_home;
                 }
 
+                debug!(
+                    sidebar_window = %target_window_id,
+                    home_pane = %model.home_pane_id,
+                    "follow complete"
+                );
                 model.sidebar_window_id = target_window_id;
             }
             Cmd::ListWindows => match tmux.list_windows().await {
                 Ok(windows) => {
+                    debug!(count = windows.len(), "refreshed window list");
                     let follow_up = update(model, Msg::WindowListLoaded(windows));
                     for c in follow_up.into_iter().rev() {
                         queue.push_front(c);
                     }
                 }
                 Err(err) => {
+                    warn!(%err, "list-windows failed");
                     model.error_message = Some(format!("list-windows: {err}"));
                     queue.push_front(Cmd::Render);
                 }

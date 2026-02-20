@@ -224,6 +224,7 @@ impl TmuxControl {
         self.waiters.lock().await.push_back(tx);
 
         let cmd = cmd.trim_end_matches('\n');
+        tracing::trace!(cmd, "tmux send");
         if let Err(err) = self.stdin.write_all(cmd.as_bytes()).await {
             self.waiters.lock().await.pop_back();
             return Err(anyhow!("failed to write tmux command: {err}"));
@@ -239,11 +240,17 @@ impl TmuxControl {
             return Err(anyhow!("failed to flush tmux stdin: {err}"));
         }
 
-        match timeout(Duration::from_secs(5), rx).await {
+        let result = match timeout(Duration::from_secs(5), rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(anyhow!("tmux command response channel closed")),
             Err(_) => Err(anyhow!("timed out waiting for tmux response")),
+        };
+
+        if let Err(ref err) = result {
+            tracing::warn!(cmd, %err, "tmux command failed");
         }
+
+        result
     }
 
     pub fn event_stream(&mut self) -> &mut mpsc::Receiver<super::TmuxEvent> {
