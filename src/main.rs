@@ -484,6 +484,9 @@ async fn execute_commands(
                     warn!(%err, "kill-window failed");
                     model.error_message = Some(format!("kill-window: {err}"));
                     queue.push_front(Cmd::Render);
+                } else {
+                    // Proactively refresh — don't rely solely on %window-close notification
+                    queue.push_front(Cmd::ListWindows);
                 }
             }
             Cmd::FollowToWindow {
