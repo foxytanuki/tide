@@ -12,6 +12,7 @@ pub enum Msg {
     WindowClosed(String),
     WindowRenamed(String, String),
     WindowListLoaded(Vec<WindowInfo>),
+    WindowFocusChanged(String), // window_id
 
     // UI events
     CursorUp,

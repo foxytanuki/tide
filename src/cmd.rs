@@ -7,6 +7,7 @@ pub enum Cmd {
     NewWindow { name: String },
     RenameWindow { id: String, name: String },
     CloseWindow { id: String },
+    FollowToWindow { window_id: String },
     ListWindows,
 
     // App commands

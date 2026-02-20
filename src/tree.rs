@@ -263,8 +263,11 @@ mod tests {
 
     #[test]
     fn flatten_hides_collapsed_children() {
-        let mut tree =
-            build_tree(&[w("@1", 1, "proj:edit"), w("@2", 2, "proj:term"), w("@3", 3, "solo")]);
+        let mut tree = build_tree(&[
+            w("@1", 1, "proj:edit"),
+            w("@2", 2, "proj:term"),
+            w("@3", 3, "solo"),
+        ]);
         if let TreeNode::Folder { expanded, .. } = &mut tree[0] {
             *expanded = false;
         }
@@ -302,8 +305,11 @@ mod tests {
 
     #[test]
     fn navigation_helpers_work() {
-        let tree =
-            build_tree(&[w("@1", 1, "proj:edit"), w("@2", 2, "proj:term"), w("@3", 3, "solo")]);
+        let tree = build_tree(&[
+            w("@1", 1, "proj:edit"),
+            w("@2", 2, "proj:term"),
+            w("@3", 3, "solo"),
+        ]);
         let flat = flatten(&tree);
 
         assert_eq!(flat.len(), 4);

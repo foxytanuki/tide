@@ -18,11 +18,8 @@ pub fn render(model: &Model, frame: &mut Frame) {
         1
     };
 
-    let chunks = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(footer_height),
-    ])
-    .split(inner);
+    let chunks =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).split(inner);
 
     // Tree area
     let tree_items: Vec<ListItem> = model
@@ -57,7 +54,14 @@ fn render_tree_item(
 
     match get_node(&model.tree, &item.path) {
         Ok(node) => match (&item.kind, node) {
-            (FlatNodeKind::Folder, TreeNode::Folder { name, expanded, children }) => {
+            (
+                FlatNodeKind::Folder,
+                TreeNode::Folder {
+                    name,
+                    expanded,
+                    children,
+                },
+            ) => {
                 let marker = if *expanded { "v" } else { ">" };
                 let content = format!("{}{} {}", indent, marker, name);
                 line.push_str(&truncate(&content, width));
@@ -102,10 +106,7 @@ fn build_footer_text(model: &Model, width: usize) -> String {
     match &model.mode {
         Mode::Normal => truncate("[r]ename [x]close [c]new", width),
         Mode::Renaming { .. } => {
-            let line1 = truncate(
-                &format!("Rename: {}_", model.input_buffer),
-                width,
-            );
+            let line1 = truncate(&format!("Rename: {}_", model.input_buffer), width);
             let line2 = truncate("[enter] ok [esc] cancel", width);
             format!("{}\n{}", line1, line2)
         }

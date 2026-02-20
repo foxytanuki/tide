@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::cmd::Cmd;
-use crate::model::{Mode, Model};
+use crate::model::{Mode, Model, PreviewState};
 use crate::msg::Msg;
 use crate::tree::{
     build_tree, find_parent_folder, get_node_mut, next_visible_item, prev_visible_item,
@@ -12,7 +12,14 @@ use crate::tree::{
 
 pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
     // Clear error on any user action
-    if !matches!(msg, Msg::Tick | Msg::WindowAdded(_) | Msg::WindowClosed(_) | Msg::WindowRenamed(_, _) | Msg::WindowListLoaded(_)) {
+    if !matches!(
+        msg,
+        Msg::Tick
+            | Msg::WindowAdded(_)
+            | Msg::WindowClosed(_)
+            | Msg::WindowRenamed(_, _)
+            | Msg::WindowListLoaded(_)
+    ) {
         model.error_message = None;
     }
 
@@ -28,6 +35,18 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         }],
         Msg::RenameWindow => handle_rename_window(model),
         Msg::CloseWindow => handle_close_window(model),
+        Msg::WindowFocusChanged(window_id) => {
+            if model.ignore_next_window_change {
+                model.ignore_next_window_change = false;
+                return vec![];
+            }
+            if window_id == model.sidebar_window_id {
+                return vec![];
+            }
+            // User explicitly switched windows; clear preview state
+            model.preview = PreviewState::Home;
+            vec![Cmd::FollowToWindow { window_id }, Cmd::ListWindows]
+        }
         Msg::WindowAdded(_) | Msg::WindowClosed(_) | Msg::WindowRenamed(_, _) => {
             vec![Cmd::ListWindows]
         }
@@ -82,7 +101,12 @@ fn handle_cursor_down(model: &mut Model) -> Vec<Cmd> {
 /// Preview: if cursor is on a window, swap its pane into the right slot.
 fn preview_current_item(model: &Model) -> Vec<Cmd> {
     if let Some(info) = model.selected_window_info() {
-        vec![Cmd::PreviewWindow { id: info.id.clone() }, Cmd::Render]
+        vec![
+            Cmd::PreviewWindow {
+                id: info.id.clone(),
+            },
+            Cmd::Render,
+        ]
     } else {
         vec![Cmd::Render]
     }
@@ -105,7 +129,9 @@ fn handle_select_item(model: &mut Model) -> Vec<Cmd> {
         FlatNodeKind::Window => {
             if let Some(info) = model.selected_window_info() {
                 vec![
-                    Cmd::PreviewWindow { id: info.id.clone() },
+                    Cmd::PreviewWindow {
+                        id: info.id.clone(),
+                    },
                     Cmd::FocusRightPane,
                 ]
             } else {
@@ -123,8 +149,7 @@ fn handle_collapse_or_parent(model: &mut Model) -> Vec<Cmd> {
 
     match item.kind {
         FlatNodeKind::Folder => {
-            if let Ok(TreeNode::Folder { expanded, .. }) =
-                get_node_mut(&mut model.tree, &item.path)
+            if let Ok(TreeNode::Folder { expanded, .. }) = get_node_mut(&mut model.tree, &item.path)
             {
                 if *expanded {
                     *expanded = false;
@@ -173,9 +198,7 @@ fn handle_rename_window(model: &mut Model) -> Vec<Cmd> {
         None => return vec![],
     };
     model.input_buffer = info.1;
-    model.mode = Mode::Renaming {
-        window_id: info.0,
-    };
+    model.mode = Mode::Renaming { window_id: info.0 };
     vec![Cmd::Render]
 }
 

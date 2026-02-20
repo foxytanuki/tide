@@ -14,6 +14,7 @@ pub struct Model {
     pub home_pane_id: String,
     pub sidebar_window_id: String,
     pub preview: PreviewState,
+    pub ignore_next_window_change: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,8 +28,8 @@ pub enum Mode {
 pub enum PreviewState {
     Home,
     Previewing {
-        window_id: String,
-        swapped_pane_id: String,
+        original_window_id: String,
+        original_home_pane_id: String,
     },
 }
 
@@ -52,6 +53,7 @@ impl Model {
             home_pane_id,
             sidebar_window_id,
             preview: PreviewState::Home,
+            ignore_next_window_change: false,
         }
     }
 

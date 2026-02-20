@@ -65,7 +65,16 @@ async fn main() -> Result<()> {
             inner_cmd.push_str(arg);
         }
         let status = std::process::Command::new("tmux")
-            .args(["split-window", "-hb", "-l", "30", "--", "sh", "-c", &inner_cmd])
+            .args([
+                "split-window",
+                "-hb",
+                "-l",
+                "30",
+                "--",
+                "sh",
+                "-c",
+                &inner_cmd,
+            ])
             .status();
         std::process::exit(status.map(|s| s.code().unwrap_or(0)).unwrap_or(1));
     }
@@ -138,10 +147,15 @@ async fn main() -> Result<()> {
 
     let mut model = Model::new(
         session_name.clone(),
-        sidebar_pane_id,
+        sidebar_pane_id.clone(),
         home_pane_id,
         sidebar_window_id,
     );
+
+    // Bind prefix+f to jump back to sidebar pane
+    let _ = tmux
+        .send_command(&format!("bind-key f select-pane -t {}", sidebar_pane_id))
+        .await;
 
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<Event>();
     spawn_input_thread(ui_tx);
@@ -205,6 +219,9 @@ async fn main() -> Result<()> {
                     TmuxEvent::WindowAdd(id) => update(&mut model, Msg::WindowAdded(id)),
                     TmuxEvent::WindowClose(id) => update(&mut model, Msg::WindowClosed(id)),
                     TmuxEvent::WindowRenamed(id, name) => update(&mut model, Msg::WindowRenamed(id, name)),
+                    TmuxEvent::SessionWindowChanged(_, window_id) => {
+                        update(&mut model, Msg::WindowFocusChanged(window_id))
+                    }
                     TmuxEvent::SessionChanged(_, _) => vec![Cmd::ListWindows],
                     TmuxEvent::Error(err) => {
                         model.error_message = Some(err);
@@ -219,6 +236,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    let _ = tmux.send_command("unbind-key f").await;
     tmux.shutdown().await;
     Ok(())
 }
@@ -256,119 +274,121 @@ async fn execute_commands(
 
     while let Some(cmd) = queue.pop_front() {
         match cmd {
-            Cmd::PreviewWindow { id: target_window_id } => {
+            Cmd::PreviewWindow {
+                id: target_window_id,
+            } => {
                 use crate::model::PreviewState;
 
-                // If target is our own sidebar window, just restore
-                if target_window_id == model.sidebar_window_id {
-                    if let PreviewState::Previewing { ref swapped_pane_id, .. } = model.preview {
-                        let swap_cmd = format!(
-                            "swap-pane -s {} -t {}",
-                            model.home_pane_id, swapped_pane_id
-                        );
-                        let _ = tmux.send_command(&swap_cmd).await;
-                        // Re-focus sidebar pane after swap
-                        let _ = tmux.send_command(&format!(
-                            "select-pane -t {}", model.sidebar_pane_id
-                        )).await;
-                        model.preview = PreviewState::Home;
-                    }
-                } else {
-                    // Already previewing this window? No-op
-                    if let PreviewState::Previewing { ref window_id, .. } = model.preview {
-                        if *window_id == target_window_id {
-                            continue;
-                        }
-                    }
-
-                    // Get target window's pane (prefer active, fallback to first)
-                    let target_pane = {
-                        let resp = tmux
-                            .send_command(&format!(
-                                "list-panes -t {} -F '#{{pane_id}} #{{pane_active}}'",
-                                target_window_id
-                            ))
-                            .await;
-                        match resp {
-                            Ok(output) => {
-                                let mut first_pane = None;
-                                let mut active_pane = None;
-                                for line in output.lines() {
-                                    let parts: Vec<&str> =
-                                        line.trim().split_whitespace().collect();
-                                    if parts.is_empty() || parts[0].is_empty() {
-                                        continue;
-                                    }
-                                    if first_pane.is_none() {
-                                        first_pane = Some(parts[0].to_string());
-                                    }
-                                    if parts.len() >= 2 && parts[1] == "1" {
-                                        active_pane = Some(parts[0].to_string());
-                                    }
-                                }
-                                active_pane.or(first_pane)
-                            }
-                            Err(err) => {
-                                model.error_message =
-                                    Some(format!("preview list-panes: {err}"));
-                                queue.push_front(Cmd::Render);
-                                continue;
-                            }
-                        }
-                    };
-
-                    let Some(target_pane) = target_pane else {
-                        model.error_message =
-                            Some(format!("no pane in {target_window_id}"));
+                // If previewing and target is the original window, restore
+                if let PreviewState::Previewing {
+                    ref original_window_id,
+                    ..
+                } = model.preview
+                {
+                    if target_window_id == *original_window_id {
                         queue.push_front(Cmd::Render);
-                        continue;
-                    };
-
-                    // Restore previous preview if any
-                    if let PreviewState::Previewing { ref swapped_pane_id, .. } = model.preview {
-                        let restore_cmd = format!(
-                            "swap-pane -s {} -t {}",
-                            model.home_pane_id, swapped_pane_id
-                        );
-                        if let Err(err) = tmux.send_command(&restore_cmd).await {
-                            model.error_message =
-                                Some(format!("restore preview: {err}"));
-                            model.preview = PreviewState::Home;
-                            queue.push_front(Cmd::Render);
-                            continue;
-                        }
-                    }
-
-                    // Swap: target pane comes to right slot, home pane goes to target window
-                    let swap_cmd = format!(
-                        "swap-pane -s {} -t {}",
-                        target_pane, model.home_pane_id
-                    );
-                    if let Err(err) = tmux.send_command(&swap_cmd).await {
-                        model.error_message = Some(format!("preview swap: {err}"));
-                        queue.push_front(Cmd::Render);
+                        queue.push_front(Cmd::RestorePreview);
                         continue;
                     }
-
-                    // Re-focus sidebar pane after swap (swap may change active pane)
-                    let _ = tmux.send_command(&format!(
-                        "select-pane -t {}", model.sidebar_pane_id
-                    )).await;
-
-                    model.preview = PreviewState::Previewing {
-                        window_id: target_window_id,
-                        swapped_pane_id: target_pane,
-                    };
                 }
+
+                // Already on this window, no-op
+                if target_window_id == model.sidebar_window_id {
+                    continue;
+                }
+
+                // Record original state if starting fresh preview
+                let (orig_window, orig_home) = match &model.preview {
+                    PreviewState::Home => {
+                        (model.sidebar_window_id.clone(), model.home_pane_id.clone())
+                    }
+                    PreviewState::Previewing {
+                        original_window_id,
+                        original_home_pane_id,
+                    } => (original_window_id.clone(), original_home_pane_id.clone()),
+                };
+
+                // Move sidebar to target window
+                let join_cmd = format!(
+                    "join-pane -dfhb -l 30 -s {} -t {}",
+                    model.sidebar_pane_id, target_window_id
+                );
+                if let Err(err) = tmux.send_command(&join_cmd).await {
+                    model.error_message = Some(format!("preview join-pane: {err}"));
+                    queue.push_front(Cmd::Render);
+                    continue;
+                }
+
+                // Switch active window to target
+                model.ignore_next_window_change = true;
+                if let Err(err) = tmux
+                    .send_command(&format!("select-window -t {}", target_window_id))
+                    .await
+                {
+                    model.error_message = Some(format!("preview select-window: {err}"));
+                    queue.push_front(Cmd::Render);
+                    continue;
+                }
+
+                // Focus sidebar pane
+                let _ = tmux
+                    .send_command(&format!("select-pane -t {}", model.sidebar_pane_id))
+                    .await;
+
+                // Update home_pane_id to a pane in the target window
+                let pane_list = tmux
+                    .send_command(&format!(
+                        "list-panes -t {} -F '#{{pane_id}}'",
+                        target_window_id
+                    ))
+                    .await
+                    .unwrap_or_default();
+                let new_home = pane_list
+                    .lines()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty() && *l != model.sidebar_pane_id)
+                    .unwrap_or("")
+                    .to_string();
+                if !new_home.is_empty() {
+                    model.home_pane_id = new_home;
+                }
+
+                model.sidebar_window_id = target_window_id;
+                model.preview = PreviewState::Previewing {
+                    original_window_id: orig_window,
+                    original_home_pane_id: orig_home,
+                };
             }
             Cmd::RestorePreview => {
                 use crate::model::PreviewState;
-                if let PreviewState::Previewing { ref swapped_pane_id, .. } = model.preview {
-                    let swap_cmd = format!(
-                        "swap-pane -s {} -t {}",
-                        model.home_pane_id, swapped_pane_id
+                if let PreviewState::Previewing {
+                    ref original_window_id,
+                    ref original_home_pane_id,
+                } = model.preview
+                {
+                    let orig_window = original_window_id.clone();
+                    let orig_home = original_home_pane_id.clone();
+
+                    // Move sidebar back to original window
+                    let join_cmd = format!(
+                        "join-pane -dfhb -l 30 -s {} -t {}",
+                        model.sidebar_pane_id, orig_window
                     );
-                    let _ = tmux.send_command(&swap_cmd).await;
+                    let _ = tmux.send_command(&join_cmd).await;
+
+                    // Switch back to original window
+                    model.ignore_next_window_change = true;
+                    let _ = tmux
+                        .send_command(&format!("select-window -t {}", orig_window))
+                        .await;
+
+                    // Focus sidebar
+                    let _ = tmux
+                        .send_command(&format!("select-pane -t {}", model.sidebar_pane_id))
+                        .await;
+
+                    model.sidebar_window_id = orig_window;
+                    model.home_pane_id = orig_home;
                     model.preview = PreviewState::Home;
                 }
             }
@@ -380,7 +400,7 @@ async fn execute_commands(
                 }
             }
             Cmd::NewWindow { name } => {
-                let new_cmd = format!("new-window -n {}", quote_tmux(&name));
+                let new_cmd = format!("new-window -d -n {}", quote_tmux(&name));
                 if let Err(err) = tmux.send_command(&new_cmd).await {
                     model.error_message = Some(format!("new-window: {err}"));
                     queue.push_front(Cmd::Render);
@@ -394,15 +414,12 @@ async fn execute_commands(
                 }
             }
             Cmd::CloseWindow { id } => {
-                // If previewing this window, restore first to avoid losing home_pane
-                if let crate::model::PreviewState::Previewing { ref window_id, ref swapped_pane_id } = model.preview {
-                    if *window_id == id {
-                        let restore_cmd = format!(
-                            "swap-pane -d -s {} -t {}",
-                            model.home_pane_id, swapped_pane_id
-                        );
-                        let _ = tmux.send_command(&restore_cmd).await;
-                        model.preview = crate::model::PreviewState::Home;
+                // If sidebar is in the window being closed, restore preview first
+                if let crate::model::PreviewState::Previewing { .. } = &model.preview {
+                    if model.sidebar_window_id == id {
+                        queue.push_front(Cmd::CloseWindow { id });
+                        queue.push_front(Cmd::RestorePreview);
+                        continue;
                     }
                 }
                 let cmd_str = format!("kill-window -t {id}");
@@ -410,6 +427,45 @@ async fn execute_commands(
                     model.error_message = Some(format!("kill-window: {err}"));
                     queue.push_front(Cmd::Render);
                 }
+            }
+            Cmd::FollowToWindow {
+                window_id: target_window_id,
+            } => {
+                if target_window_id == model.sidebar_window_id {
+                    continue;
+                }
+
+                // Move sidebar pane to the new window (left split, 30 cols, don't focus)
+                let join_cmd = format!(
+                    "join-pane -dfhb -l 30 -s {} -t {}",
+                    model.sidebar_pane_id, target_window_id
+                );
+                if let Err(err) = tmux.send_command(&join_cmd).await {
+                    model.error_message = Some(format!("follow join-pane: {err}"));
+                    queue.push_front(Cmd::Render);
+                    continue;
+                }
+
+                // Find new home pane (any pane in the target window that isn't the sidebar)
+                let pane_list = tmux
+                    .send_command(&format!(
+                        "list-panes -t {} -F '#{{pane_id}}'",
+                        target_window_id
+                    ))
+                    .await
+                    .unwrap_or_default();
+                let new_home = pane_list
+                    .lines()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty() && *l != model.sidebar_pane_id)
+                    .unwrap_or("")
+                    .to_string();
+
+                if !new_home.is_empty() {
+                    model.home_pane_id = new_home;
+                }
+
+                model.sidebar_window_id = target_window_id;
             }
             Cmd::ListWindows => match tmux.list_windows().await {
                 Ok(windows) => {

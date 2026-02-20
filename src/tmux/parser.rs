@@ -4,6 +4,7 @@ pub enum TmuxEvent {
     WindowClose(String),
     WindowRenamed(String, String),
     SessionChanged(String, String),
+    SessionWindowChanged(String, String), // session_id, window_id
     Error(String),
 }
 
@@ -52,6 +53,14 @@ pub fn parse_line(line: &str) -> Option<TmuxEvent> {
             None => (rest.trim().to_string(), String::new()),
         };
         return Some(TmuxEvent::WindowRenamed(id, name));
+    }
+
+    if let Some(rest) = line.strip_prefix("%session-window-changed ") {
+        let (session_id, window_id) = match rest.split_once(' ') {
+            Some((sid, wid)) => (sid.to_string(), wid.trim().to_string()),
+            None => return None,
+        };
+        return Some(TmuxEvent::SessionWindowChanged(session_id, window_id));
     }
 
     if let Some(rest) = line.strip_prefix("%session-changed ") {
