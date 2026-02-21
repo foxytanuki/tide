@@ -1,0 +1,14 @@
+[tools]
+rust = "latest"
+
+[tasks.install]
+description = "Build and install tmuxide"
+run = "cargo install --path ."
+
+[tasks.build]
+description = "Build tmuxide (debug)"
+run = "cargo build"
+
+[tasks.check]
+description = "Run clippy and check"
+run = "cargo clippy -- -D warnings"
