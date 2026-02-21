@@ -479,18 +479,48 @@ fn handle_confirm_close_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
     }
 }
 
+/// Collect all window names from the tree (recursively).
+fn collect_window_names(nodes: &[TreeNode]) -> Vec<String> {
+    let mut names = Vec::new();
+    for node in nodes {
+        match node {
+            TreeNode::Window { info } => names.push(info.name.clone()),
+            TreeNode::Folder { children, .. } => names.extend(collect_window_names(children)),
+        }
+    }
+    names
+}
+
+/// Generate a unique tab name like "tab1", "tab2", ... that doesn't collide
+/// with existing window names. If `folder` is Some, checks against "folder:tabN".
+fn next_tab_name(existing_names: &[String], folder: Option<&str>) -> String {
+    for i in 1.. {
+        let candidate = match folder {
+            Some(f) => format!("{}:tab{}", f, i),
+            None => format!("tab{}", i),
+        };
+        if !existing_names.iter().any(|n| n == &candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
 /// Determine the name for a new window based on cursor context.
-/// If cursor is on/in a folder, prefix with the folder name (e.g. "proj:new").
+/// If cursor is on/in a folder, prefix with the folder name (e.g. "proj:tab1").
+/// Uses sequential numbering: tab1, tab2, tab3, ...
 fn determine_new_window_name(model: &Model) -> String {
+    let existing = collect_window_names(model.tree());
+
     let item = match model.flat_items().get(model.cursor()) {
         Some(item) => item,
-        None => return "new".to_string(),
+        None => return next_tab_name(&existing, None),
     };
 
     if let Some(selected) = model.selected_window_info() {
         if let Some(pending) = model.pending_renames.get(selected.id.as_str()) {
             if let Some((folder, _)) = pending.target_name.split_once(':') {
-                let generated = format!("{}:new", folder);
+                let generated = next_tab_name(&existing, Some(folder));
                 debug!(
                     cursor = model.cursor(),
                     generated,
@@ -504,7 +534,7 @@ fn determine_new_window_name(model: &Model) -> String {
     match item.kind {
         FlatNodeKind::Folder => {
             if let Ok(TreeNode::Folder { name, .. }) = get_node(model.tree(), &item.path) {
-                let generated = format!("{}:new", name);
+                let generated = next_tab_name(&existing, Some(name));
                 debug!(
                     cursor = model.cursor(),
                     generated,
@@ -513,7 +543,7 @@ fn determine_new_window_name(model: &Model) -> String {
                 generated
             } else {
                 debug!(cursor = model.cursor(), "new window name fallback");
-                "new".to_string()
+                next_tab_name(&existing, None)
             }
         }
         FlatNodeKind::Window => {
@@ -522,7 +552,7 @@ fn determine_new_window_name(model: &Model) -> String {
                     if let Ok(TreeNode::Folder { name, .. }) =
                         get_node(model.tree(), &parent_item.path)
                     {
-                        let generated = format!("{}:new", name);
+                        let generated = next_tab_name(&existing, Some(name));
                         debug!(
                             cursor = model.cursor(),
                             generated,
@@ -536,7 +566,7 @@ fn determine_new_window_name(model: &Model) -> String {
                 cursor = model.cursor(),
                 "new window name fallback from window w/o folder"
             );
-            "new".to_string()
+            next_tab_name(&existing, None)
         }
     }
 }
@@ -668,7 +698,7 @@ mod tests {
         // cursor=0 is the folder "proj"
         assert_eq!(model.cursor(), 0);
         let cmds = update(&mut model, Msg::NewWindow);
-        assert_new_window_name(&cmds, "proj:new");
+        assert_new_window_name(&cmds, "proj:tab1");
     }
 
     #[test]
@@ -682,7 +712,7 @@ mod tests {
         // move cursor to child window (index 1 = proj/edit)
         model.set_cursor(1);
         let cmds = update(&mut model, Msg::NewWindow);
-        assert_new_window_name(&cmds, "proj:new");
+        assert_new_window_name(&cmds, "proj:tab1");
     }
 
     #[test]
@@ -696,7 +726,7 @@ mod tests {
         // flat: [0]=folder "proj", [1]=window "edit", [2]=window "scratch"
         model.set_cursor(2);
         let cmds = update(&mut model, Msg::NewWindow);
-        assert_new_window_name(&cmds, "new");
+        assert_new_window_name(&cmds, "tab1");
     }
 
     #[test]
@@ -813,7 +843,7 @@ mod tests {
         );
 
         let cmds = update(&mut model, Msg::NewWindow);
-        assert_new_window_name(&cmds, "new:new");
+        assert_new_window_name(&cmds, "new:tab1");
     }
 
     #[test]
