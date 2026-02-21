@@ -14,10 +14,13 @@ use crate::tree::{
 pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
     const MISSING_PENDING_RENAME_THRESHOLD: u8 = 6;
 
-    // Clear error on any user action
+    // Clear error on any user action (exclude background events)
     if !matches!(
         msg,
-        Msg::WindowChanged | Msg::WindowRenamed { .. } | Msg::WindowListLoaded(_)
+        Msg::WindowChanged
+            | Msg::WindowRenamed { .. }
+            | Msg::WindowListLoaded(_)
+            | Msg::AiProcessPollResult(_)
     ) {
         model.error_message = None;
         model.info_message = None;
@@ -231,15 +234,19 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                 followup_cmds
             }
         }
+        Msg::AiProcessPollResult(ai_windows) => {
+            model.ai_windows = ai_windows;
+            vec![Cmd::CheckBorder]
+        }
         Msg::Key(event) => handle_key(model, event),
         Msg::Restart => {
             model.should_quit = true;
             model.restart_requested = true;
-            vec![Cmd::RestorePreview, Cmd::Restart]
+            vec![Cmd::ResetAllBorders, Cmd::RestorePreview, Cmd::Restart]
         }
         Msg::Quit => {
             model.should_quit = true;
-            vec![Cmd::RestorePreview, Cmd::Quit]
+            vec![Cmd::ResetAllBorders, Cmd::RestorePreview, Cmd::Quit]
         }
     }
 }

@@ -199,7 +199,18 @@ async fn main() -> Result<()> {
         .send_command(&format!("select-pane -t {}", sidebar_pane_id))
         .await;
 
+    // Initial AI process poll (detect immediately without waiting for first tick)
+    let initial_poll = vec![Cmd::PollAiProcesses];
+    if !execute_commands(&mut model, &mut tmux, &mut terminal, initial_poll).await {
+        info!("initial AI poll requested quit");
+        tmux.shutdown().await;
+        return Ok(());
+    }
+
     info!("entering main loop");
+
+    let mut ai_poll_interval = tokio::time::interval(Duration::from_secs(3));
+    ai_poll_interval.reset(); // skip immediate first tick (we already polled above)
 
     loop {
         if model.should_quit {
@@ -260,10 +271,21 @@ async fn main() -> Result<()> {
                     break;
                 }
             }
+
+            _ = ai_poll_interval.tick() => {
+                let cmds = vec![Cmd::PollAiProcesses];
+                if !execute_commands(&mut model, &mut tmux, &mut terminal, cmds).await {
+                    break;
+                }
+            }
         }
     }
 
     let restart = model.restart_requested;
+
+    // Clean up AI border highlights before shutdown
+    let cleanup_cmds = vec![Cmd::ResetAllBorders];
+    let _ = execute_commands(&mut model, &mut tmux, &mut terminal, cleanup_cmds).await;
 
     // Restore previous prefix+f binding (or unbind if none existed)
     if let Some(ref binding) = prev_f_binding {

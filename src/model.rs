@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::tree::{
     expand_to_window_by_id, find_window_flat_index_by_id, flatten, get_node, FlatItem, TreeNode,
@@ -32,6 +32,10 @@ pub struct Model {
     pub pending_renames: HashMap<String, PendingRename>,
     /// Most recent pending-rename target, used to keep selection stable.
     pub pending_rename_last_window_id: Option<String>,
+    /// Window IDs currently running AI processes.
+    pub ai_windows: HashSet<String>,
+    /// Window ID currently highlighted with AI border.
+    pub border_highlighted_window: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +92,8 @@ impl Model {
             pending_internal_focus_window: None,
             pending_renames: HashMap::new(),
             pending_rename_last_window_id: None,
+            ai_windows: HashSet::new(),
+            border_highlighted_window: None,
         }
     }
 

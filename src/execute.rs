@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::io::Stdout;
@@ -156,6 +156,7 @@ pub async fn execute_commands<T: TmuxApi>(
                     original_window_id: orig_window,
                     original_home_pane_id: orig_home,
                 };
+                queue.push_front(Cmd::CheckBorder);
             }
             Cmd::RestorePreview => {
                 if let PreviewState::Previewing {
@@ -220,6 +221,7 @@ pub async fn execute_commands<T: TmuxApi>(
                         model.error_message =
                             Some("restore preview failed; state reconciled".to_string());
                     }
+                    queue.push_front(Cmd::CheckBorder);
                 }
             }
             Cmd::FocusRightPane => {
@@ -400,6 +402,7 @@ pub async fn execute_commands<T: TmuxApi>(
                     "follow complete"
                 );
                 model.sidebar_window_id = target_window_id;
+                queue.push_front(Cmd::CheckBorder);
             }
             Cmd::EnsureSidebarWidth => {
                 if let Err(err) = tmux
@@ -426,6 +429,70 @@ pub async fn execute_commands<T: TmuxApi>(
                     queue.push_front(Cmd::Render);
                 }
             },
+            Cmd::PollAiProcesses => {
+                let list_cmd = format!(
+                    "list-panes -s -t {} -F '#{{window_id}}\t#{{pane_id}}\t#{{pane_current_command}}'",
+                    model.session_name
+                );
+                match tmux.send_command(&list_cmd).await {
+                    Ok(output) => {
+                        let ai_windows = parse_ai_pane_output(&output, &model.sidebar_pane_id);
+                        let follow_up = update(model, Msg::AiProcessPollResult(ai_windows));
+                        for c in follow_up.into_iter().rev() {
+                            queue.push_front(c);
+                        }
+                    }
+                    Err(err) => {
+                        debug!(%err, "ai process poll failed");
+                    }
+                }
+            }
+            Cmd::CheckBorder => {
+                let should_highlight = model.ai_windows.contains(&model.sidebar_window_id);
+                let current = model.border_highlighted_window.clone();
+
+                let need_highlight = if should_highlight {
+                    Some(model.sidebar_window_id.clone())
+                } else {
+                    None
+                };
+
+                if current == need_highlight {
+                    continue;
+                }
+
+                // Reset old highlight
+                if let Some(ref old_id) = current {
+                    let reset_cmd = format!(
+                        "set-window-option -t {} pane-border-style default ; set-window-option -t {} pane-active-border-style default",
+                        old_id, old_id
+                    );
+                    let _ = tmux.send_command(&reset_cmd).await;
+                    debug!(window = %old_id, "border highlight removed");
+                }
+
+                // Apply new highlight
+                if let Some(ref new_id) = need_highlight {
+                    let set_cmd = format!(
+                        "set-window-option -t {} pane-border-style fg=yellow ; set-window-option -t {} pane-active-border-style fg=yellow",
+                        new_id, new_id
+                    );
+                    let _ = tmux.send_command(&set_cmd).await;
+                    debug!(window = %new_id, "border highlight applied");
+                }
+
+                model.border_highlighted_window = need_highlight;
+            }
+            Cmd::ResetAllBorders => {
+                if let Some(ref id) = model.border_highlighted_window.take() {
+                    let reset_cmd = format!(
+                        "set-window-option -t {} pane-border-style default ; set-window-option -t {} pane-active-border-style default",
+                        id, id
+                    );
+                    let _ = tmux.send_command(&reset_cmd).await;
+                    debug!(window = %id, "border highlight reset on cleanup");
+                }
+            }
             Cmd::Render => {
                 if let Err(err) = terminal.draw(|f| render(model, f)) {
                     model.error_message = Some(format!("render: {err}"));
@@ -565,6 +632,32 @@ async fn read_window_layout<T: TmuxApi>(tmux: &mut T, window_id: &str) -> Option
     } else {
         Some(layout.to_string())
     }
+}
+
+const AI_PROCESS_NAMES: &[&str] = &["claude", "codex", "gemini"];
+
+fn parse_ai_pane_output(output: &str, sidebar_pane_id: &str) -> HashSet<String> {
+    let mut ai_windows = HashSet::new();
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let window_id = parts[0].trim();
+        let pane_id = parts[1].trim();
+        let command = parts[2].trim();
+
+        // Skip the sidebar pane itself
+        if pane_id == sidebar_pane_id {
+            continue;
+        }
+
+        let lower = command.to_lowercase();
+        if AI_PROCESS_NAMES.iter().any(|name| lower.contains(name)) {
+            ai_windows.insert(window_id.to_string());
+        }
+    }
+    ai_windows
 }
 
 async fn remember_window_layout_without_sidebar<T: TmuxApi>(

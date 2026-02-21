@@ -11,6 +11,11 @@ pub enum Cmd {
     EnsureSidebarWidth,
     ListWindows,
 
+    // AI border highlight
+    PollAiProcesses,
+    CheckBorder,
+    ResetAllBorders,
+
     // App commands
     Render,
     Restart,

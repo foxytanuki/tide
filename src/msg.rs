@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crossterm::event::KeyEvent;
 
 use crate::tree::WindowInfo;
@@ -24,6 +26,9 @@ pub enum Msg {
     NewProject,
     RenameWindow,
     CloseWindow,
+
+    // AI process detection
+    AiProcessPollResult(HashSet<String>), // window_ids with AI processes
 
     Restart,
     Quit,
