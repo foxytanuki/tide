@@ -34,10 +34,9 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             vec![Cmd::NewWindow { name }]
         }
         Msg::NewProject => {
-            let name = generate_project_name(model);
-            vec![Cmd::NewWindow {
-                name: format!("{}:main", name),
-            }]
+            clear_input(model);
+            model.mode = Mode::CreatingProject;
+            vec![Cmd::Render]
         }
         Msg::RenameWindow => handle_rename_window(model),
         Msg::CloseWindow => handle_close_window(model),
@@ -209,13 +208,19 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                     let still_exists = windows.iter().any(|w| w.id == *window_id);
                     if !still_exists {
                         model.mode = Mode::Normal;
-                        model.input_buffer.clear();
-                    } else if matches!(model.mode, Mode::Renaming { .. }) {
-                        model.mode = Mode::Normal;
-                        model.input_buffer.clear();
+                        clear_input(model);
                     }
                 }
-                Mode::Normal => {}
+                Mode::RenamingFolder { folder_name } => {
+                    let folder_exists = windows
+                        .iter()
+                        .any(|w| w.name.starts_with(&format!("{}:", folder_name)));
+                    if !folder_exists {
+                        model.mode = Mode::Normal;
+                        clear_input(model);
+                    }
+                }
+                Mode::Normal | Mode::CreatingProject => {}
             }
 
             if followup_cmds.is_empty() {
@@ -255,10 +260,10 @@ fn handle_cursor_down(model: &mut Model) -> Vec<Cmd> {
 fn preview_current_item(model: &Model) -> Vec<Cmd> {
     if let Some(info) = model.selected_window_info() {
         vec![
-            Cmd::Render,
             Cmd::PreviewWindow {
                 id: info.id.clone(),
             },
+            Cmd::Render,
         ]
     } else {
         vec![Cmd::Render]
@@ -352,13 +357,53 @@ fn handle_toggle_folder(model: &mut Model) -> Vec<Cmd> {
 }
 
 fn handle_rename_window(model: &mut Model) -> Vec<Cmd> {
-    let info = match model.selected_window_info() {
-        Some(info) => (info.id.clone(), info.name.clone()),
+    let item = match model.flat_items().get(model.cursor()) {
+        Some(item) => item.clone(),
         None => return vec![],
     };
-    model.input_buffer = info.1;
-    model.mode = Mode::Renaming { window_id: info.0 };
-    vec![Cmd::Render]
+
+    match item.kind {
+        FlatNodeKind::Window => {
+            let info = match model.selected_window_info() {
+                Some(info) => info.clone(),
+                None => return vec![],
+            };
+            // Reconstruct full tmux name (folder:child) if inside a folder
+            let full_name =
+                if let Some(parent_idx) = find_parent_folder(model.flat_items(), model.cursor()) {
+                    if let Some(parent_item) = model.flat_items().get(parent_idx) {
+                        if let Ok(TreeNode::Folder { name, .. }) =
+                            get_node(model.tree(), &parent_item.path)
+                        {
+                            format!("{}:{}", name, info.name)
+                        } else {
+                            info.name.clone()
+                        }
+                    } else {
+                        info.name.clone()
+                    }
+                } else {
+                    info.name.clone()
+                };
+            set_input(model, full_name);
+            model.mode = Mode::Renaming {
+                window_id: info.id.clone(),
+            };
+            vec![Cmd::Render]
+        }
+        FlatNodeKind::Folder => {
+            let folder_name = if let Ok(TreeNode::Folder { name, .. }) =
+                get_node(model.tree(), &item.path)
+            {
+                name.clone()
+            } else {
+                return vec![];
+            };
+            set_input(model, folder_name.clone());
+            model.mode = Mode::RenamingFolder { folder_name };
+            vec![Cmd::Render]
+        }
+    }
 }
 
 fn handle_close_window(model: &mut Model) -> Vec<Cmd> {
@@ -374,12 +419,70 @@ fn handle_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
     match &model.mode {
         Mode::Normal => handle_normal_key(model, event),
         Mode::Renaming { .. } => handle_renaming_key(model, event),
+        Mode::RenamingFolder { .. } => handle_renaming_folder_key(model, event),
+        Mode::CreatingProject => handle_creating_project_key(model, event),
         Mode::ConfirmClose { .. } => handle_confirm_close_key(model, event),
     }
 }
 
 fn is_plain_key(event: &KeyEvent) -> bool {
     event.modifiers.is_empty() || event.modifiers == KeyModifiers::SHIFT
+}
+
+/// Handle common text input keys (arrows, backspace, char insert).
+/// Returns Some(cmds) if the key was handled, None for Enter/Esc/other.
+fn handle_input_key(model: &mut Model, code: KeyCode) -> Option<Vec<Cmd>> {
+    match code {
+        KeyCode::Left => {
+            if model.input_cursor > 0 {
+                model.input_cursor -= 1;
+            }
+            Some(vec![Cmd::Render])
+        }
+        KeyCode::Right => {
+            if model.input_cursor < model.input_buffer.len() {
+                model.input_cursor += 1;
+            }
+            Some(vec![Cmd::Render])
+        }
+        KeyCode::Home => {
+            model.input_cursor = 0;
+            Some(vec![Cmd::Render])
+        }
+        KeyCode::End => {
+            model.input_cursor = model.input_buffer.len();
+            Some(vec![Cmd::Render])
+        }
+        KeyCode::Backspace => {
+            if model.input_cursor > 0 {
+                model.input_cursor -= 1;
+                model.input_buffer.remove(model.input_cursor);
+            }
+            Some(vec![Cmd::Render])
+        }
+        KeyCode::Delete => {
+            if model.input_cursor < model.input_buffer.len() {
+                model.input_buffer.remove(model.input_cursor);
+            }
+            Some(vec![Cmd::Render])
+        }
+        KeyCode::Char(c) => {
+            model.input_buffer.insert(model.input_cursor, c);
+            model.input_cursor += 1;
+            Some(vec![Cmd::Render])
+        }
+        _ => None,
+    }
+}
+
+fn clear_input(model: &mut Model) {
+    model.input_buffer.clear();
+    model.input_cursor = 0;
+}
+
+fn set_input(model: &mut Model, value: String) {
+    model.input_cursor = value.len();
+    model.input_buffer = value;
 }
 
 fn handle_normal_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
@@ -407,9 +510,11 @@ fn handle_normal_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
 }
 
 fn handle_renaming_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
-    // Allow Shift (for uppercase), reject Ctrl/Alt/Super
     if !is_plain_key(&event) {
         return vec![];
+    }
+    if let Some(cmds) = handle_input_key(model, event.code) {
+        return cmds;
     }
     match event.code {
         KeyCode::Enter => {
@@ -428,7 +533,7 @@ fn handle_renaming_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
                     },
                 );
                 model.pending_rename_last_window_id = Some(window_id.clone());
-                model.input_buffer.clear();
+                clear_input(model);
                 vec![
                     Cmd::RenameWindow {
                         id: window_id,
@@ -442,15 +547,86 @@ fn handle_renaming_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
         }
         KeyCode::Esc => {
             model.mode = Mode::Normal;
-            model.input_buffer.clear();
+            clear_input(model);
             vec![Cmd::Render]
         }
-        KeyCode::Backspace => {
-            model.input_buffer.pop();
+        _ => vec![],
+    }
+}
+
+fn handle_creating_project_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
+    if !is_plain_key(&event) {
+        return vec![];
+    }
+    if let Some(cmds) = handle_input_key(model, event.code) {
+        return cmds;
+    }
+    match event.code {
+        KeyCode::Enter => {
+            let name = model.input_buffer.trim().to_string();
+            if name.is_empty() {
+                return vec![Cmd::Render];
+            }
+            model.mode = Mode::Normal;
+            clear_input(model);
+            let window_name = format!("{}:tab1", name);
+            vec![Cmd::NewWindow { name: window_name }]
+        }
+        KeyCode::Esc => {
+            model.mode = Mode::Normal;
+            clear_input(model);
             vec![Cmd::Render]
         }
-        KeyCode::Char(c) => {
-            model.input_buffer.push(c);
+        _ => vec![],
+    }
+}
+
+fn handle_renaming_folder_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
+    if !is_plain_key(&event) {
+        return vec![];
+    }
+    if let Some(cmds) = handle_input_key(model, event.code) {
+        return cmds;
+    }
+    match event.code {
+        KeyCode::Enter => {
+            let mode = model.mode.clone();
+            if let Mode::RenamingFolder { folder_name } = mode {
+                let new_name = model.input_buffer.trim().to_string();
+                if new_name.is_empty() || new_name == folder_name {
+                    model.mode = Mode::Normal;
+                    clear_input(model);
+                    return vec![Cmd::Render];
+                }
+                model.mode = Mode::Normal;
+                clear_input(model);
+
+                let children = collect_folder_children(model.tree(), &folder_name);
+                let mut cmds = Vec::new();
+                for (window_id, child_name) in &children {
+                    let full_name = format!("{}:{}", new_name, child_name);
+                    model.pending_renames.insert(
+                        window_id.clone(),
+                        PendingRename {
+                            target_name: full_name.clone(),
+                            observed_count: 0,
+                        },
+                    );
+                    model.pending_rename_last_window_id = Some(window_id.clone());
+                    cmds.push(Cmd::RenameWindow {
+                        id: window_id.clone(),
+                        name: full_name,
+                    });
+                }
+                cmds.push(Cmd::Render);
+                cmds
+            } else {
+                vec![]
+            }
+        }
+        KeyCode::Esc => {
+            model.mode = Mode::Normal;
+            clear_input(model);
             vec![Cmd::Render]
         }
         _ => vec![],
@@ -479,13 +655,27 @@ fn handle_confirm_close_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
     }
 }
 
-/// Collect all window names from the tree (recursively).
+/// Collect all window names from the tree as full tmux names (folder:child).
 fn collect_window_names(nodes: &[TreeNode]) -> Vec<String> {
+    collect_window_names_inner(nodes, None)
+}
+
+fn collect_window_names_inner(nodes: &[TreeNode], prefix: Option<&str>) -> Vec<String> {
     let mut names = Vec::new();
     for node in nodes {
         match node {
-            TreeNode::Window { info } => names.push(info.name.clone()),
-            TreeNode::Folder { children, .. } => names.extend(collect_window_names(children)),
+            TreeNode::Window { info } => {
+                let name = match prefix {
+                    Some(p) => format!("{}:{}", p, info.name),
+                    None => info.name.clone(),
+                };
+                names.push(name);
+            }
+            TreeNode::Folder {
+                name, children, ..
+            } => {
+                names.extend(collect_window_names_inner(children, Some(name)));
+            }
         }
     }
     names
@@ -571,18 +761,28 @@ fn determine_new_window_name(model: &Model) -> String {
     }
 }
 
-/// Generate a unique project name (project1, project2, ...).
-fn generate_project_name(model: &Model) -> String {
-    for i in 1.. {
-        let candidate = format!("project{}", i);
-        let exists = model.tree().iter().any(|node| {
-            matches!(node, TreeNode::Folder { name, .. } if name == &candidate)
-        });
-        if !exists {
-            return candidate;
+/// Collect (window_id, child_name) pairs for all windows in a folder.
+fn collect_folder_children(tree: &[TreeNode], folder_name: &str) -> Vec<(String, String)> {
+    for node in tree {
+        if let TreeNode::Folder {
+            name, children, ..
+        } = node
+        {
+            if name == folder_name {
+                return children
+                    .iter()
+                    .filter_map(|child| {
+                        if let TreeNode::Window { info } = child {
+                            Some((info.id.clone(), info.name.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+            }
         }
     }
-    unreachable!()
+    Vec::new()
 }
 
 /// Collect folder name → expanded state from the tree
@@ -771,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn window_list_loaded_uses_renaming_mode_window_id_even_if_cursor_stale() {
+    fn window_list_loaded_preserves_renaming_mode_when_target_exists() {
         let mut model = test_model();
         let before = vec![
             wi("@1", 1, "dev"),
@@ -793,6 +993,29 @@ mod tests {
 
         assert_eq!(model.selected_window_info().map(|w| w.id.as_str()), Some("@1"));
         assert_eq!(model.cursor(), 1);
+        // Renaming mode preserved: target window @1 still exists
+        assert!(matches!(model.mode, Mode::Renaming { .. }));
+    }
+
+    #[test]
+    fn window_list_loaded_cancels_renaming_mode_when_target_gone() {
+        let mut model = test_model();
+        let before = vec![
+            wi("@1", 1, "dev"),
+            wi("@2", 2, "scratch"),
+        ];
+        update(&mut model, Msg::WindowListLoaded(before));
+
+        model.mode = Mode::Renaming {
+            window_id: "@1".to_string(),
+        };
+
+        // @1 is gone from the new list
+        let after = vec![
+            wi("@2", 2, "scratch"),
+        ];
+        update(&mut model, Msg::WindowListLoaded(after));
+
         assert_eq!(model.mode, Mode::Normal);
     }
 

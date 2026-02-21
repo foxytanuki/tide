@@ -271,6 +271,10 @@ pub async fn execute_commands<T: TmuxApi>(
                                 name = %name,
                                 "tracking new window for rename stabilization"
                             );
+                            queue.push_front(Cmd::Render);
+                            queue.push_front(Cmd::PreviewWindow {
+                                id: window_id.to_string(),
+                            });
                             queue.push_front(Cmd::ListWindows);
                         } else {
                             warn!("new-window returned empty window id");

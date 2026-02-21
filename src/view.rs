@@ -1,5 +1,6 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use unicode_width::UnicodeWidthChar;
 
 use crate::model::{Mode, Model};
 use crate::tree::{get_node, FlatItem, FlatNodeKind, TreeNode};
@@ -12,10 +13,9 @@ pub fn render(model: &Model, frame: &mut Frame) {
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
-    let footer_height: u16 = if matches!(model.mode, Mode::Renaming { .. }) {
-        2
-    } else {
-        1
+    let footer_height: u16 = match model.mode {
+        Mode::Renaming { .. } | Mode::RenamingFolder { .. } | Mode::CreatingProject => 2,
+        _ => 1,
     };
 
     let chunks =
@@ -40,6 +40,13 @@ pub fn render(model: &Model, frame: &mut Frame) {
     };
     let footer = Paragraph::new(footer_text).style(footer_style);
     frame.render_widget(footer, chunks[1]);
+
+    // Show terminal block cursor in input modes
+    if let Some(prefix_len) = input_prefix_len(&model.mode) {
+        let cursor_x = chunks[1].x + prefix_len + model.input_cursor as u16;
+        let cursor_y = chunks[1].y;
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
 }
 
 fn render_tree_item(
@@ -72,7 +79,7 @@ fn render_tree_item(
             }
             (FlatNodeKind::Window, TreeNode::Window { info }) => {
                 let branch = window_branch(model.tree(), &item.path);
-                if info.active {
+                if info.id == model.sidebar_window_id {
                     let content = format!("{}{} * {}", indent, branch, info.name);
                     line.push_str(&truncate(&content, width));
                     style = style.fg(Color::Yellow);
@@ -105,8 +112,13 @@ fn build_footer_text(model: &Model, width: usize) -> String {
 
     match &model.mode {
         Mode::Normal => truncate("[r]ename [x]close [c]new [C]project", width),
-        Mode::Renaming { .. } => {
-            let line1 = truncate(&format!("Rename: {}_", model.input_buffer), width);
+        Mode::Renaming { .. } | Mode::RenamingFolder { .. } => {
+            let line1 = truncate(&format!("Rename: {}", model.input_buffer), width);
+            let line2 = truncate("[enter] ok [esc] cancel", width);
+            format!("{}\n{}", line1, line2)
+        }
+        Mode::CreatingProject => {
+            let line1 = truncate(&format!("Project: {}", model.input_buffer), width);
             let line2 = truncate("[enter] ok [esc] cancel", width);
             format!("{}\n{}", line1, line2)
         }
@@ -137,10 +149,29 @@ fn window_branch(tree: &[TreeNode], path: &[usize]) -> &'static str {
     }
 }
 
-/// Truncate a string to at most `max_chars` Unicode scalar values.
-fn truncate(input: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
+/// Returns the prefix length before the input text for cursor positioning.
+fn input_prefix_len(mode: &Mode) -> Option<u16> {
+    match mode {
+        Mode::Renaming { .. } | Mode::RenamingFolder { .. } => Some("Rename: ".len() as u16),
+        Mode::CreatingProject => Some("Project: ".len() as u16),
+        _ => None,
+    }
+}
+
+/// Truncate a string to fit within `max_cols` terminal display columns.
+fn truncate(input: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
         return String::new();
     }
-    input.chars().take(max_chars).collect()
+    let mut cols = 0;
+    let mut result = String::new();
+    for ch in input.chars() {
+        let w = ch.width().unwrap_or(0);
+        if cols + w > max_cols {
+            break;
+        }
+        result.push(ch);
+        cols += w;
+    }
+    result
 }

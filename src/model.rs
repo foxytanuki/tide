@@ -13,6 +13,7 @@ pub struct Model {
     pub session_id: String,
     pub mode: Mode,
     pub input_buffer: String,
+    pub input_cursor: usize,
     pub should_quit: bool,
     pub error_message: Option<String>,
     // Preview state
@@ -35,6 +36,8 @@ pub struct Model {
 pub enum Mode {
     Normal,
     Renaming { window_id: String },
+    RenamingFolder { folder_name: String },
+    CreatingProject,
     ConfirmClose { window_id: String },
 }
 
@@ -69,6 +72,7 @@ impl Model {
             session_id,
             mode: Mode::Normal,
             input_buffer: String::new(),
+            input_cursor: 0,
             should_quit: false,
             error_message: None,
             sidebar_pane_id,
