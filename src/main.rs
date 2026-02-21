@@ -26,7 +26,7 @@ use tracing::{debug, error, info, warn};
 use crate::cmd::Cmd;
 use crate::model::Model;
 use crate::msg::Msg;
-use crate::tmux::{TmuxControl, TmuxEvent};
+use crate::tmux::{quote_tmux, TmuxControl, TmuxEvent};
 use crate::update::update;
 use crate::view::render;
 
@@ -814,20 +814,3 @@ async fn restore_window_layout_without_sidebar(
     }
 }
 
-/// Escape a string for use in tmux command arguments.
-/// tmux control mode uses its own parser (not shell). Double-quote and escape inside.
-fn quote_tmux(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() + 2);
-    out.push('"');
-    for c in input.chars() {
-        match c {
-            '"' | '\\' | '$' | '#' => {
-                out.push('\\');
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
