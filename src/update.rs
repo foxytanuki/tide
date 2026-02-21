@@ -14,11 +14,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
     // Clear error on any user action
     if !matches!(
         msg,
-        Msg::Tick
-            | Msg::WindowAdded(_)
-            | Msg::WindowClosed(_)
-            | Msg::WindowRenamed(_, _)
-            | Msg::WindowListLoaded(_)
+        Msg::WindowChanged | Msg::WindowListLoaded(_)
     ) {
         model.error_message = None;
     }
@@ -51,9 +47,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                 Cmd::ListWindows,
             ]
         }
-        Msg::WindowAdded(_) | Msg::WindowClosed(_) | Msg::WindowRenamed(_, _) => {
-            vec![Cmd::ListWindows]
-        }
+        Msg::WindowChanged => vec![Cmd::ListWindows],
         Msg::WindowListLoaded(windows) => {
             // Save folder expanded state before rebuilding
             let expanded_state = collect_folder_expanded(&model.tree);
@@ -76,7 +70,6 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             vec![Cmd::Render]
         }
         Msg::Key(event) => handle_key(model, event),
-        Msg::Tick => vec![],
         Msg::Quit => {
             model.should_quit = true;
             vec![Cmd::RestorePreview, Cmd::Quit]

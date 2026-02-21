@@ -222,9 +222,9 @@ async fn main() -> Result<()> {
                 debug!(?tmux_event, "received tmux event");
 
                 let cmds = match tmux_event {
-                    TmuxEvent::WindowAdd(id) => update(&mut model, Msg::WindowAdded(id)),
-                    TmuxEvent::WindowClose(id) => update(&mut model, Msg::WindowClosed(id)),
-                    TmuxEvent::WindowRenamed(id, name) => update(&mut model, Msg::WindowRenamed(id, name)),
+                    TmuxEvent::WindowAdd(_)
+                    | TmuxEvent::WindowClose(_)
+                    | TmuxEvent::WindowRenamed(_, _) => update(&mut model, Msg::WindowChanged),
                     TmuxEvent::SessionWindowChanged(_, window_id) => {
                         update(&mut model, Msg::WindowFocusChanged(window_id))
                     }

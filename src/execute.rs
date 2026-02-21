@@ -274,11 +274,6 @@ pub async fn execute_commands(
                 }
             }
             Cmd::Quit => return false,
-            Cmd::Batch(batch) => {
-                for c in batch.into_iter().rev() {
-                    queue.push_front(c);
-                }
-            }
         }
     }
 

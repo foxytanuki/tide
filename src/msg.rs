@@ -8,9 +8,7 @@ pub enum Msg {
     Key(KeyEvent),
 
     // tmux events (from control mode)
-    WindowAdded(String),
-    WindowClosed(String),
-    WindowRenamed(String, String),
+    WindowChanged,
     WindowListLoaded(Vec<WindowInfo>),
     WindowFocusChanged(String), // window_id
 
@@ -25,7 +23,5 @@ pub enum Msg {
     RenameWindow,
     CloseWindow,
 
-    // Internal
-    Tick,
     Quit,
 }

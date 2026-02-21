@@ -14,7 +14,4 @@ pub enum Cmd {
     // App commands
     Render,
     Quit,
-
-    // Batch
-    Batch(Vec<Cmd>),
 }
