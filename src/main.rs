@@ -124,32 +124,8 @@ async fn main() -> Result<()> {
     // Falls back silently on older tmux versions.
     let _ = tmux.send_command("refresh-client -f no-output").await;
 
-    // Detect sidebar pane, its window, and sibling (home) pane
-    let sidebar_pane_id = env::var("TMUX_PANE").unwrap_or_default();
-    debug!(sidebar_pane_id, "detected sidebar pane");
-
-    let sidebar_window_id = tmux
-        .send_command(&format!(
-            "display-message -t {sidebar_pane_id} -p '#{{window_id}}'"
-        ))
-        .await
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    debug!(sidebar_window_id, "detected sidebar window");
-
-    let pane_list = tmux
-        .send_command(&format!(
-            "list-panes -t {sidebar_window_id} -F '#{{pane_id}}'"
-        ))
-        .await
-        .unwrap_or_default();
-    let home_pane_id = pane_list
-        .lines()
-        .map(|l| l.trim())
-        .find(|l| !l.is_empty() && *l != sidebar_pane_id)
-        .unwrap_or("")
-        .to_string();
-    debug!(home_pane_id, "detected home pane");
+    let (sidebar_pane_id, sidebar_window_id, home_pane_id) =
+        detect_sidebar_context(&mut tmux).await;
 
     let mut model = Model::new(
         session_name.clone(),
@@ -246,6 +222,36 @@ async fn main() -> Result<()> {
     tmux.shutdown().await;
     info!("tmuxide shut down");
     Ok(())
+}
+
+async fn detect_sidebar_context(tmux: &mut TmuxControl) -> (String, String, String) {
+    let sidebar_pane_id = env::var("TMUX_PANE").unwrap_or_default();
+    debug!(sidebar_pane_id, "detected sidebar pane");
+
+    let sidebar_window_id = tmux
+        .send_command(&format!(
+            "display-message -t {sidebar_pane_id} -p '#{{window_id}}'"
+        ))
+        .await
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    debug!(sidebar_window_id, "detected sidebar window");
+
+    let pane_list = tmux
+        .send_command(&format!(
+            "list-panes -t {sidebar_window_id} -F '#{{pane_id}}'"
+        ))
+        .await
+        .unwrap_or_default();
+    let home_pane_id = pane_list
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && *l != sidebar_pane_id)
+        .unwrap_or("")
+        .to_string();
+    debug!(home_pane_id, "detected home pane");
+
+    (sidebar_pane_id, sidebar_window_id, home_pane_id)
 }
 
 fn spawn_input_thread(tx: mpsc::UnboundedSender<Event>) {
