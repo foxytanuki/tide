@@ -81,14 +81,24 @@ fn build_sidebar_inner_cmd() -> String {
 }
 
 fn ensure_session_exists(session: &str) -> Result<()> {
+    let already = std::process::Command::new("tmux")
+        .args(["has-session", "-t", session])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if already {
+        return Ok(());
+    }
     let status = std::process::Command::new("tmux")
-        .args(["new-session", "-Ad", "-s", session])
+        .args(["new-session", "-d", "-s", session])
         .env_remove("TMUX")
         .status()?;
     if status.success() {
         Ok(())
     } else {
-        anyhow::bail!("failed to ensure tmux session '{}'", session);
+        anyhow::bail!("failed to create tmux session '{}'", session);
     }
 }
 
