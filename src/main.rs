@@ -10,6 +10,7 @@ mod view;
 
 use std::env;
 use std::io;
+use std::os::unix::process::CommandExt;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -186,6 +187,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Show restart notification
+    if env::var("TIDE_RESTARTED").is_ok() {
+        env::remove_var("TIDE_RESTARTED");
+        model.info_message = Some("restarted".to_string());
+        let _ = terminal.draw(|f| render(&model, f));
+    }
+
     // Focus sidebar pane on startup
     let _ = tmux
         .send_command(&format!("select-pane -t {}", sidebar_pane_id))
@@ -255,6 +263,8 @@ async fn main() -> Result<()> {
         }
     }
 
+    let restart = model.restart_requested;
+
     // Restore previous prefix+f binding (or unbind if none existed)
     if let Some(ref binding) = prev_f_binding {
         let _ = tmux.send_command(binding).await;
@@ -262,6 +272,21 @@ async fn main() -> Result<()> {
         let _ = tmux.send_command("unbind-key f").await;
     }
     tmux.shutdown().await;
+
+    if restart {
+        info!("restarting tide via exec");
+        // TerminalGuard will drop and restore terminal before exec
+        drop(_guard);
+        let exe = env::current_exe().context("failed to get current exe path")?;
+        let args: Vec<String> = env::args().collect();
+        let err = std::process::Command::new(&exe)
+            .args(&args[1..])
+            .env("TIDE_RESTARTED", "1")
+            .exec();
+        // exec() only returns on error
+        anyhow::bail!("exec failed: {err}");
+    }
+
     info!("tide shut down");
     Ok(())
 }

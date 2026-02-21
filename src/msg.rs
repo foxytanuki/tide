@@ -25,5 +25,6 @@ pub enum Msg {
     RenameWindow,
     CloseWindow,
 
+    Restart,
     Quit,
 }

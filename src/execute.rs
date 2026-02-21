@@ -431,6 +431,7 @@ pub async fn execute_commands<T: TmuxApi>(
                     model.error_message = Some(format!("render: {err}"));
                 }
             }
+            Cmd::Restart => return false,
             Cmd::Quit => return false,
         }
     }

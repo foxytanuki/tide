@@ -13,5 +13,6 @@ pub enum Cmd {
 
     // App commands
     Render,
+    Restart,
     Quit,
 }

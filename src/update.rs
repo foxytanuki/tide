@@ -20,6 +20,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         Msg::WindowChanged | Msg::WindowRenamed { .. } | Msg::WindowListLoaded(_)
     ) {
         model.error_message = None;
+        model.info_message = None;
     }
 
     match msg {
@@ -231,6 +232,11 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             }
         }
         Msg::Key(event) => handle_key(model, event),
+        Msg::Restart => {
+            model.should_quit = true;
+            model.restart_requested = true;
+            vec![Cmd::RestorePreview, Cmd::Restart]
+        }
         Msg::Quit => {
             model.should_quit = true;
             vec![Cmd::RestorePreview, Cmd::Quit]
@@ -504,6 +510,7 @@ fn handle_normal_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
         KeyCode::Char('x') => update(model, Msg::CloseWindow),
         KeyCode::Char('c') => update(model, Msg::NewWindow),
         KeyCode::Char('C') => update(model, Msg::NewProject),
+        KeyCode::Char('R') => update(model, Msg::Restart),
         KeyCode::Char('q') => update(model, Msg::Quit),
         _ => vec![],
     }

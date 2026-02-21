@@ -35,6 +35,8 @@ pub fn render(model: &Model, frame: &mut Frame) {
     let footer_text = build_footer_text(model, chunks[1].width as usize);
     let footer_style = if model.error_message.is_some() {
         Style::default().fg(Color::Red)
+    } else if model.info_message.is_some() {
+        Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::DarkGray)
     };
@@ -109,9 +111,12 @@ fn build_footer_text(model: &Model, width: usize) -> String {
     if let Some(err) = &model.error_message {
         return truncate(err, width);
     }
+    if let Some(info) = &model.info_message {
+        return truncate(info, width);
+    }
 
     match &model.mode {
-        Mode::Normal => truncate("[r]ename [x]close [c]new [C]project", width),
+        Mode::Normal => truncate("[r]ename [x]close [c]new [C]proj [R]estart", width),
         Mode::Renaming { .. } | Mode::RenamingFolder { .. } => {
             let line1 = truncate(&format!("Rename: {}", model.input_buffer), width);
             let line2 = truncate("[enter] ok [esc] cancel", width);
