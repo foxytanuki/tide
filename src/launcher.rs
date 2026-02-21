@@ -83,6 +83,7 @@ fn build_sidebar_inner_cmd() -> String {
 fn ensure_session_exists(session: &str) -> Result<()> {
     let status = std::process::Command::new("tmux")
         .args(["new-session", "-Ad", "-s", session])
+        .env_remove("TMUX")
         .status()?;
     if status.success() {
         Ok(())

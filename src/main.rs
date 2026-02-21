@@ -12,7 +12,7 @@ use std::env;
 use std::io;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -125,7 +125,7 @@ async fn main() -> Result<()> {
     let _ = tmux.send_command("refresh-client -f no-output").await;
 
     let (sidebar_pane_id, sidebar_window_id, home_pane_id) =
-        detect_sidebar_context(&mut tmux).await;
+        detect_sidebar_context(&mut tmux).await?;
 
     let mut model = Model::new(
         session_name.clone(),
@@ -133,6 +133,23 @@ async fn main() -> Result<()> {
         home_pane_id,
         sidebar_window_id,
     );
+
+    // Save existing prefix+f binding before overwriting
+    let prev_f_binding = tmux
+        .send_command("list-keys -T prefix")
+        .await
+        .ok()
+        .and_then(|output| {
+            output
+                .lines()
+                .find(|line| {
+                    line.split_whitespace()
+                        .skip_while(|&w| w != "prefix")
+                        .nth(1)
+                        == Some("f")
+                })
+                .map(|s| s.trim().to_string())
+        });
 
     // Bind prefix+f to jump back to sidebar pane
     let _ = tmux
@@ -218,14 +235,23 @@ async fn main() -> Result<()> {
         }
     }
 
-    let _ = tmux.send_command("unbind-key f").await;
+    // Restore previous prefix+f binding (or unbind if none existed)
+    if let Some(ref binding) = prev_f_binding {
+        let _ = tmux.send_command(binding).await;
+    } else {
+        let _ = tmux.send_command("unbind-key f").await;
+    }
     tmux.shutdown().await;
     info!("tmuxide shut down");
     Ok(())
 }
 
-async fn detect_sidebar_context(tmux: &mut TmuxControl) -> (String, String, String) {
-    let sidebar_pane_id = env::var("TMUX_PANE").unwrap_or_default();
+async fn detect_sidebar_context(tmux: &mut TmuxControl) -> Result<(String, String, String)> {
+    let sidebar_pane_id = env::var("TMUX_PANE")
+        .context("TMUX_PANE not set; tmuxide must run inside a tmux pane")?;
+    if sidebar_pane_id.is_empty() {
+        anyhow::bail!("TMUX_PANE is empty");
+    }
     debug!(sidebar_pane_id, "detected sidebar pane");
 
     let sidebar_window_id = tmux
@@ -234,7 +260,10 @@ async fn detect_sidebar_context(tmux: &mut TmuxControl) -> (String, String, Stri
         ))
         .await
         .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+        .context("failed to detect sidebar window id")?;
+    if sidebar_window_id.is_empty() {
+        anyhow::bail!("detected empty sidebar window id");
+    }
     debug!(sidebar_window_id, "detected sidebar window");
 
     let pane_list = tmux
@@ -242,7 +271,7 @@ async fn detect_sidebar_context(tmux: &mut TmuxControl) -> (String, String, Stri
             "list-panes -t {sidebar_window_id} -F '#{{pane_id}}'"
         ))
         .await
-        .unwrap_or_default();
+        .context("failed to list panes in sidebar window")?;
     let home_pane_id = pane_list
         .lines()
         .map(|l| l.trim())
@@ -251,7 +280,7 @@ async fn detect_sidebar_context(tmux: &mut TmuxControl) -> (String, String, Stri
         .to_string();
     debug!(home_pane_id, "detected home pane");
 
-    (sidebar_pane_id, sidebar_window_id, home_pane_id)
+    Ok((sidebar_pane_id, sidebar_window_id, home_pane_id))
 }
 
 fn spawn_input_thread(tx: mpsc::UnboundedSender<Event>) {

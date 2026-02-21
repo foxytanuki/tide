@@ -232,10 +232,17 @@ impl TmuxControl {
     }
 
     pub async fn send_command(&mut self, cmd: &str) -> Result<String> {
+        let cmd = cmd.trim_end_matches('\n');
+        if cmd.contains('\n') {
+            return Err(anyhow!(
+                "tmux command must not contain embedded newlines: {:?}",
+                cmd
+            ));
+        }
+
         let (tx, rx) = oneshot::channel::<Result<String>>();
         self.waiters.lock().await.push_back(tx);
 
-        let cmd = cmd.trim_end_matches('\n');
         tracing::trace!(cmd, "tmux send");
         if let Err(err) = self.stdin.write_all(cmd.as_bytes()).await {
             self.waiters.lock().await.pop_back();
@@ -255,7 +262,11 @@ impl TmuxControl {
         let result = match timeout(Duration::from_secs(5), rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(anyhow!("tmux command response channel closed")),
-            Err(_) => Err(anyhow!("timed out waiting for tmux response")),
+            Err(_) => {
+                // Remove stale waiter to prevent misrouting future responses
+                self.waiters.lock().await.pop_back();
+                Err(anyhow!("timed out waiting for tmux response"))
+            }
         };
 
         if let Err(ref err) = result {
@@ -301,6 +312,7 @@ impl TmuxControl {
 impl Drop for TmuxControl {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
+        let _ = self.child.try_wait();
         self.reader_task.abort();
     }
 }
