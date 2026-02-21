@@ -167,6 +167,49 @@ pub fn get_node_mut<'a>(nodes: &'a mut [TreeNode], path: &[usize]) -> Result<&'a
     descend(nodes, path)
 }
 
+/// Expand folder ancestors needed to show the given window in the flat list.
+///
+/// Returns `true` when `window_id` was found.
+pub fn expand_to_window_by_id(nodes: &mut [TreeNode], window_id: &str) -> bool {
+    for node in nodes.iter_mut() {
+        match node {
+            TreeNode::Window { info } => {
+                if info.id == window_id {
+                    return true;
+                }
+            }
+            TreeNode::Folder {
+                expanded, children, ..
+            } => {
+                if expand_to_window_by_id(children.as_mut_slice(), window_id) {
+                    *expanded = true;
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Return the flat index for a window id, if present in the current tree.
+pub fn find_window_flat_index_by_id(
+    flat_items: &[FlatItem],
+    nodes: &[TreeNode],
+    window_id: &str,
+) -> Option<usize> {
+    for (idx, item) in flat_items.iter().enumerate() {
+        if item.kind != FlatNodeKind::Window {
+            continue;
+        }
+        if let Ok(TreeNode::Window { info }) = get_node(nodes, &item.path) {
+            if info.id == window_id {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
 fn flatten_node(node: &TreeNode, depth: usize, path: &mut Vec<usize>, out: &mut Vec<FlatItem>) {
     match node {
         TreeNode::Folder {
@@ -337,6 +380,38 @@ mod tests {
 
         let child = get_node(&tree, &flat[1].path).unwrap();
         assert_eq!(window_name(child), "edit");
+    }
+
+    #[test]
+    fn find_window_flat_index_by_id_finds_window() {
+        let tree = build_tree(&[
+            w("@1", 1, "proj:edit"),
+            w("@2", 2, "proj:term"),
+            w("@3", 3, "solo"),
+        ]);
+        let flat = flatten(&tree);
+
+        assert_eq!(find_window_flat_index_by_id(&flat, &tree, "@2"), Some(2));
+        assert_eq!(find_window_flat_index_by_id(&flat, &tree, "@missing"), None);
+    }
+
+    #[test]
+    fn expand_to_window_by_id_expands_path() {
+        let mut tree = build_tree(&[
+            w("@1", 1, "proj:edit"),
+            w("@2", 2, "solo"),
+        ]);
+
+        assert!(expand_to_window_by_id(tree.as_mut_slice(), "@1"));
+
+        assert_eq!(
+            match &tree[0] {
+                TreeNode::Folder { expanded, .. } => *expanded,
+                _ => false,
+            },
+            true
+        );
+        assert!(!expand_to_window_by_id(tree.as_mut_slice(), "@missing"));
     }
 
     fn window_name(node: &TreeNode) -> &str {

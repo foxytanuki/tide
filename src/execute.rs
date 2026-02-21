@@ -9,7 +9,7 @@ use ratatui::Terminal;
 use tracing::{debug, info, warn};
 
 use crate::cmd::Cmd;
-use crate::model::{Model, PreviewState};
+use crate::model::{Model, PendingRename, PreviewState};
 use crate::msg::Msg;
 use crate::tmux::{quote_tmux, TmuxControl, WindowInfo};
 use crate::update::update;
@@ -234,20 +234,87 @@ pub async fn execute_commands<T: TmuxApi>(
             }
             Cmd::NewWindow { name } => {
                 debug!(name, "creating new window");
-                let new_cmd = format!("new-window -d -n {}", quote_tmux(&name));
-                if let Err(err) = tmux.send_command(&new_cmd).await {
-                    warn!(%err, "new-window failed");
-                    model.error_message = Some(format!("new-window: {err}"));
-                    queue.push_front(Cmd::Render);
+                let new_cmd = format!(
+                    "new-window -d -n {} -P -F '#{{window_id}}'",
+                    quote_tmux(&name)
+                );
+                match tmux.send_command(&new_cmd).await {
+                    Ok(output) => {
+                        let window_id = output.trim();
+                        if !window_id.is_empty() {
+                            let disable_rename = format!(
+                                "set-window-option -t {} automatic-rename off ; set-window-option -t {} allow-rename off",
+                                window_id, window_id
+                            );
+                            if let Err(err) = tmux.send_command(&disable_rename).await {
+                                warn!(
+                                    id = %window_id,
+                                    name = %name,
+                                    %err,
+                                    "failed to disable rename updates for new window"
+                                );
+                            } else {
+                                debug!(
+                                    id = %window_id,
+                                    "disabled automatic/allow-rename for new window"
+                                );
+                            }
+
+                            model.pending_renames.insert(
+                                window_id.to_string(),
+                                PendingRename {
+                                    target_name: name.clone(),
+                                    observed_count: 0,
+                                },
+                            );
+                            model.pending_rename_last_window_id = Some(window_id.to_string());
+                            debug!(
+                                id = %window_id,
+                                name = %name,
+                                "tracking new window for rename stabilization"
+                            );
+                            queue.push_front(Cmd::ListWindows);
+                        } else {
+                            warn!("new-window returned empty window id");
+                        }
+                    }
+                    Err(err) => {
+                        warn!(%err, "new-window failed");
+                        model.error_message = Some(format!("new-window: {err}"));
+                        queue.push_front(Cmd::Render);
+                    }
                 }
             }
             Cmd::RenameWindow { id, name } => {
                 debug!(id, name, "renaming window");
+                let disable_rename = format!(
+                    "set-window-option -t {} automatic-rename off ; set-window-option -t {} allow-rename off",
+                    id, id
+                );
+                if let Err(err) = tmux.send_command(&disable_rename).await {
+                    warn!(%id, %err, "failed to disable automatic-rename before rename");
+                } else {
+                    debug!(%id, "disabled rename options before rename");
+                }
                 let cmd_str = format!("rename-window -t {} {}", id, quote_tmux(&name));
                 if let Err(err) = tmux.send_command(&cmd_str).await {
                     warn!(%err, "rename-window failed");
                     model.error_message = Some(format!("rename-window: {err}"));
                     queue.push_front(Cmd::Render);
+                } else {
+                    if let Err(err) = tmux
+                        .send_command(&disable_rename)
+                        .await
+                    {
+                        warn!(
+                            %id,
+                            %err,
+                            "failed to keep rename updates disabled after rename"
+                        );
+                    } else {
+                        debug!(%id, "kept rename options disabled after rename");
+                    }
+                    queue.push_front(Cmd::ListWindows);
                 }
             }
             Cmd::CloseWindow { id } => {

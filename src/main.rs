@@ -185,6 +185,12 @@ async fn main() -> Result<()> {
         tmux.shutdown().await;
         return Ok(());
     }
+
+    // Focus sidebar pane on startup
+    let _ = tmux
+        .send_command(&format!("select-pane -t {}", sidebar_pane_id))
+        .await;
+
     info!("entering main loop");
 
     loop {
@@ -223,9 +229,12 @@ async fn main() -> Result<()> {
                 debug!(?tmux_event, "received tmux event");
 
                 let cmds = match tmux_event {
-                    TmuxEvent::WindowAdd(_)
-                    | TmuxEvent::WindowClose(_)
-                    | TmuxEvent::WindowRenamed(_, _) => update(&mut model, Msg::WindowChanged),
+                    TmuxEvent::WindowAdd(_) | TmuxEvent::WindowClose(_) => {
+                        update(&mut model, Msg::WindowChanged)
+                    }
+                    TmuxEvent::WindowRenamed(window_id, name) => {
+                        update(&mut model, Msg::WindowRenamed { window_id, name })
+                    }
                     TmuxEvent::SessionWindowChanged(ref sid, window_id)
                         if *sid == model.session_id =>
                     {

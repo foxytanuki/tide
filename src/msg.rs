@@ -9,6 +9,7 @@ pub enum Msg {
 
     // tmux events (from control mode)
     WindowChanged,
+    WindowRenamed { window_id: String, name: String },
     WindowListLoaded(Vec<WindowInfo>),
     WindowFocusChanged(String), // window_id
 
@@ -20,6 +21,7 @@ pub enum Msg {
     ToggleFolder,
     Escape,
     NewWindow,
+    NewProject,
     RenameWindow,
     CloseWindow,
 

@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use crate::tree::{flatten, get_node, FlatItem, TreeNode, WindowInfo};
+use crate::tree::{
+    expand_to_window_by_id, find_window_flat_index_by_id, flatten, get_node, FlatItem, TreeNode,
+    WindowInfo,
+};
 
 pub struct Model {
     tree: Vec<TreeNode>,
@@ -22,6 +25,10 @@ pub struct Model {
     pub ignore_window_changes: u8,
     /// Window ID expected while suppression is active.
     pub pending_internal_focus_window: Option<String>,
+    /// Windows tracked for rename stabilization.
+    pub pending_renames: HashMap<String, PendingRename>,
+    /// Most recent pending-rename target, used to keep selection stable.
+    pub pending_rename_last_window_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +45,12 @@ pub enum PreviewState {
         original_window_id: String,
         original_home_pane_id: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRename {
+    pub target_name: String,
+    pub observed_count: u8,
 }
 
 impl Model {
@@ -65,6 +78,8 @@ impl Model {
             layout_without_sidebar_by_window: HashMap::new(),
             ignore_window_changes: 0,
             pending_internal_focus_window: None,
+            pending_renames: HashMap::new(),
+            pending_rename_last_window_id: None,
         }
     }
 
@@ -84,10 +99,19 @@ impl Model {
         self.cursor = idx;
     }
 
-    /// Replace the tree and rebuild the flat list + clamp cursor.
-    pub fn replace_tree(&mut self, new_tree: Vec<TreeNode>) {
+    pub fn replace_tree_preserve_selection(&mut self, new_tree: Vec<TreeNode>, selected_window_id: Option<&str>) {
         self.tree = new_tree;
+        if let Some(window_id) = selected_window_id {
+            expand_to_window_by_id(&mut self.tree, window_id);
+        }
         self.rebuild_flat();
+        if let Some(window_id) = selected_window_id {
+            if let Some(index) =
+                find_window_flat_index_by_id(&self.flat_items, &self.tree, window_id)
+            {
+                self.cursor = index;
+            }
+        }
     }
 
     /// Mutate the tree in-place, then rebuild the flat list + clamp cursor.
@@ -122,5 +146,63 @@ impl Model {
             TreeNode::Window { info } => Some(info),
             TreeNode::Folder { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::{build_tree, WindowInfo};
+
+    fn test_model() -> Model {
+        Model::new(
+            "s".to_string(),
+            "$1".to_string(),
+            "%sidebar".to_string(),
+            "%home".to_string(),
+            "@home".to_string(),
+        )
+    }
+
+    fn window(id: &str, index: usize, name: &str) -> WindowInfo {
+        WindowInfo {
+            id: id.to_string(),
+            index,
+            name: name.to_string(),
+            active: false,
+        }
+    }
+
+    #[test]
+    fn replace_tree_preserve_selection_expands_folder_for_target() {
+        let mut model = test_model();
+        let first = vec![
+            window("@1", 1, "new:one"),
+            window("@2", 2, "new:two"),
+            window("@3", 3, "dev"),
+        ];
+        let first_tree = build_tree(&first);
+        model.replace_tree_preserve_selection(first_tree, Some("@2"));
+        assert_eq!(model.selected_window_info().map(|w| w.id.as_str()), Some("@2"));
+        assert_eq!(model.cursor(), 2);
+
+        let mut second_tree = build_tree(&[
+            window("@1", 1, "new:uno"),
+            window("@2", 2, "new:dos"),
+            window("@3", 3, "dev"),
+        ]);
+        if let TreeNode::Folder { expanded, .. } = &mut second_tree[0] {
+            *expanded = false;
+        }
+
+        model.replace_tree_preserve_selection(second_tree, Some("@2"));
+
+        assert_eq!(model.selected_window_info().map(|w| w.id.as_str()), Some("@2"));
+        assert_eq!(model.cursor(), 2);
+        assert!(matches!(
+            model.flat_items()[model.cursor()].kind,
+            crate::tree::FlatNodeKind::Window
+        ));
+        assert_eq!(model.flat_items().len(), 4);
     }
 }

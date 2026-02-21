@@ -104,7 +104,7 @@ fn build_footer_text(model: &Model, width: usize) -> String {
     }
 
     match &model.mode {
-        Mode::Normal => truncate("[r]ename [x]close [c]new", width),
+        Mode::Normal => truncate("[r]ename [x]close [c]new [C]project", width),
         Mode::Renaming { .. } => {
             let line1 = truncate(&format!("Rename: {}_", model.input_buffer), width);
             let line2 = truncate("[enter] ok [esc] cancel", width);
