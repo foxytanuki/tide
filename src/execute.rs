@@ -113,11 +113,11 @@ pub async fn execute_commands<T: TmuxApi>(
 
                 // Action phase: batch all visual tmux operations into a single
                 // command so tmux processes them in one server tick (no flicker).
+                // -l 30 sets sidebar width at join time to avoid intermediate resize.
                 let mut batch = format!(
-                    "join-pane -dfhb -s {} -t {} ; select-window -t {} ; select-pane -t {} ; resize-pane -t {} -x 30",
+                    "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
                     model.sidebar_pane_id, join_target,
                     target_window_id,
-                    model.sidebar_pane_id,
                     model.sidebar_pane_id,
                 );
                 if let Some(layout) = model.layout_without_sidebar_by_window.get(&source_window) {
@@ -174,12 +174,11 @@ pub async fn execute_commands<T: TmuxApi>(
                     let source_window = model.sidebar_window_id.clone();
                     remember_window_layout_without_sidebar(model, tmux, &orig_window).await;
 
-                    // Batch: join sidebar back + switch + focus + resize + restore source
+                    // Batch: join sidebar back + switch + focus + restore source
                     let mut batch = format!(
-                        "join-pane -dfhb -s {} -t {} ; select-window -t {} ; select-pane -t {} ; resize-pane -t {} -x 30",
+                        "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
                         model.sidebar_pane_id, orig_home,
                         orig_window,
-                        model.sidebar_pane_id,
                         model.sidebar_pane_id,
                     );
                     if let Some(layout) = model.layout_without_sidebar_by_window.get(&source_window) {
@@ -190,10 +189,9 @@ pub async fn execute_commands<T: TmuxApi>(
                         warn!(%err, "restore batch failed, trying fallback");
                         // Fallback: join to window instead of home pane
                         let mut fallback = format!(
-                            "join-pane -dfhb -s {} -t {} ; select-window -t {} ; select-pane -t {} ; resize-pane -t {} -x 30",
+                            "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
                             model.sidebar_pane_id, orig_window,
                             orig_window,
-                            model.sidebar_pane_id,
                             model.sidebar_pane_id,
                         );
                         if let Some(layout) = model.layout_without_sidebar_by_window.get(&source_window) {
@@ -363,11 +361,10 @@ pub async fn execute_commands<T: TmuxApi>(
                     target_home.clone()
                 };
 
-                // Action phase: batch join + resize (+ optional source restore)
+                // Action phase: batch join (+ optional source restore)
                 let mut batch = format!(
-                    "join-pane -dfhb -s {} -t {} ; resize-pane -t {} -x 30",
+                    "join-pane -dfhb -l 30 -s {} -t {}",
                     model.sidebar_pane_id, join_target,
-                    model.sidebar_pane_id,
                 );
                 if let Some(layout) = model.layout_without_sidebar_by_window.get(&source_window) {
                     write!(batch, " ; select-layout -t {} {}", source_window, quote_tmux(layout)).unwrap();

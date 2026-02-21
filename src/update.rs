@@ -255,10 +255,10 @@ fn handle_cursor_down(model: &mut Model) -> Vec<Cmd> {
 fn preview_current_item(model: &Model) -> Vec<Cmd> {
     if let Some(info) = model.selected_window_info() {
         vec![
+            Cmd::Render,
             Cmd::PreviewWindow {
                 id: info.id.clone(),
             },
-            Cmd::Render,
         ]
     } else {
         vec![Cmd::Render]

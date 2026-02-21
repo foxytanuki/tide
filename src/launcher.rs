@@ -91,15 +91,28 @@ fn ensure_session_exists(session: &str) -> Result<()> {
     if already {
         return Ok(());
     }
+    let initial_window = "general:tab1";
     let status = std::process::Command::new("tmux")
-        .args(["new-session", "-d", "-s", session])
+        .args(["new-session", "-d", "-s", session, "-n", initial_window])
         .env_remove("TMUX")
         .status()?;
-    if status.success() {
-        Ok(())
-    } else {
+    if !status.success() {
         anyhow::bail!("failed to create tmux session '{}'", session);
     }
+    // Disable automatic window renaming for the initial window
+    let _ = std::process::Command::new("tmux")
+        .args([
+            "set-window-option", "-t", session,
+            "automatic-rename", "off",
+        ])
+        .status();
+    let _ = std::process::Command::new("tmux")
+        .args([
+            "set-window-option", "-t", session,
+            "allow-rename", "off",
+        ])
+        .status();
+    Ok(())
 }
 
 fn split_sidebar_in_session(session: &str, inner_cmd: &str, detached: bool) -> Result<()> {
