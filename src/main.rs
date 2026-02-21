@@ -31,6 +31,77 @@ use crate::update::update;
 use crate::view::render;
 
 type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
+const TMUXIDE_SESSION_NAME: &str = "tmuxide";
+
+fn build_sidebar_inner_cmd() -> String {
+    let exe = env::current_exe()
+        .unwrap_or_else(|_| "tmuxide".into())
+        .display()
+        .to_string();
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    let mut inner_cmd = String::from("TMUXIDE_SIDEBAR=1");
+    if let Ok(log) = env::var("TMUXIDE_LOG") {
+        inner_cmd.push_str(" TMUXIDE_LOG=");
+        inner_cmd.push_str(&log);
+    }
+    inner_cmd.push(' ');
+    inner_cmd.push_str(&exe);
+    for arg in &args {
+        inner_cmd.push(' ');
+        inner_cmd.push_str(arg);
+    }
+    inner_cmd
+}
+
+fn ensure_session_exists(session: &str) -> Result<()> {
+    let status = std::process::Command::new("tmux")
+        .args(["new-session", "-Ad", "-s", session])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("failed to ensure tmux session '{}'", session);
+    }
+}
+
+fn split_sidebar_in_session(session: &str, inner_cmd: &str, detached: bool) -> Result<()> {
+    let mut cmd = std::process::Command::new("tmux");
+    cmd.arg("split-window").arg("-t").arg(session);
+    if detached {
+        cmd.arg("-d");
+    }
+    let status = cmd
+        .args(["-hb", "-l", "30", "--", "sh", "-c", inner_cmd])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("failed to split sidebar in session '{}'", session);
+    }
+}
+
+fn switch_client_to_session(session: &str) -> Result<()> {
+    let status = std::process::Command::new("tmux")
+        .args(["switch-client", "-t", session])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("failed to switch client to session '{}'", session);
+    }
+}
+
+fn attach_to_session(session: &str) -> Result<()> {
+    let status = std::process::Command::new("tmux")
+        .args(["attach-session", "-t", session])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("failed to attach to session '{}'", session);
+    }
+}
 
 fn init_logging() {
     use std::sync::Mutex;
@@ -81,37 +152,28 @@ impl Drop for TerminalGuard {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // If inside tmux but not already in a sidebar pane, re-launch as split
-    if env::var("TMUX").is_ok() && env::var("TMUXIDE_SIDEBAR").is_err() {
-        let exe = env::current_exe()
-            .unwrap_or_else(|_| "tmuxide".into())
-            .display()
-            .to_string();
-        let args: Vec<String> = env::args().skip(1).collect();
-        let mut inner_cmd = String::from("TMUXIDE_SIDEBAR=1");
-        if let Ok(log) = env::var("TMUXIDE_LOG") {
-            inner_cmd.push_str(" TMUXIDE_LOG=");
-            inner_cmd.push_str(&log);
+    // Launcher mode: if not already in sidebar process, spawn sidebar in tmuxide session.
+    if env::var("TMUXIDE_SIDEBAR").is_err() {
+        let inner_cmd = build_sidebar_inner_cmd();
+
+        if env::var("TMUX").is_ok() {
+            let current_session = detect_session_name().await;
+            ensure_session_exists(TMUXIDE_SESSION_NAME)?;
+
+            if current_session != TMUXIDE_SESSION_NAME {
+                split_sidebar_in_session(TMUXIDE_SESSION_NAME, &inner_cmd, true)?;
+                switch_client_to_session(TMUXIDE_SESSION_NAME)?;
+                std::process::exit(0);
+            }
+
+            split_sidebar_in_session(TMUXIDE_SESSION_NAME, &inner_cmd, false)?;
+            std::process::exit(0);
+        } else {
+            ensure_session_exists(TMUXIDE_SESSION_NAME)?;
+            split_sidebar_in_session(TMUXIDE_SESSION_NAME, &inner_cmd, true)?;
+            attach_to_session(TMUXIDE_SESSION_NAME)?;
+            std::process::exit(0);
         }
-        inner_cmd.push(' ');
-        inner_cmd.push_str(&exe);
-        for arg in &args {
-            inner_cmd.push(' ');
-            inner_cmd.push_str(arg);
-        }
-        let status = std::process::Command::new("tmux")
-            .args([
-                "split-window",
-                "-hb",
-                "-l",
-                "30",
-                "--",
-                "sh",
-                "-c",
-                &inner_cmd,
-            ])
-            .status();
-        std::process::exit(status.map(|s| s.code().unwrap_or(0)).unwrap_or(1));
     }
 
     init_logging();
@@ -120,6 +182,13 @@ async fn main() -> Result<()> {
         Some(s) if !s.trim().is_empty() => s,
         _ => detect_session_name().await,
     };
+    if session_name != TMUXIDE_SESSION_NAME {
+        anyhow::bail!(
+            "tmuxide only supports '{}' session (got '{}')",
+            TMUXIDE_SESSION_NAME,
+            session_name
+        );
+    }
     info!(session = %session_name, "starting tmuxide");
 
     install_panic_hook();
