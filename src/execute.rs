@@ -123,19 +123,27 @@ pub async fn execute_commands(
                             "join-pane -dfhb -s {} -t {}",
                             model.sidebar_pane_id, orig_window
                         );
-                        let _ = tmux.send_command(&join_cmd_by_window).await;
+                        if let Err(err) = tmux.send_command(&join_cmd_by_window).await {
+                            warn!(%err, "restore join-pane fallback also failed");
+                        }
                     }
                     restore_window_layout_without_sidebar(model, tmux, &source_window).await;
 
                     // Switch back to original window
-                    let _ = tmux
+                    if let Err(err) = tmux
                         .send_command(&format!("select-window -t {}", orig_window))
-                        .await;
+                        .await
+                    {
+                        warn!(%err, "restore select-window failed");
+                    }
 
                     // Focus sidebar
-                    let _ = tmux
+                    if let Err(err) = tmux
                         .send_command(&format!("select-pane -t {}", model.sidebar_pane_id))
-                        .await;
+                        .await
+                    {
+                        debug!(%err, "restore select-pane failed");
+                    }
 
                     // Force sidebar to exactly 30 columns LAST — select-window
                     // triggers layout recalculation that can override earlier resize
@@ -334,9 +342,12 @@ async fn focus_sidebar_in_window(
     {
         return Err(format!("select-window: {err}"));
     }
-    let _ = tmux
+    if let Err(err) = tmux
         .send_command(&format!("select-pane -t {}", sidebar_pane_id))
-        .await;
+        .await
+    {
+        debug!(%err, "select-pane failed");
+    }
     if let Err(err) = tmux
         .send_command(&format!("resize-pane -t {} -x 30", sidebar_pane_id))
         .await

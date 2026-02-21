@@ -50,9 +50,9 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         Msg::WindowChanged => vec![Cmd::ListWindows],
         Msg::WindowListLoaded(windows) => {
             // Save folder expanded state before rebuilding
-            let expanded_state = collect_folder_expanded(&model.tree);
-            model.tree = build_tree(&windows);
-            restore_folder_expanded(&mut model.tree, &expanded_state);
+            let expanded_state = collect_folder_expanded(model.tree());
+            let mut new_tree = build_tree(&windows);
+            restore_folder_expanded(&mut new_tree, &expanded_state);
 
             // If in Renaming/ConfirmClose mode, check target still exists
             match &model.mode {
@@ -66,7 +66,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                 Mode::Normal => {}
             }
 
-            model.rebuild_flat();
+            model.replace_tree(new_tree);
             vec![Cmd::Render]
         }
         Msg::Key(event) => handle_key(model, event),
@@ -78,8 +78,8 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
 }
 
 fn handle_cursor_up(model: &mut Model) -> Vec<Cmd> {
-    if let Some(prev) = prev_visible_item(&model.flat_items, model.cursor) {
-        model.cursor = prev;
+    if let Some(prev) = prev_visible_item(model.flat_items(), model.cursor()) {
+        model.set_cursor(prev);
         preview_current_item(model)
     } else {
         vec![]
@@ -87,8 +87,8 @@ fn handle_cursor_up(model: &mut Model) -> Vec<Cmd> {
 }
 
 fn handle_cursor_down(model: &mut Model) -> Vec<Cmd> {
-    if let Some(next) = next_visible_item(&model.flat_items, model.cursor) {
-        model.cursor = next;
+    if let Some(next) = next_visible_item(model.flat_items(), model.cursor()) {
+        model.set_cursor(next);
         preview_current_item(model)
     } else {
         vec![]
@@ -110,17 +110,18 @@ fn preview_current_item(model: &Model) -> Vec<Cmd> {
 }
 
 fn handle_select_item(model: &mut Model) -> Vec<Cmd> {
-    let item = match model.flat_items.get(model.cursor) {
+    let item = match model.flat_items().get(model.cursor()) {
         Some(item) => item.clone(),
         None => return vec![],
     };
 
     match item.kind {
         FlatNodeKind::Folder => {
-            if let Ok(node) = get_node_mut(&mut model.tree, &item.path) {
-                toggle_expand(node);
-            }
-            model.rebuild_flat();
+            model.mutate_tree(|tree| {
+                if let Ok(node) = get_node_mut(tree, &item.path) {
+                    toggle_expand(node);
+                }
+            });
             vec![Cmd::Render]
         }
         FlatNodeKind::Window => {
@@ -139,31 +140,35 @@ fn handle_select_item(model: &mut Model) -> Vec<Cmd> {
 }
 
 fn handle_collapse_or_parent(model: &mut Model) -> Vec<Cmd> {
-    let item = match model.flat_items.get(model.cursor) {
+    let item = match model.flat_items().get(model.cursor()) {
         Some(item) => item.clone(),
         None => return vec![],
     };
 
     match item.kind {
         FlatNodeKind::Folder => {
-            if let Ok(TreeNode::Folder { expanded, .. }) = get_node_mut(&mut model.tree, &item.path)
-            {
-                if *expanded {
-                    *expanded = false;
-                    model.rebuild_flat();
-                    return vec![Cmd::Render];
+            let collapsed = model.mutate_tree(|tree| {
+                if let Ok(TreeNode::Folder { expanded, .. }) = get_node_mut(tree, &item.path) {
+                    if *expanded {
+                        *expanded = false;
+                        return true;
+                    }
                 }
+                false
+            });
+            if collapsed {
+                return vec![Cmd::Render];
             }
-            if let Some(parent_idx) = find_parent_folder(&model.flat_items, model.cursor) {
-                model.cursor = parent_idx;
+            if let Some(parent_idx) = find_parent_folder(model.flat_items(), model.cursor()) {
+                model.set_cursor(parent_idx);
                 vec![Cmd::Render]
             } else {
                 vec![]
             }
         }
         FlatNodeKind::Window => {
-            if let Some(parent_idx) = find_parent_folder(&model.flat_items, model.cursor) {
-                model.cursor = parent_idx;
+            if let Some(parent_idx) = find_parent_folder(model.flat_items(), model.cursor()) {
+                model.set_cursor(parent_idx);
                 vec![Cmd::Render]
             } else {
                 vec![]
@@ -173,16 +178,17 @@ fn handle_collapse_or_parent(model: &mut Model) -> Vec<Cmd> {
 }
 
 fn handle_toggle_folder(model: &mut Model) -> Vec<Cmd> {
-    let item = match model.flat_items.get(model.cursor) {
+    let item = match model.flat_items().get(model.cursor()) {
         Some(item) => item.clone(),
         None => return vec![],
     };
 
     if item.kind == FlatNodeKind::Folder {
-        if let Ok(node) = get_node_mut(&mut model.tree, &item.path) {
-            toggle_expand(node);
-        }
-        model.rebuild_flat();
+        model.mutate_tree(|tree| {
+            if let Ok(node) = get_node_mut(tree, &item.path) {
+                toggle_expand(node);
+            }
+        });
         vec![Cmd::Render]
     } else {
         vec![]

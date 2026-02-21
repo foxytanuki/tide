@@ -23,7 +23,7 @@ pub fn render(model: &Model, frame: &mut Frame) {
 
     // Tree area
     let tree_items: Vec<ListItem> = model
-        .flat_items
+        .flat_items()
         .iter()
         .enumerate()
         .map(|(idx, item)| render_tree_item(model, idx, item, chunks[0].width as usize))
@@ -52,7 +52,7 @@ fn render_tree_item(
     let mut line = String::new();
     let mut style = Style::default();
 
-    match get_node(&model.tree, &item.path) {
+    match get_node(model.tree(), &item.path) {
         Ok(node) => match (&item.kind, node) {
             (
                 FlatNodeKind::Folder,
@@ -71,7 +71,7 @@ fn render_tree_item(
                 }
             }
             (FlatNodeKind::Window, TreeNode::Window { info }) => {
-                let branch = window_branch(&model.tree, &item.path);
+                let branch = window_branch(model.tree(), &item.path);
                 if info.active {
                     let content = format!("{}{} * {}", indent, branch, info.name);
                     line.push_str(&truncate(&content, width));
@@ -91,7 +91,7 @@ fn render_tree_item(
         }
     }
 
-    if index == model.cursor {
+    if index == model.cursor() {
         style = style.add_modifier(Modifier::REVERSED);
     }
 

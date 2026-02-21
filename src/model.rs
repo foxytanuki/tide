@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use crate::tree::{flatten, get_node, FlatItem, TreeNode, WindowInfo};
 
 pub struct Model {
-    pub tree: Vec<TreeNode>,
-    pub flat_items: Vec<FlatItem>,
-    pub cursor: usize,
+    tree: Vec<TreeNode>,
+    flat_items: Vec<FlatItem>,
+    cursor: usize,
     pub session_name: String,
     pub mode: Mode,
     pub input_buffer: String,
@@ -63,7 +63,39 @@ impl Model {
         }
     }
 
-    pub fn rebuild_flat(&mut self) {
+    pub fn tree(&self) -> &[TreeNode] {
+        &self.tree
+    }
+
+    pub fn flat_items(&self) -> &[FlatItem] {
+        &self.flat_items
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn set_cursor(&mut self, idx: usize) {
+        self.cursor = idx;
+    }
+
+    /// Replace the tree and rebuild the flat list + clamp cursor.
+    pub fn replace_tree(&mut self, new_tree: Vec<TreeNode>) {
+        self.tree = new_tree;
+        self.rebuild_flat();
+    }
+
+    /// Mutate the tree in-place, then rebuild the flat list + clamp cursor.
+    pub fn mutate_tree<F, R>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut Vec<TreeNode>) -> R,
+    {
+        let result = f(&mut self.tree);
+        self.rebuild_flat();
+        result
+    }
+
+    fn rebuild_flat(&mut self) {
         self.flat_items = flatten(&self.tree);
         if self.flat_items.is_empty() {
             self.cursor = 0;
