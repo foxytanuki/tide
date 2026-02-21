@@ -3,12 +3,12 @@ use std::env;
 use anyhow::Result;
 use tokio::process::Command;
 
-pub const TMUXIDE_SESSION_NAME: &str = "tmuxide";
+pub const TIDE_SESSION_NAME: &str = "tide";
 
-/// If we're not already in the sidebar process, spawn sidebar in tmuxide session and exit.
+/// If we're not already in the sidebar process, spawn sidebar in tide session and exit.
 /// Returns `Ok(())` if we should continue as the sidebar process.
 pub async fn launch_if_needed() -> Result<()> {
-    if env::var("TMUXIDE_SIDEBAR").is_ok() {
+    if env::var("TIDE_SIDEBAR").is_ok() {
         return Ok(());
     }
 
@@ -16,20 +16,20 @@ pub async fn launch_if_needed() -> Result<()> {
 
     if env::var("TMUX").is_ok() {
         let current_session = detect_session_name().await;
-        ensure_session_exists(TMUXIDE_SESSION_NAME)?;
+        ensure_session_exists(TIDE_SESSION_NAME)?;
 
-        if current_session != TMUXIDE_SESSION_NAME {
-            split_sidebar_in_session(TMUXIDE_SESSION_NAME, &inner_cmd, true)?;
-            switch_client_to_session(TMUXIDE_SESSION_NAME)?;
+        if current_session != TIDE_SESSION_NAME {
+            split_sidebar_in_session(TIDE_SESSION_NAME, &inner_cmd, true)?;
+            switch_client_to_session(TIDE_SESSION_NAME)?;
             std::process::exit(0);
         }
 
-        split_sidebar_in_session(TMUXIDE_SESSION_NAME, &inner_cmd, false)?;
+        split_sidebar_in_session(TIDE_SESSION_NAME, &inner_cmd, false)?;
         std::process::exit(0);
     } else {
-        ensure_session_exists(TMUXIDE_SESSION_NAME)?;
-        split_sidebar_in_session(TMUXIDE_SESSION_NAME, &inner_cmd, true)?;
-        attach_to_session(TMUXIDE_SESSION_NAME)?;
+        ensure_session_exists(TIDE_SESSION_NAME)?;
+        split_sidebar_in_session(TIDE_SESSION_NAME, &inner_cmd, true)?;
+        attach_to_session(TIDE_SESSION_NAME)?;
         std::process::exit(0);
     }
 }
@@ -62,14 +62,14 @@ fn shell_quote(s: &str) -> String {
 
 fn build_sidebar_inner_cmd() -> String {
     let exe = env::current_exe()
-        .unwrap_or_else(|_| "tmuxide".into())
+        .unwrap_or_else(|_| "tide".into())
         .display()
         .to_string();
     let args: Vec<String> = env::args().skip(1).collect();
 
-    let mut inner_cmd = String::from("TMUXIDE_SIDEBAR=1");
-    if let Ok(log) = env::var("TMUXIDE_LOG") {
-        inner_cmd.push_str(&format!(" TMUXIDE_LOG={}", shell_quote(&log)));
+    let mut inner_cmd = String::from("TIDE_SIDEBAR=1");
+    if let Ok(log) = env::var("TIDE_LOG") {
+        inner_cmd.push_str(&format!(" TIDE_LOG={}", shell_quote(&log)));
     }
     inner_cmd.push(' ');
     inner_cmd.push_str(&shell_quote(&exe));

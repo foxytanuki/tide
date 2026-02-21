@@ -35,7 +35,7 @@ fn init_logging() {
     use std::sync::Mutex;
     use tracing_subscriber::EnvFilter;
 
-    let log_val = match env::var("TMUXIDE_LOG") {
+    let log_val = match env::var("TIDE_LOG") {
         Ok(v) => v,
         Err(_) => return, // logging disabled
     };
@@ -43,7 +43,7 @@ fn init_logging() {
     let file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/tmuxide.log")
+        .open("/tmp/tide.log")
     {
         Ok(f) => f,
         Err(_) => return,
@@ -88,14 +88,14 @@ async fn main() -> Result<()> {
         Some(s) if !s.trim().is_empty() => s,
         _ => launcher::detect_session_name().await,
     };
-    if session_name != launcher::TMUXIDE_SESSION_NAME {
+    if session_name != launcher::TIDE_SESSION_NAME {
         anyhow::bail!(
-            "tmuxide only supports '{}' session (got '{}')",
-            launcher::TMUXIDE_SESSION_NAME,
+            "tide only supports '{}' session (got '{}')",
+            launcher::TIDE_SESSION_NAME,
             session_name
         );
     }
-    info!(session = %session_name, "starting tmuxide");
+    info!(session = %session_name, "starting tide");
 
     install_panic_hook();
     enable_raw_mode()?;
@@ -253,7 +253,7 @@ async fn main() -> Result<()> {
         let _ = tmux.send_command("unbind-key f").await;
     }
     tmux.shutdown().await;
-    info!("tmuxide shut down");
+    info!("tide shut down");
     Ok(())
 }
 
