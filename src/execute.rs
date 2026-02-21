@@ -126,6 +126,7 @@ pub async fn execute_commands<T: TmuxApi>(
 
                 if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
                     warn!(%err, "preview batch failed");
+                    clear_internal_window_change_suppression(model);
                     model.error_message = Some(format!("preview: {err}"));
                     queue.push_front(Cmd::Render);
                     continue;
@@ -185,7 +186,7 @@ pub async fn execute_commands<T: TmuxApi>(
                         write!(batch, " ; select-layout -t {} {}", source_window, quote_tmux(layout)).unwrap();
                     }
 
-                    if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
+                    let restored = if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
                         warn!(%err, "restore batch failed, trying fallback");
                         // Fallback: join to window instead of home pane
                         let mut fallback = format!(
@@ -200,12 +201,27 @@ pub async fn execute_commands<T: TmuxApi>(
                         }
                         if let Err(err) = send_batch_with_reconcile(model, tmux, &fallback).await {
                             warn!(%err, "restore fallback batch also failed");
+                            false
+                        } else {
+                            true
                         }
-                    }
+                    } else {
+                        true
+                    };
 
-                    model.sidebar_window_id = orig_window;
-                    model.home_pane_id = orig_home;
-                    model.preview = PreviewState::Home;
+                    if restored {
+                        model.sidebar_window_id = orig_window;
+                        model.home_pane_id = orig_home;
+                        model.preview = PreviewState::Home;
+                    } else {
+                        // Keep reconciled runtime state from failed batch attempts.
+                        clear_internal_window_change_suppression(model);
+                        if model.sidebar_window_id == orig_window {
+                            model.preview = PreviewState::Home;
+                        }
+                        model.error_message =
+                            Some("restore preview failed; state reconciled".to_string());
+                    }
                 }
             }
             Cmd::FocusRightPane => {
@@ -292,6 +308,7 @@ pub async fn execute_commands<T: TmuxApi>(
 
                 if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
                     warn!(%err, "follow batch failed");
+                    clear_internal_window_change_suppression(model);
                     model.error_message = Some(format!("follow: {err}"));
                     queue.push_front(Cmd::Render);
                     continue;
@@ -351,6 +368,11 @@ pub async fn execute_commands<T: TmuxApi>(
     }
 
     true
+}
+
+fn clear_internal_window_change_suppression(model: &mut Model) {
+    model.ignore_window_changes = 0;
+    model.pending_internal_focus_window = None;
 }
 
 async fn send_batch_with_reconcile<T: TmuxApi>(
