@@ -32,15 +32,29 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         Msg::RenameWindow => handle_rename_window(model),
         Msg::CloseWindow => handle_close_window(model),
         Msg::WindowFocusChanged(window_id) => {
+            // Suppress only the internally expected window-focus events.
+            // If an unexpected window_id arrives while suppression is active,
+            // treat it as a real user switch instead of consuming suppression.
             if model.ignore_window_changes > 0 {
-                model.ignore_window_changes -= 1;
-                return vec![Cmd::EnsureSidebarWidth];
+                let expected = model.pending_internal_focus_window.as_deref();
+                if expected == Some(window_id.as_str()) {
+                    model.ignore_window_changes -= 1;
+                    if model.ignore_window_changes == 0 {
+                        model.pending_internal_focus_window = None;
+                    }
+                    return vec![Cmd::EnsureSidebarWidth];
+                }
             }
+
+            // Ignore events for the window the sidebar is already in.
             if window_id == model.sidebar_window_id {
                 return vec![Cmd::EnsureSidebarWidth];
             }
+
             // User explicitly switched windows; clear preview state
             model.preview = PreviewState::Home;
+            model.ignore_window_changes = 0;
+            model.pending_internal_focus_window = None;
             vec![
                 Cmd::FollowToWindow { window_id },
                 Cmd::EnsureSidebarWidth,
@@ -344,5 +358,70 @@ fn restore_folder_expanded(nodes: &mut [TreeNode], state: &HashMap<String, bool>
             }
             restore_folder_expanded(children, state);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_model() -> Model {
+        Model::new(
+            "s".to_string(),
+            "$1".to_string(),
+            "%sidebar".to_string(),
+            "%home".to_string(),
+            "@home".to_string(),
+        )
+    }
+
+    fn assert_follow_window(cmds: &[Cmd], window_id: &str) {
+        assert_eq!(cmds.len(), 3);
+        assert!(matches!(
+            &cmds[0],
+            Cmd::FollowToWindow { window_id: id } if id == window_id
+        ));
+        assert!(matches!(cmds[1], Cmd::EnsureSidebarWidth));
+        assert!(matches!(cmds[2], Cmd::ListWindows));
+    }
+
+    fn assert_ensure_only(cmds: &[Cmd]) {
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::EnsureSidebarWidth));
+    }
+
+    #[test]
+    fn unexpected_focus_change_is_not_swallowed_during_suppression() {
+        let mut model = test_model();
+        model.preview = PreviewState::Previewing {
+            original_window_id: "@home".to_string(),
+            original_home_pane_id: "%home".to_string(),
+        };
+        model.ignore_window_changes = 2;
+        model.pending_internal_focus_window = Some("@internal".to_string());
+
+        let cmds = update(&mut model, Msg::WindowFocusChanged("@user".to_string()));
+
+        assert_eq!(model.preview, PreviewState::Home);
+        assert_eq!(model.ignore_window_changes, 0);
+        assert_eq!(model.pending_internal_focus_window, None);
+        assert_follow_window(&cmds, "@user");
+    }
+
+    #[test]
+    fn expected_focus_change_consumes_suppression_counter() {
+        let mut model = test_model();
+        model.ignore_window_changes = 2;
+        model.pending_internal_focus_window = Some("@target".to_string());
+
+        let first = update(&mut model, Msg::WindowFocusChanged("@target".to_string()));
+        assert_ensure_only(&first);
+        assert_eq!(model.ignore_window_changes, 1);
+        assert_eq!(model.pending_internal_focus_window.as_deref(), Some("@target"));
+
+        let second = update(&mut model, Msg::WindowFocusChanged("@target".to_string()));
+        assert_ensure_only(&second);
+        assert_eq!(model.ignore_window_changes, 0);
+        assert_eq!(model.pending_internal_focus_window, None);
     }
 }

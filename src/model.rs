@@ -7,6 +7,7 @@ pub struct Model {
     flat_items: Vec<FlatItem>,
     cursor: usize,
     pub session_name: String,
+    pub session_id: String,
     pub mode: Mode,
     pub input_buffer: String,
     pub should_quit: bool,
@@ -17,9 +18,10 @@ pub struct Model {
     pub sidebar_window_id: String,
     pub preview: PreviewState,
     pub layout_without_sidebar_by_window: HashMap<String, String>,
-    /// Number of session-window-changed events to suppress.
-    /// join-pane and select-window can each trigger events; set to 2 to absorb both.
+    /// Number of internal window-focus notifications to suppress.
     pub ignore_window_changes: u8,
+    /// Window ID expected while suppression is active.
+    pub pending_internal_focus_window: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +43,7 @@ pub enum PreviewState {
 impl Model {
     pub fn new(
         session_name: String,
+        session_id: String,
         sidebar_pane_id: String,
         home_pane_id: String,
         sidebar_window_id: String,
@@ -50,6 +53,7 @@ impl Model {
             flat_items: Vec::new(),
             cursor: 0,
             session_name,
+            session_id,
             mode: Mode::Normal,
             input_buffer: String::new(),
             should_quit: false,
@@ -60,6 +64,7 @@ impl Model {
             preview: PreviewState::Home,
             layout_without_sidebar_by_window: HashMap::new(),
             ignore_window_changes: 0,
+            pending_internal_focus_window: None,
         }
     }
 

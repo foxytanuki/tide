@@ -127,8 +127,16 @@ async fn main() -> Result<()> {
     let (sidebar_pane_id, sidebar_window_id, home_pane_id) =
         detect_sidebar_context(&mut tmux).await?;
 
+    let session_id = tmux
+        .send_command("display-message -p '#{session_id}'")
+        .await
+        .map(|s| s.trim().to_string())
+        .context("failed to detect session id")?;
+    debug!(session_id, "detected session id");
+
     let mut model = Model::new(
         session_name.clone(),
+        session_id,
         sidebar_pane_id.clone(),
         home_pane_id,
         sidebar_window_id,
@@ -218,9 +226,12 @@ async fn main() -> Result<()> {
                     TmuxEvent::WindowAdd(_)
                     | TmuxEvent::WindowClose(_)
                     | TmuxEvent::WindowRenamed(_, _) => update(&mut model, Msg::WindowChanged),
-                    TmuxEvent::SessionWindowChanged(_, window_id) => {
+                    TmuxEvent::SessionWindowChanged(ref sid, window_id)
+                        if *sid == model.session_id =>
+                    {
                         update(&mut model, Msg::WindowFocusChanged(window_id))
                     }
+                    TmuxEvent::SessionWindowChanged(_, _) => Vec::new(),
                     TmuxEvent::SessionChanged(_, _) => vec![Cmd::ListWindows],
                     TmuxEvent::Error(err) => {
                         model.error_message = Some(err);
