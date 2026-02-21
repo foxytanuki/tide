@@ -12,10 +12,17 @@ use tokio::time::{timeout, Duration};
 use super::parser::{parse_control_marker, parse_line, ControlMarker};
 use super::WindowInfo;
 
+struct WaiterState {
+    queue: VecDeque<oneshot::Sender<Result<String>>>,
+    /// Number of responses to silently discard (from timed-out commands whose
+    /// %end has not yet arrived).
+    skip_responses: usize,
+}
+
 pub struct TmuxControl {
     stdin: tokio::fs::File,
     events: mpsc::Receiver<super::TmuxEvent>,
-    waiters: Arc<Mutex<VecDeque<oneshot::Sender<Result<String>>>>>,
+    waiters: Arc<Mutex<WaiterState>>,
     child: Child,
     reader_task: tokio::task::JoinHandle<()>,
 }
@@ -122,8 +129,11 @@ impl TmuxControl {
             .context("failed to spawn tmux reader thread")?;
 
         let (event_tx, event_rx) = mpsc::channel::<super::TmuxEvent>(256);
-        let waiters: Arc<Mutex<VecDeque<oneshot::Sender<Result<String>>>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
+        let waiters: Arc<Mutex<WaiterState>> =
+            Arc::new(Mutex::new(WaiterState {
+                queue: VecDeque::new(),
+                skip_responses: 0,
+            }));
 
         let waiters_for_task = Arc::clone(&waiters);
         let reader_task = tokio::spawn(async move {
@@ -139,8 +149,10 @@ impl TmuxControl {
                     match marker {
                         ControlMarker::Begin => {
                             if let Some(old_data) = in_progress.take() {
-                                let mut waiters = waiters_for_task.lock().await;
-                                if let Some(waiter) = waiters.pop_front() {
+                                let mut state = waiters_for_task.lock().await;
+                                if state.skip_responses > 0 {
+                                    state.skip_responses -= 1;
+                                } else if let Some(waiter) = state.queue.pop_front() {
                                     let _ = waiter.send(Err(anyhow!(
                                         "response block interrupted by new %begin (data: {})",
                                         old_data.trim()
@@ -153,24 +165,28 @@ impl TmuxControl {
                             let is_error = matches!(marker, ControlMarker::ErrorEnd);
                             match in_progress.take() {
                                 Some(data) => {
-                                    let mut waiters = waiters_for_task.lock().await;
-                                    while let Some(waiter) = waiters.pop_front() {
-                                        let result = if is_error {
-                                            let err_msg = data.trim().to_string();
-                                            Err(anyhow!(
-                                                "tmux command error: {}",
-                                                if err_msg.is_empty() {
-                                                    "unknown error".to_string()
-                                                } else {
-                                                    err_msg
-                                                }
-                                            ))
-                                        } else {
-                                            Ok(data.clone())
-                                        };
+                                    let mut state = waiters_for_task.lock().await;
+                                    if state.skip_responses > 0 {
+                                        state.skip_responses -= 1;
+                                    } else {
+                                        while let Some(waiter) = state.queue.pop_front() {
+                                            let result = if is_error {
+                                                let err_msg = data.trim().to_string();
+                                                Err(anyhow!(
+                                                    "tmux command error: {}",
+                                                    if err_msg.is_empty() {
+                                                        "unknown error".to_string()
+                                                    } else {
+                                                        err_msg
+                                                    }
+                                                ))
+                                            } else {
+                                                Ok(data.clone())
+                                            };
 
-                                        if waiter.send(result).is_ok() {
-                                            break;
+                                            if waiter.send(result).is_ok() {
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -210,8 +226,8 @@ impl TmuxControl {
                 }
             }
 
-            let mut waiters = waiters_for_task.lock().await;
-            while let Some(waiter) = waiters.pop_front() {
+            let mut state = waiters_for_task.lock().await;
+            while let Some(waiter) = state.queue.pop_front() {
                 let _ = waiter.send(Err(anyhow!("tmux control stream closed")));
             }
 
@@ -241,21 +257,21 @@ impl TmuxControl {
         }
 
         let (tx, rx) = oneshot::channel::<Result<String>>();
-        self.waiters.lock().await.push_back(tx);
+        self.waiters.lock().await.queue.push_back(tx);
 
         tracing::trace!(cmd, "tmux send");
         if let Err(err) = self.stdin.write_all(cmd.as_bytes()).await {
-            self.waiters.lock().await.pop_back();
+            self.waiters.lock().await.queue.pop_back();
             return Err(anyhow!("failed to write tmux command: {err}"));
         }
 
         if let Err(err) = self.stdin.write_all(b"\n").await {
-            self.waiters.lock().await.pop_back();
+            self.waiters.lock().await.queue.pop_back();
             return Err(anyhow!("failed to write tmux command newline: {err}"));
         }
 
         if let Err(err) = self.stdin.flush().await {
-            self.waiters.lock().await.pop_back();
+            self.waiters.lock().await.queue.pop_back();
             return Err(anyhow!("failed to flush tmux stdin: {err}"));
         }
 
@@ -263,8 +279,9 @@ impl TmuxControl {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(anyhow!("tmux command response channel closed")),
             Err(_) => {
-                // Remove stale waiter to prevent misrouting future responses
-                self.waiters.lock().await.pop_back();
+                let mut state = self.waiters.lock().await;
+                state.queue.pop_back();
+                state.skip_responses += 1;
                 Err(anyhow!("timed out waiting for tmux response"))
             }
         };
