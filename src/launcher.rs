@@ -56,6 +56,10 @@ pub async fn detect_session_name() -> String {
     }
 }
 
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn build_sidebar_inner_cmd() -> String {
     let exe = env::current_exe()
         .unwrap_or_else(|_| "tmuxide".into())
@@ -65,14 +69,13 @@ fn build_sidebar_inner_cmd() -> String {
 
     let mut inner_cmd = String::from("TMUXIDE_SIDEBAR=1");
     if let Ok(log) = env::var("TMUXIDE_LOG") {
-        inner_cmd.push_str(" TMUXIDE_LOG=");
-        inner_cmd.push_str(&log);
+        inner_cmd.push_str(&format!(" TMUXIDE_LOG={}", shell_quote(&log)));
     }
     inner_cmd.push(' ');
-    inner_cmd.push_str(&exe);
+    inner_cmd.push_str(&shell_quote(&exe));
     for arg in &args {
         inner_cmd.push(' ');
-        inner_cmd.push_str(arg);
+        inner_cmd.push_str(&shell_quote(arg));
     }
     inner_cmd
 }

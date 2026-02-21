@@ -59,8 +59,9 @@ pub async fn execute_commands(
                     } => (original_window_id.clone(), original_home_pane_id.clone()),
                 };
 
+                // suppress 2 events: join-pane + select-window in focus_sidebar_in_window
                 let new_home =
-                    match move_sidebar_to_window(model, tmux, &target_window_id).await {
+                    match move_sidebar_to_window(model, tmux, &target_window_id, 2).await {
                         Ok(h) => h,
                         Err(err) => {
                             warn!(%err, "preview move failed");
@@ -209,8 +210,9 @@ pub async fn execute_commands(
 
                 info!(target = %target_window_id, "following to window");
 
+                // suppress 1 event: join-pane only (no select-window in follow path)
                 let new_home =
-                    match move_sidebar_to_window(model, tmux, &target_window_id).await {
+                    match move_sidebar_to_window(model, tmux, &target_window_id, 1).await {
                         Ok(h) => h,
                         Err(err) => {
                             warn!(%err, "follow move failed");
@@ -281,14 +283,15 @@ pub async fn execute_commands(
 }
 
 /// Move sidebar pane to the target window, preserving layouts.
-/// Sets `ignore_window_changes = 2` and handles layout save/restore.
+/// Sets `ignore_window_changes` to `suppress_events` and handles layout save/restore.
 /// Returns the new home pane id in the target window (may be empty).
 async fn move_sidebar_to_window(
     model: &mut Model,
     tmux: &mut TmuxControl,
     target_window_id: &str,
+    suppress_events: u8,
 ) -> Result<String, String> {
-    model.ignore_window_changes = 2;
+    model.ignore_window_changes = suppress_events;
     let source_window = model.sidebar_window_id.clone();
     remember_window_layout_without_sidebar(model, tmux, target_window_id).await;
 

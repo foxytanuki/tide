@@ -49,22 +49,24 @@ impl TmuxControl {
             let mut err_buf = [0u8; 1024];
             let err_msg = {
                 use std::io::Read;
-                let mut master_clone = pty_master.try_clone().unwrap_or_else(|_| {
-                    // fallback: just use the master directly (we'll lose it but we're erroring out)
-                    unsafe { std::fs::File::from_raw_fd(-1) }
-                });
-                // Set non-blocking for this read so we don't hang
-                unsafe {
-                    let flags = libc::fcntl(master_clone.as_raw_fd(), libc::F_GETFL);
-                    libc::fcntl(
-                        master_clone.as_raw_fd(),
-                        libc::F_SETFL,
-                        flags | libc::O_NONBLOCK,
-                    );
-                }
                 use std::os::unix::io::AsRawFd;
-                match master_clone.read(&mut err_buf) {
-                    Ok(n) => String::from_utf8_lossy(&err_buf[..n]).trim().to_string(),
+                match pty_master.try_clone() {
+                    Ok(mut master_clone) => {
+                        unsafe {
+                            let flags = libc::fcntl(master_clone.as_raw_fd(), libc::F_GETFL);
+                            libc::fcntl(
+                                master_clone.as_raw_fd(),
+                                libc::F_SETFL,
+                                flags | libc::O_NONBLOCK,
+                            );
+                        }
+                        match master_clone.read(&mut err_buf) {
+                            Ok(n) => {
+                                String::from_utf8_lossy(&err_buf[..n]).trim().to_string()
+                            }
+                            Err(_) => String::new(),
+                        }
+                    }
                     Err(_) => String::new(),
                 }
             };
