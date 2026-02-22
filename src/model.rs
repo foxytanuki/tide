@@ -41,6 +41,11 @@ pub struct Model {
     /// AI process CPU tracking for activity detection.
     /// Maps pane_id → (ai_pid, last_cpu_ticks, polls_since_active).
     pub ai_cpu_tracker: HashMap<String, (u32, u64, u16)>,
+    /// Count of %output events per pane since last poll (for streaming detection).
+    /// Reset to 0 after each classify_active_panes call.
+    pub ai_output_counts: HashMap<String, u32>,
+    /// Polls to skip %output counts after window switch (pane redraw noise).
+    pub ai_output_suppress: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +106,8 @@ impl Model {
             ai_windows: HashSet::new(),
             highlighted_panes: HashSet::new(),
             ai_cpu_tracker: HashMap::new(),
+            ai_output_counts: HashMap::new(),
+            ai_output_suppress: 0,
         }
     }
 

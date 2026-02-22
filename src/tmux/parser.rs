@@ -5,6 +5,7 @@ pub enum TmuxEvent {
     WindowRenamed(String, String),
     SessionChanged(String, String),
     SessionWindowChanged(String, String), // session_id, window_id
+    PaneOutput(String),                   // pane_id (data discarded)
     Error(String),
 }
 
@@ -69,6 +70,19 @@ pub fn parse_line(line: &str) -> Option<TmuxEvent> {
             None => (rest.trim().to_string(), String::new()),
         };
         return Some(TmuxEvent::SessionChanged(id, name));
+    }
+
+    // %output %<pane_id> <data> — pane produced output (data discarded)
+    if let Some(rest) = line.strip_prefix("%output ") {
+        let pane_id = rest.split_whitespace().next()?.to_string();
+        return Some(TmuxEvent::PaneOutput(pane_id));
+    }
+
+    // %extended-output %<pane_id> <age> ... : <data> — same as %output but
+    // emitted when pause-after is configured. We only need the pane_id.
+    if let Some(rest) = line.strip_prefix("%extended-output ") {
+        let pane_id = rest.split_whitespace().next()?.to_string();
+        return Some(TmuxEvent::PaneOutput(pane_id));
     }
 
     // Unknown % notifications are silently ignored
@@ -149,5 +163,30 @@ mod tests {
     fn unknown_percent_lines_ignored() {
         assert_eq!(parse_line("%layout-change some data"), None);
         assert_eq!(parse_line("%pane-mode-changed @1"), None);
+    }
+
+    #[test]
+    fn parse_pane_output() {
+        assert_eq!(
+            parse_line("%output %5 some escaped output data"),
+            Some(TmuxEvent::PaneOutput("%5".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_pane_output_no_data() {
+        // Edge case: %output with pane_id but no data
+        assert_eq!(
+            parse_line("%output %0"),
+            Some(TmuxEvent::PaneOutput("%0".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_extended_output() {
+        assert_eq!(
+            parse_line("%extended-output %3 500 : some data here"),
+            Some(TmuxEvent::PaneOutput("%3".to_string()))
+        );
     }
 }

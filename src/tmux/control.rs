@@ -205,7 +205,7 @@ impl TmuxControl {
                 if let Some(data) = in_progress.as_mut() {
                     if line.starts_with('%') {
                         if let Some(event) = parse_line(&line) {
-                            if event_tx.send(event).await.is_err() {
+                            if !send_event(&event_tx, event).await {
                                 break;
                             }
                             continue;
@@ -219,7 +219,7 @@ impl TmuxControl {
                 // Outside a response block, %-prefixed lines are events
                 if line.starts_with('%') {
                     if let Some(event) = parse_line(&line) {
-                        if event_tx.send(event).await.is_err() {
+                        if !send_event(&event_tx, event).await {
                             break;
                         }
                     }
@@ -376,6 +376,27 @@ fn open_pty() -> Result<(std::fs::File, std::fs::File)> {
             std::fs::File::from_raw_fd(master_fd),
             std::fs::File::from_raw_fd(slave_fd),
         ))
+    }
+}
+
+/// Send an event through the channel.  PaneOutput events are best-effort
+/// (try_send) to avoid backpressure from high-frequency streaming output
+/// stalling %begin/%end processing and command responses.  All other
+/// events use blocking send.  Returns false when the channel is closed.
+async fn send_event(
+    tx: &mpsc::Sender<super::TmuxEvent>,
+    event: super::TmuxEvent,
+) -> bool {
+    if matches!(event, super::TmuxEvent::PaneOutput(_)) {
+        // Best-effort: drop if channel is full rather than blocking.
+        // Closed channel → return false to break the reader loop.
+        match tx.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => true, // drop, keep going
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    } else {
+        tx.send(event).await.is_ok()
     }
 }
 

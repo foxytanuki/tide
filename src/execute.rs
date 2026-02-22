@@ -156,6 +156,8 @@ pub async fn execute_commands<T: TmuxApi>(
                     original_window_id: orig_window,
                     original_home_pane_id: orig_home,
                 };
+                // Suppress %output for next 2 polls to discard pane redraw noise
+                model.ai_output_suppress = 2;
                 queue.push_front(Cmd::CheckBorder);
             }
             Cmd::RestorePreview => {
@@ -221,6 +223,8 @@ pub async fn execute_commands<T: TmuxApi>(
                         model.error_message =
                             Some("restore preview failed; state reconciled".to_string());
                     }
+                    // Discard %output events from pane redraw during window switch
+                    model.ai_output_counts.clear();
                     queue.push_front(Cmd::CheckBorder);
                 }
             }
@@ -402,6 +406,8 @@ pub async fn execute_commands<T: TmuxApi>(
                     "follow complete"
                 );
                 model.sidebar_window_id = target_window_id;
+                // Suppress %output for next 2 polls to discard pane redraw noise
+                model.ai_output_suppress = 2;
                 queue.push_front(Cmd::CheckBorder);
             }
             Cmd::EnsureSidebarWidth => {
@@ -430,6 +436,11 @@ pub async fn execute_commands<T: TmuxApi>(
                 }
             },
             Cmd::PollAiProcesses => {
+                // If suppressing output after window switch, discard counts
+                if model.ai_output_suppress > 0 {
+                    model.ai_output_suppress -= 1;
+                    model.ai_output_counts.clear();
+                }
                 let list_cmd = format!(
                     "list-panes -s -t {} -F '#{{window_id}}\t#{{pane_id}}\t#{{pane_current_command}}\t#{{pane_pid}}'",
                     model.session_name
@@ -440,6 +451,7 @@ pub async fn execute_commands<T: TmuxApi>(
                         let (panes, windows) = classify_active_panes(
                             &candidates,
                             &mut model.ai_cpu_tracker,
+                            &mut model.ai_output_counts,
                         );
                         let follow_up = update(model, Msg::AiProcessPollResult { panes, windows });
                         for c in follow_up.into_iter().rev() {
@@ -672,20 +684,41 @@ fn find_ai_pane_candidates(output: &str, sidebar_pane_id: &str) -> Vec<AiPaneCan
 }
 
 /// Number of consecutive idle polls before demoting an AI pane to inactive.
-/// At 1s poll interval, 30 polls = 30 seconds of grace after last CPU activity.
-/// Covers most "thinking" phases where CPU is near zero (API response wait).
-const AI_CPU_GRACE_POLLS: u16 = 30;
+/// At 1s poll interval, 3 polls = 3 seconds of grace after last activity.
+/// Grace covers brief pauses between streaming chunks and tool calls.
+/// Thinking phases sustain grace via CPU (delta >= MIN_CPU_DELTA_FOR_GRACE).
+const AI_CPU_GRACE_POLLS: u16 = 3;
 
-/// Determine which AI panes are actively working by tracking CPU time.
+/// Minimum %output events per poll interval to count as streaming.
+/// Streaming generates 10-100+ events/s; idle terminal noise is 0-2/s.
+const MIN_OUTPUT_BURST: u32 = 5;
+
+/// Minimum CPU delta (ticks/poll) required to sustain grace period.
+/// Must be high enough to filter out warm-idle background CPU (0-15 typical,
+/// spikes to ~50). Active thinking/tool execution drives 100+ consistently.
+const MIN_CPU_DELTA_FOR_GRACE: u64 = 50;
+
+/// Enable verbose per-pane logging in classify_active_panes.
+const AI_DEBUG: bool = false;
+
+/// Determine which AI panes are actively working using %output as the
+/// primary signal and CPU as a secondary grace-sustaining signal.
 ///
-/// Reads utime + stime from /proc/<pid>/stat. If CPU ticks increased since
-/// last poll, the pane is active (grace timer reset). Grace period covers
-/// brief idle gaps during thinking. All AI tools treated equally.
+/// Design principle: **%output-primary, CPU-secondary**
+/// - Only %output bursts can ACTIVATE a pane (transition idle → active)
+/// - CPU activity can only SUSTAIN an already-active pane during grace
+/// - This prevents warm idle sessions (high background CPU) from false-activating
 ///
+/// Activation: %output burst >= MIN_OUTPUT_BURST (streaming detected)
+/// Grace sustain: CPU delta >= MIN_CPU_DELTA_FOR_GRACE (still computing)
+/// Grace expiry: neither signal for AI_CPU_GRACE_POLLS consecutive polls
+///
+/// Output counts are reset after each call (consumed per poll).
 /// Returns (active_pane_ids, active_window_ids).
 fn classify_active_panes(
     candidates: &[AiPaneCandidate],
     prev_cpu: &mut HashMap<String, (u32, u64, u16)>,
+    output_counts: &mut HashMap<String, u32>,
 ) -> (HashSet<String>, HashSet<String>) {
     let mut active_panes = HashSet::new();
     let mut active_windows = HashSet::new();
@@ -697,34 +730,55 @@ fn classify_active_panes(
         let ai_pid = find_ai_child_pid(c.pane_pid).unwrap_or(c.pane_pid);
         let current_cpu = read_cpu_ticks(ai_pid).unwrap_or(0);
 
+        let output_count = output_counts.get(&c.pane_id).copied().unwrap_or(0);
+        let is_streaming = output_count >= MIN_OUTPUT_BURST;
+
         // polls_since_active semantics:
-        //   0 = never been active (baseline only)
-        //   1 = active right now (CPU burst just seen)
-        //   2..=GRACE = was active, counting idle polls
+        //   0 = never been active / fully idle
+        //   1 = active right now (just activated or reactivated by streaming)
+        //   2..=GRACE = was active, grace period counting down
         //   >GRACE = demoted to idle
         let (is_active, new_polls) =
             if let Some(&(prev_pid, prev_ticks, polls)) = prev_cpu.get(&c.pane_id) {
                 if prev_pid != ai_pid {
-                    // PID changed — new process, need baseline
+                    (is_streaming, if is_streaming { 1 } else { 0 })
+                } else if is_streaming {
+                    (true, 1)
+                } else if polls == 0 {
                     (false, 0)
-                } else {
-                    let delta = current_cpu.saturating_sub(prev_ticks);
-                    if delta > 0 {
-                        // CPU activity — activate
+                } else if polls <= AI_CPU_GRACE_POLLS {
+                    let cpu_delta = current_cpu.saturating_sub(prev_ticks);
+                    if cpu_delta >= MIN_CPU_DELTA_FOR_GRACE {
                         (true, 1)
-                    } else if polls == 0 {
-                        // Never been active — stay idle
-                        (false, 0)
                     } else {
-                        // Was active, no CPU now — count toward grace expiry
                         let new_polls = polls.saturating_add(1);
                         (new_polls <= AI_CPU_GRACE_POLLS, new_polls)
                     }
+                } else {
+                    (false, 0)
                 }
             } else {
-                // First time seeing this pane — record baseline, stay idle
-                (false, 0)
+                (is_streaming, if is_streaming { 1 } else { 0 })
             };
+
+        if AI_DEBUG {
+            let prev_info = prev_cpu.get(&c.pane_id);
+            let prev_ticks = prev_info.map(|&(_, t, _)| t).unwrap_or(0);
+            let prev_polls = prev_info.map(|&(_, _, p)| p).unwrap_or(0);
+            let cpu_delta = current_cpu.saturating_sub(prev_ticks);
+            debug!(
+                pane = %c.pane_id,
+                window = %c.window_id,
+                ai_pid,
+                cpu_delta,
+                output_count,
+                is_streaming,
+                prev_polls,
+                new_polls,
+                is_active,
+                "ai classify"
+            );
+        }
 
         prev_cpu.insert(c.pane_id.clone(), (ai_pid, current_cpu, new_polls));
 
@@ -734,8 +788,8 @@ fn classify_active_panes(
         }
     }
 
-    // Clean up stale entries for panes no longer running AI
     prev_cpu.retain(|k, _| seen_panes.contains(k));
+    output_counts.clear();
 
     (active_panes, active_windows)
 }
@@ -857,48 +911,107 @@ mod tests {
         let candidates = vec![AiPaneCandidate {
             pane_id: "%10".to_string(),
             window_id: "@1".to_string(),
-
             pane_pid: 99999,
         }];
         let mut prev = HashMap::new();
-        let (panes, _) = classify_active_panes(&candidates, &mut prev);
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
         assert!(!panes.contains("%10"), "first-seen pane should be idle (baseline)");
         assert!(prev.contains_key("%10"), "baseline should be recorded");
     }
 
     #[test]
-    fn classify_active_panes_never_active_stays_idle() {
+    fn classify_active_panes_high_cpu_alone_does_not_activate() {
+        // Key test: CPU alone should NEVER activate a pane.
+        // This prevents warm idle sessions from showing as active.
         let candidates = vec![AiPaneCandidate {
             pane_id: "%10".to_string(),
             window_id: "@1".to_string(),
-
             pane_pid: 99999,
         }];
-        // polls=0 means never been active — should stay idle
+        // polls=0 (never active), even with high CPU — should stay idle
         let mut prev = HashMap::new();
         prev.insert("%10".to_string(), (99999u32, 50000u64, 0u16));
 
-        let (panes, _) = classify_active_panes(&candidates, &mut prev);
-        assert!(!panes.contains("%10"), "never-active pane should stay idle");
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
+        assert!(!panes.contains("%10"), "CPU alone should never activate (output-primary)");
     }
 
     #[test]
-    fn classify_active_panes_grace_maintains_active() {
+    fn classify_active_panes_output_burst_activates_first_seen() {
         let candidates = vec![AiPaneCandidate {
             pane_id: "%10".to_string(),
             window_id: "@1".to_string(),
-
             pane_pid: 99999,
         }];
-        // polls=1 means just activated, no CPU delta — should stay active within grace
+        let mut prev = HashMap::new();
+        let mut counts = HashMap::new();
+        counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
+
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
+        assert!(panes.contains("%10"), "output burst should activate first-seen pane");
+        assert!(counts.is_empty(), "counts should be reset after poll");
+    }
+
+    #[test]
+    fn classify_active_panes_output_burst_activates_existing() {
+        let candidates = vec![AiPaneCandidate {
+            pane_id: "%10".to_string(),
+            window_id: "@1".to_string(),
+            pane_pid: 99999,
+        }];
+        // Existing pane with baseline (polls=0, never active)
+        let mut prev = HashMap::new();
+        prev.insert("%10".to_string(), (99999u32, 50000u64, 0u16));
+
+        let mut counts = HashMap::new();
+        counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
+
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
+        assert!(panes.contains("%10"), "output burst should activate idle pane");
+        let &(_, _, polls) = prev.get("%10").unwrap();
+        assert_eq!(polls, 1, "polls should be 1 after activation");
+    }
+
+    #[test]
+    fn classify_active_panes_output_burst_resets_grace() {
+        let candidates = vec![AiPaneCandidate {
+            pane_id: "%10".to_string(),
+            window_id: "@1".to_string(),
+            pane_pid: 99999,
+        }];
+        // Was active, grace is about to expire
+        let mut prev = HashMap::new();
+        prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS));
+
+        // But output burst should reset
+        let mut counts = HashMap::new();
+        counts.insert("%10".to_string(), MIN_OUTPUT_BURST + 10);
+
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
+        assert!(panes.contains("%10"), "output burst should reset grace timer");
+        let &(_, _, polls) = prev.get("%10").unwrap();
+        assert_eq!(polls, 1, "polls should reset to 1");
+    }
+
+    #[test]
+    fn classify_active_panes_grace_with_cpu_stays_active() {
+        let candidates = vec![AiPaneCandidate {
+            pane_id: "%10".to_string(),
+            window_id: "@1".to_string(),
+            pane_pid: 99999,
+        }];
+        // polls=1 means just activated by streaming, now no output but CPU still working
+        // Since fake PID won't have /proc entry, cpu_delta=0, so grace counts down
         let mut prev = HashMap::new();
         prev.insert("%10".to_string(), (99999u32, 50000u64, 1u16));
 
-        let (panes, _) = classify_active_panes(&candidates, &mut prev);
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
+        // With fake PID, cpu_delta=0, so grace counts down (polls 1→2)
+        // But still within grace period
         assert!(panes.contains("%10"), "should stay active within grace period");
 
         let &(_, _, polls) = prev.get("%10").unwrap();
-        assert_eq!(polls, 2, "polls counter should increment");
+        assert_eq!(polls, 2, "polls counter should increment (no CPU activity from fake pid)");
     }
 
     #[test]
@@ -906,14 +1019,13 @@ mod tests {
         let candidates = vec![AiPaneCandidate {
             pane_id: "%10".to_string(),
             window_id: "@1".to_string(),
-
             pane_pid: 99999,
         }];
         // polls at grace limit — next poll should demote to idle
         let mut prev = HashMap::new();
         prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS));
 
-        let (panes, _) = classify_active_panes(&candidates, &mut prev);
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
         assert!(!panes.contains("%10"), "should be idle after grace period expires");
     }
 
@@ -922,14 +1034,13 @@ mod tests {
         let candidates = vec![AiPaneCandidate {
             pane_id: "%10".to_string(),
             window_id: "@1".to_string(),
-
             pane_pid: 99999,
         }];
-        // polls=15 means was active, been quiet for 15 polls — still within 30s grace
+        // polls=2 means was active, been quiet for 2 polls — still within 3s grace
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, 15u16));
+        prev.insert("%10".to_string(), (99999u32, 50000u64, 2u16));
 
-        let (panes, _) = classify_active_panes(&candidates, &mut prev);
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
         assert!(panes.contains("%10"), "should stay active during thinking (within grace)");
     }
 
@@ -939,8 +1050,46 @@ mod tests {
         let mut prev = HashMap::new();
         prev.insert("%gone".to_string(), (123u32, 50000u64, 0u16));
 
-        let _ = classify_active_panes(&candidates, &mut prev);
+        let _ = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
         assert!(prev.is_empty(), "stale entries should be cleaned");
+    }
+
+    #[test]
+    fn classify_active_panes_low_output_not_streaming() {
+        let candidates = vec![AiPaneCandidate {
+            pane_id: "%10".to_string(),
+            window_id: "@1".to_string(),
+            pane_pid: 99999,
+        }];
+        let mut prev = HashMap::new();
+        // Low output count (idle terminal noise) should NOT activate
+        let mut counts = HashMap::new();
+        counts.insert("%10".to_string(), MIN_OUTPUT_BURST - 1);
+
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
+        assert!(!panes.contains("%10"), "low output count should not activate");
+    }
+
+    #[test]
+    fn classify_active_panes_grace_expired_only_streaming_reactivates() {
+        let candidates = vec![AiPaneCandidate {
+            pane_id: "%10".to_string(),
+            window_id: "@1".to_string(),
+            pane_pid: 99999,
+        }];
+        // Grace fully expired (polls > GRACE)
+        let mut prev = HashMap::new();
+        prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS + 1));
+
+        // No streaming — should stay idle even with CPU
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
+        assert!(!panes.contains("%10"), "grace-expired pane needs streaming to reactivate");
+
+        // Now with streaming — should reactivate
+        let mut counts = HashMap::new();
+        counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
+        assert!(panes.contains("%10"), "streaming should reactivate grace-expired pane");
     }
 
     #[test]

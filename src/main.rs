@@ -120,10 +120,11 @@ async fn main() -> Result<()> {
     };
 
     // Exclude control client from window sizing calculations.
-    // "no-output" flag tells tmux this client doesn't display output,
-    // so it should be ignored for window-size decisions (tmux 3.2+).
+    // "ignore-size" tells tmux not to use this client for window-size
+    // decisions (tmux 3.4+). We avoid "no-output" because it also
+    // suppresses %output events needed for AI activity detection.
     // Falls back silently on older tmux versions.
-    let _ = tmux.send_command("refresh-client -f no-output").await;
+    let _ = tmux.send_command("refresh-client -f ignore-size").await;
 
     let (sidebar_pane_id, sidebar_window_id, home_pane_id) =
         detect_sidebar_context(&mut tmux).await?;
@@ -261,6 +262,17 @@ async fn main() -> Result<()> {
                     }
                     TmuxEvent::SessionWindowChanged(_, _) => Vec::new(),
                     TmuxEvent::SessionChanged(_, _) => vec![Cmd::ListWindows],
+                    TmuxEvent::PaneOutput(pane_id) => {
+                        // Hot-path exception: update output counter directly
+                        // instead of going through Msg→update→Cmd cycle.
+                        // %output fires at very high frequency during streaming;
+                        // routing through TEA would create unnecessary overhead.
+                        // Skip sidebar pane's own output to avoid self-triggering.
+                        if pane_id != model.sidebar_pane_id {
+                            *model.ai_output_counts.entry(pane_id).or_insert(0) += 1;
+                        }
+                        Vec::new()
+                    }
                     TmuxEvent::Error(err) => {
                         model.error_message = Some(err);
                         vec![Cmd::Render]
