@@ -47,7 +47,13 @@ pub fn render(model: &Model, frame: &mut Frame) {
 
     // Show terminal block cursor in input modes
     if let Some(prefix_len) = input_prefix_len(&model.mode) {
-        let cursor_x = chunks[1].x + prefix_len + model.input_cursor as u16;
+        let display_width: u16 = model
+            .input_buffer
+            .chars()
+            .take(model.input_cursor)
+            .map(|c| c.width().unwrap_or(0) as u16)
+            .sum();
+        let cursor_x = chunks[1].x + prefix_len + display_width;
         let cursor_y = chunks[1].y;
         frame.set_cursor_position((cursor_x, cursor_y));
     }

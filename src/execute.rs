@@ -212,7 +212,19 @@ pub async fn execute_commands<T: TmuxApi>(
 
                     if restored {
                         model.sidebar_window_id = orig_window;
-                        model.home_pane_id = orig_home;
+                        // Re-detect home pane: orig_home may be stale (e.g. pane
+                        // was closed), especially after the fallback path.
+                        let fresh_home = choose_home_pane_in_window(
+                            tmux,
+                            &model.sidebar_window_id,
+                            &model.sidebar_pane_id,
+                        )
+                        .await;
+                        model.home_pane_id = if fresh_home.is_empty() {
+                            orig_home
+                        } else {
+                            fresh_home
+                        };
                         model.preview = PreviewState::Home;
                     } else {
                         // Keep reconciled runtime state from failed batch attempts.

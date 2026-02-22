@@ -8,7 +8,7 @@ pub const TIDE_SESSION_NAME: &str = "tide";
 /// If we're not already in the sidebar process, spawn sidebar in tide session and exit.
 /// Returns `Ok(())` if we should continue as the sidebar process.
 pub async fn launch_if_needed() -> Result<()> {
-    if env::var("TIDE_SIDEBAR").is_ok() {
+    if env::var("TIDE_SIDEBAR").ok().as_deref() == Some("1") {
         return Ok(());
     }
 

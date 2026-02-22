@@ -12,6 +12,23 @@ use tokio::time::{timeout, Duration};
 use super::parser::{parse_control_marker, parse_line, ControlMarker};
 use super::WindowInfo;
 
+/// Guard that kills the child process on drop unless disarmed via `take()`.
+struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    fn take(&mut self) -> Child {
+        self.0.take().expect("ChildGuard already taken")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(ref mut child) = self.0 {
+            let _ = child.start_kill();
+        }
+    }
+}
+
 struct WaiterState {
     queue: VecDeque<oneshot::Sender<Result<String>>>,
     /// Number of responses to silently discard (from timed-out commands whose
@@ -37,21 +54,23 @@ impl TmuxControl {
         let slave_stdin = pty_slave.try_clone().context("dup pty slave for stdin")?;
         let slave_stdout = pty_slave.try_clone().context("dup pty slave for stdout")?;
 
-        let mut child = Command::new("tmux")
-            .arg("-CC")
-            .arg("attach")
-            .arg("-t")
-            .arg(session)
-            .env_remove("TMUX")
-            .stdin(Stdio::from(slave_stdin))
-            .stdout(Stdio::from(slave_stdout))
-            .stderr(Stdio::from(pty_slave))
-            .spawn()
-            .with_context(|| format!("failed to spawn tmux -CC attach -t {session}"))?;
+        let mut guard = ChildGuard(Some(
+            Command::new("tmux")
+                .arg("-CC")
+                .arg("attach")
+                .arg("-t")
+                .arg(session)
+                .env_remove("TMUX")
+                .stdin(Stdio::from(slave_stdin))
+                .stdout(Stdio::from(slave_stdout))
+                .stderr(Stdio::from(pty_slave))
+                .spawn()
+                .with_context(|| format!("failed to spawn tmux -CC attach -t {session}"))?,
+        ));
 
         // Give the child a moment to fail (e.g. bad session name)
         tokio::time::sleep(Duration::from_millis(200)).await;
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = guard.0.as_mut().unwrap().try_wait()? {
             // Try to read error output from pty master
             let mut err_buf = [0u8; 1024];
             let err_msg = {
@@ -244,7 +263,7 @@ impl TmuxControl {
             stdin,
             events: event_rx,
             waiters,
-            child,
+            child: guard.take(),
             reader_task,
         })
     }
@@ -337,7 +356,12 @@ impl TmuxControl {
 impl Drop for TmuxControl {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
-        let _ = self.child.try_wait();
+        // Give the child a brief window to exit after SIGKILL so we
+        // don't leave a zombie.  Can't use async wait in Drop.
+        if matches!(self.child.try_wait(), Ok(None)) {
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = self.child.try_wait();
+        }
         self.reader_task.abort();
     }
 }

@@ -21,6 +21,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         Msg::WindowChanged
             | Msg::WindowRenamed { .. }
             | Msg::WindowListLoaded(_)
+            | Msg::WindowFocusChanged(_)
             | Msg::AiProcessPollResult { .. }
     ) {
         model.error_message = None;
@@ -614,6 +615,19 @@ fn handle_renaming_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
             if let Mode::Renaming { window_id } = mode {
                 let new_name = model.input_buffer.trim().to_string();
                 if new_name.is_empty() {
+                    return vec![Cmd::Render];
+                }
+                // Short-circuit if name is unchanged — avoid unnecessary
+                // tmux traffic and pending-rename tracking.
+                let already_named = model.flat_items().iter().any(|item| {
+                    matches!(
+                        get_node(model.tree(), &item.path),
+                        Ok(TreeNode::Window { info }) if info.id == window_id && info.name == new_name
+                    )
+                });
+                if already_named {
+                    model.mode = Mode::Normal;
+                    clear_input(model);
                     return vec![Cmd::Render];
                 }
                 model.mode = Mode::Normal;
