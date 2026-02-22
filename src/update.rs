@@ -497,7 +497,16 @@ fn is_plain_key(event: &KeyEvent) -> bool {
     event.modifiers.is_empty() || event.modifiers == KeyModifiers::SHIFT
 }
 
+/// Convert a character index to a byte offset in the string.
+fn char_to_byte_offset(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(s.len())
+}
+
 /// Handle common text input keys (arrows, backspace, char insert).
+/// `input_cursor` is a character index (not byte offset).
 /// Returns Some(cmds) if the key was handled, None for Enter/Esc/other.
 fn handle_input_key(model: &mut Model, code: KeyCode) -> Option<Vec<Cmd>> {
     match code {
@@ -508,7 +517,7 @@ fn handle_input_key(model: &mut Model, code: KeyCode) -> Option<Vec<Cmd>> {
             Some(vec![Cmd::Render])
         }
         KeyCode::Right => {
-            if model.input_cursor < model.input_buffer.len() {
+            if model.input_cursor < model.input_buffer.chars().count() {
                 model.input_cursor += 1;
             }
             Some(vec![Cmd::Render])
@@ -518,24 +527,27 @@ fn handle_input_key(model: &mut Model, code: KeyCode) -> Option<Vec<Cmd>> {
             Some(vec![Cmd::Render])
         }
         KeyCode::End => {
-            model.input_cursor = model.input_buffer.len();
+            model.input_cursor = model.input_buffer.chars().count();
             Some(vec![Cmd::Render])
         }
         KeyCode::Backspace => {
             if model.input_cursor > 0 {
                 model.input_cursor -= 1;
-                model.input_buffer.remove(model.input_cursor);
+                let byte_idx = char_to_byte_offset(&model.input_buffer, model.input_cursor);
+                model.input_buffer.remove(byte_idx);
             }
             Some(vec![Cmd::Render])
         }
         KeyCode::Delete => {
-            if model.input_cursor < model.input_buffer.len() {
-                model.input_buffer.remove(model.input_cursor);
+            if model.input_cursor < model.input_buffer.chars().count() {
+                let byte_idx = char_to_byte_offset(&model.input_buffer, model.input_cursor);
+                model.input_buffer.remove(byte_idx);
             }
             Some(vec![Cmd::Render])
         }
         KeyCode::Char(c) => {
-            model.input_buffer.insert(model.input_cursor, c);
+            let byte_idx = char_to_byte_offset(&model.input_buffer, model.input_cursor);
+            model.input_buffer.insert(byte_idx, c);
             model.input_cursor += 1;
             Some(vec![Cmd::Render])
         }
@@ -549,7 +561,7 @@ fn clear_input(model: &mut Model) {
 }
 
 fn set_input(model: &mut Model, value: String) {
-    model.input_cursor = value.len();
+    model.input_cursor = value.chars().count();
     model.input_buffer = value;
 }
 

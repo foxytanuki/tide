@@ -200,16 +200,18 @@ impl TmuxControl {
                 }
 
                 // If inside a response block, non-marker lines are response data
-                // EXCEPT: %-prefixed notification lines should still be emitted as events
-                // (tmux can interleave notifications within %begin/%end blocks)
+                // EXCEPT: %-prefixed lines are never response data — they are either
+                // known notifications (emitted as events) or unknown notifications
+                // (silently dropped to avoid corrupting command responses).
                 if let Some(data) = in_progress.as_mut() {
                     if line.starts_with('%') {
                         if let Some(event) = parse_line(&line) {
                             if !send_event(&event_tx, event).await {
                                 break;
                             }
-                            continue;
                         }
+                        // Known or unknown %-notification: never append to response data
+                        continue;
                     }
                     data.push_str(&line);
                     data.push('\n');

@@ -48,6 +48,9 @@ pub struct Model {
     pub ai_output_suppress: u8,
     /// Terminal size for mouse hit-testing (width, height).
     pub terminal_size: (u16, u16),
+    /// Circuit breaker: true after attempting RestorePreview before CloseWindow.
+    /// Prevents infinite requeue loop if RestorePreview fails persistently.
+    pub close_restore_attempted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +114,7 @@ impl Model {
             ai_output_counts: HashMap::new(),
             ai_output_suppress: 0,
             terminal_size: (80, 24),
+            close_restore_attempted: false,
         }
     }
 

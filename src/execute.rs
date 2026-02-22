@@ -326,15 +326,35 @@ pub async fn execute_commands<T: TmuxApi>(
                 }
             }
             Cmd::CloseWindow { id } => {
-                // If sidebar is in the window being closed, restore preview first
-                if let PreviewState::Previewing { .. } = &model.preview {
-                    if model.sidebar_window_id == id {
-                        debug!(id, "closing previewed window, restoring first");
-                        queue.push_front(Cmd::CloseWindow { id });
-                        queue.push_front(Cmd::RestorePreview);
-                        continue;
+                // Never kill the window hosting the sidebar
+                if model.sidebar_window_id == id {
+                    match &model.preview {
+                        PreviewState::Previewing { .. } => {
+                            if model.close_restore_attempted {
+                                // Circuit breaker: already tried restore once, don't loop
+                                model.close_restore_attempted = false;
+                                warn!(id, "close-after-restore failed, refusing to close sidebar window");
+                                model.error_message =
+                                    Some("cannot close: sidebar stuck in window".to_string());
+                                queue.push_front(Cmd::Render);
+                                continue;
+                            }
+                            model.close_restore_attempted = true;
+                            debug!(id, "closing previewed window, restoring first");
+                            queue.push_front(Cmd::CloseWindow { id });
+                            queue.push_front(Cmd::RestorePreview);
+                            continue;
+                        }
+                        PreviewState::Home => {
+                            warn!(id, "refusing to close sidebar's own window");
+                            model.error_message =
+                                Some("cannot close sidebar window".to_string());
+                            queue.push_front(Cmd::Render);
+                            continue;
+                        }
                     }
                 }
+                model.close_restore_attempted = false;
                 debug!(id, "closing window");
                 let cmd_str = format!("kill-window -t {id}");
                 if let Err(err) = tmux.send_command(&cmd_str).await {
