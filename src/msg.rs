@@ -27,6 +27,11 @@ pub enum Msg {
     RenameWindow,
     CloseWindow,
 
+    // Mouse events
+    MouseClick { row: u16 },
+    MouseScrollUp,
+    MouseScrollDown,
+
     // AI process detection
     AiProcessPollResult {
         panes: HashSet<String>,   // active AI pane_ids

@@ -10,6 +10,7 @@ use crate::tree::{
     build_tree, find_parent_folder, get_node, get_node_mut, next_visible_item, prev_visible_item,
     toggle_expand, FlatNodeKind, TreeNode,
 };
+use crate::view::tree_item_at;
 
 pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
     const MISSING_PENDING_RENAME_THRESHOLD: u8 = 6;
@@ -242,6 +243,27 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             model.ai_windows = windows;
             vec![Cmd::CheckBorder, Cmd::Render]
         }
+        Msg::MouseClick { row } => {
+            if !matches!(model.mode, Mode::Normal) {
+                return vec![];
+            }
+            match tree_item_at(model, row) {
+                Some(index) => handle_mouse_click(model, index),
+                None => vec![],
+            }
+        }
+        Msg::MouseScrollUp => {
+            if !matches!(model.mode, Mode::Normal) {
+                return vec![];
+            }
+            handle_cursor_up(model)
+        }
+        Msg::MouseScrollDown => {
+            if !matches!(model.mode, Mode::Normal) {
+                return vec![];
+            }
+            handle_cursor_down(model)
+        }
         Msg::Key(event) => handle_key(model, event),
         Msg::Restart => {
             model.should_quit = true;
@@ -312,6 +334,35 @@ fn handle_select_item(model: &mut Model) -> Vec<Cmd> {
                 ]
             } else {
                 vec![]
+            }
+        }
+    }
+}
+
+fn handle_mouse_click(model: &mut Model, index: usize) -> Vec<Cmd> {
+    let item = match model.flat_items().get(index) {
+        Some(item) => item.clone(),
+        None => return vec![],
+    };
+
+    match item.kind {
+        FlatNodeKind::Folder => {
+            model.set_cursor(index);
+            model.mutate_tree(|tree| {
+                if let Ok(node) = get_node_mut(tree, &item.path) {
+                    toggle_expand(node);
+                }
+            });
+            vec![Cmd::Render]
+        }
+        FlatNodeKind::Window => {
+            if model.cursor() == index {
+                // Already selected → follow (focus right pane)
+                handle_select_item(model)
+            } else {
+                // Move cursor + preview
+                model.set_cursor(index);
+                preview_current_item(model)
             }
         }
     }

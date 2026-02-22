@@ -14,7 +14,9 @@ use std::os::unix::process::CommandExt;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -64,7 +66,7 @@ fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         original_hook(info);
     }));
 }
@@ -75,7 +77,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen);
+        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -103,7 +105,7 @@ async fn main() -> Result<()> {
     let _guard = TerminalGuard;
 
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -143,6 +145,7 @@ async fn main() -> Result<()> {
         home_pane_id,
         sidebar_window_id,
     );
+    model.terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
 
     // Save existing prefix+f binding before overwriting
     let prev_f_binding = tmux
@@ -230,7 +233,22 @@ async fn main() -> Result<()> {
                     Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                         update(&mut model, Msg::Key(key))
                     }
-                    Event::Resize(_, _) => vec![Cmd::Render],
+                    Event::Resize(w, h) => {
+                        model.terminal_size = (w, h);
+                        vec![Cmd::Render]
+                    }
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            update(&mut model, Msg::MouseClick { row: mouse.row })
+                        }
+                        MouseEventKind::ScrollUp => {
+                            update(&mut model, Msg::MouseScrollUp)
+                        }
+                        MouseEventKind::ScrollDown => {
+                            update(&mut model, Msg::MouseScrollDown)
+                        }
+                        _ => Vec::new(),
+                    }
                     _ => Vec::new(),
                 };
 

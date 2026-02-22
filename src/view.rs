@@ -196,6 +196,32 @@ fn input_prefix_len(mode: &Mode) -> Option<u16> {
     }
 }
 
+/// Hit-test: map a mouse row to a flat_items index in the tree area.
+pub fn tree_item_at(model: &Model, row: u16) -> Option<usize> {
+    let (w, h) = model.terminal_size;
+    let area = Rect::new(0, 0, w, h);
+    let outer = Block::default().borders(Borders::ALL);
+    let inner = outer.inner(area);
+
+    let footer_height: u16 = match model.mode {
+        Mode::Renaming { .. } | Mode::RenamingFolder { .. } | Mode::CreatingProject => 2,
+        _ => 1,
+    };
+    let chunks =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).split(inner);
+    let tree_rect = chunks[0];
+
+    if row < tree_rect.y || row >= tree_rect.y + tree_rect.height {
+        return None;
+    }
+    let index = (row - tree_rect.y) as usize;
+    if index < model.flat_items().len() {
+        Some(index)
+    } else {
+        None
+    }
+}
+
 /// Truncate a string to fit within `max_cols` terminal display columns.
 fn truncate(input: &str, max_cols: usize) -> String {
     if max_cols == 0 {

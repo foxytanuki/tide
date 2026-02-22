@@ -46,6 +46,8 @@ pub struct Model {
     pub ai_output_counts: HashMap<String, u32>,
     /// Polls to skip %output counts after window switch (pane redraw noise).
     pub ai_output_suppress: u8,
+    /// Terminal size for mouse hit-testing (width, height).
+    pub terminal_size: (u16, u16),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +110,7 @@ impl Model {
             ai_cpu_tracker: HashMap::new(),
             ai_output_counts: HashMap::new(),
             ai_output_suppress: 0,
+            terminal_size: (80, 24),
         }
     }
 
