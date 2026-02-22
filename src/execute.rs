@@ -470,6 +470,42 @@ pub async fn execute_commands<T: TmuxApi>(
                     warn!(%err, "ensure resize-pane failed");
                 }
             }
+            Cmd::ValidateSidebarPanes => {
+                let pane_list = tmux
+                    .send_command(&format!(
+                        "list-panes -t {} -F '#{{pane_id}}'",
+                        model.sidebar_window_id
+                    ))
+                    .await
+                    .unwrap_or_default();
+
+                let has_content = pane_list
+                    .lines()
+                    .map(|l| l.trim())
+                    .any(|l| !l.is_empty() && l != model.sidebar_pane_id);
+
+                if !has_content {
+                    debug!(
+                        window = %model.sidebar_window_id,
+                        "sidebar window lost all content panes, evacuating"
+                    );
+                    match &model.preview {
+                        PreviewState::Previewing { .. } => {
+                            queue.push_front(Cmd::ListWindows);
+                            queue.push_front(Cmd::RestorePreview);
+                        }
+                        PreviewState::Home => {
+                            let sidebar_wid = model.sidebar_window_id.clone();
+                            if let Some(other_id) = model.find_another_window_id(&sidebar_wid) {
+                                queue.push_front(Cmd::ListWindows);
+                                queue.push_front(Cmd::FollowToWindow {
+                                    window_id: other_id,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             Cmd::ListWindows => match tmux.list_windows().await {
                 Ok(windows) => {
                     debug!(count = windows.len(), "refreshed window list");

@@ -6,6 +6,7 @@ pub enum TmuxEvent {
     SessionChanged(String, String),
     SessionWindowChanged(String, String), // session_id, window_id
     PaneOutput(String),                   // pane_id (data discarded)
+    LayoutChange(String),                 // window_id (pane added/removed/resized)
     Error(String),
 }
 
@@ -70,6 +71,12 @@ pub fn parse_line(line: &str) -> Option<TmuxEvent> {
             None => (rest.trim().to_string(), String::new()),
         };
         return Some(TmuxEvent::SessionChanged(id, name));
+    }
+
+    // %layout-change @<window_id> <layout> ... — pane added/removed/resized
+    if let Some(rest) = line.strip_prefix("%layout-change ") {
+        let id = rest.split_whitespace().next()?.to_string();
+        return Some(TmuxEvent::LayoutChange(id));
     }
 
     // %output %<pane_id> <data> — pane produced output (data discarded)
@@ -160,8 +167,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_layout_change() {
+        assert_eq!(
+            parse_line("%layout-change @3 abc123,80x24,0,0"),
+            Some(TmuxEvent::LayoutChange("@3".to_string()))
+        );
+    }
+
+    #[test]
     fn unknown_percent_lines_ignored() {
-        assert_eq!(parse_line("%layout-change some data"), None);
         assert_eq!(parse_line("%pane-mode-changed @1"), None);
     }
 

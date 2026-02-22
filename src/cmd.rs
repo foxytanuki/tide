@@ -10,6 +10,8 @@ pub enum Cmd {
     FollowToWindow { window_id: String },
     EnsureSidebarWidth,
     ListWindows,
+    /// Check if sidebar window still has content panes; evacuate if not.
+    ValidateSidebarPanes,
 
     // AI border highlight
     PollAiProcesses,

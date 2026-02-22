@@ -278,6 +278,12 @@ async fn main() -> Result<()> {
                     {
                         update(&mut model, Msg::WindowFocusChanged(window_id))
                     }
+                    TmuxEvent::LayoutChange(window_id)
+                        if window_id == model.sidebar_window_id =>
+                    {
+                        vec![Cmd::ValidateSidebarPanes]
+                    }
+                    TmuxEvent::LayoutChange(_) => Vec::new(),
                     TmuxEvent::SessionWindowChanged(_, _) => Vec::new(),
                     TmuxEvent::SessionChanged(_, _) => vec![Cmd::ListWindows],
                     TmuxEvent::PaneOutput(pane_id) => {
