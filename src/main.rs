@@ -213,7 +213,7 @@ async fn main() -> Result<()> {
 
     info!("entering main loop");
 
-    let mut ai_poll_interval = tokio::time::interval(Duration::from_secs(1));
+    let mut ai_poll_interval = tokio::time::interval(Duration::from_millis(500));
     ai_poll_interval.reset(); // skip immediate first tick (we already polled above)
 
     loop {

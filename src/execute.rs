@@ -721,14 +721,15 @@ fn find_ai_pane_candidates(output: &str, sidebar_pane_id: &str) -> Vec<AiPaneCan
 }
 
 /// Number of consecutive idle polls before demoting an AI pane to inactive.
-/// At 1s poll interval, 3 polls = 3 seconds of grace after last activity.
+/// At 500ms poll interval, 6 polls = 3 seconds of grace after last activity.
 /// Grace covers brief pauses between streaming chunks and tool calls.
 /// Thinking phases sustain grace via CPU (delta >= MIN_CPU_DELTA_FOR_GRACE).
-const AI_CPU_GRACE_POLLS: u16 = 3;
+const AI_CPU_GRACE_POLLS: u16 = 6;
 
 /// Minimum %output events per poll interval to count as streaming.
-/// Streaming generates 10-100+ events/s; idle terminal noise is 0-2/s.
-const MIN_OUTPUT_BURST: u32 = 5;
+/// Streaming generates 6-100+ events/s; typing noise is typically 1-4/s
+/// with occasional spikes to 6-8 during fast English input.
+const MIN_OUTPUT_BURST: u32 = 6;
 
 /// Consecutive polls with output bursts required before activating a pane.
 /// Prevents false activation from typing in TUI apps (e.g. Claude Code input
