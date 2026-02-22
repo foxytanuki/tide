@@ -346,11 +346,28 @@ pub async fn execute_commands<T: TmuxApi>(
                             continue;
                         }
                         PreviewState::Home => {
-                            warn!(id, "refusing to close sidebar's own window");
-                            model.error_message =
-                                Some("cannot close sidebar window".to_string());
-                            queue.push_front(Cmd::Render);
-                            continue;
+                            if model.close_restore_attempted {
+                                model.close_restore_attempted = false;
+                                warn!(id, "close-after-evacuate failed, refusing to close sidebar window");
+                                model.error_message =
+                                    Some("cannot close: sidebar stuck in window".to_string());
+                                queue.push_front(Cmd::Render);
+                                continue;
+                            }
+                            // Find another window to evacuate sidebar to
+                            if let Some(other_id) = model.find_another_window_id(&id) {
+                                model.close_restore_attempted = true;
+                                debug!(id, other = %other_id, "evacuating sidebar before close");
+                                queue.push_front(Cmd::CloseWindow { id });
+                                queue.push_front(Cmd::FollowToWindow { window_id: other_id });
+                                continue;
+                            } else {
+                                warn!(id, "no other window to evacuate sidebar to");
+                                model.error_message =
+                                    Some("cannot close last window".to_string());
+                                queue.push_front(Cmd::Render);
+                                continue;
+                            }
                         }
                     }
                 }
@@ -713,6 +730,12 @@ const AI_CPU_GRACE_POLLS: u16 = 3;
 /// Streaming generates 10-100+ events/s; idle terminal noise is 0-2/s.
 const MIN_OUTPUT_BURST: u32 = 5;
 
+/// Consecutive polls with output bursts required before activating a pane.
+/// Prevents false activation from typing in TUI apps (e.g. Claude Code input
+/// causes brief %output bursts from UI redraws, but doesn't sustain across polls).
+/// AI streaming sustains bursts across many consecutive polls.
+const MIN_CONSECUTIVE_BURSTS: u8 = 2;
+
 /// Minimum CPU delta (ticks/poll) required to sustain grace period.
 /// Must be high enough to filter out warm-idle background CPU (0-15 typical,
 /// spikes to ~50). Active thinking/tool execution drives 100+ consistently.
@@ -729,11 +752,13 @@ const MAX_PROC_TREE_DEPTH: u8 = 8;
 /// primary signal and CPU as a secondary grace-sustaining signal.
 ///
 /// Design principle: **%output-primary, CPU-secondary**
-/// - Only %output bursts can ACTIVATE a pane (transition idle → active)
+/// - Only sustained %output bursts can ACTIVATE a pane (idle → active)
+/// - Activation requires MIN_CONSECUTIVE_BURSTS consecutive polls with bursts
+///   to filter out brief UI redraw noise from typing in TUI apps
 /// - CPU activity can only SUSTAIN an already-active pane during grace
 /// - This prevents warm idle sessions (high background CPU) from false-activating
 ///
-/// Activation: %output burst >= MIN_OUTPUT_BURST (streaming detected)
+/// Activation: consecutive polls with burst >= MIN_CONSECUTIVE_BURSTS
 /// Grace sustain: CPU delta >= MIN_CPU_DELTA_FOR_GRACE (still computing)
 /// Grace expiry: neither signal for AI_CPU_GRACE_POLLS consecutive polls
 ///
@@ -741,7 +766,7 @@ const MAX_PROC_TREE_DEPTH: u8 = 8;
 /// Returns (active_pane_ids, active_window_ids).
 fn classify_active_panes(
     candidates: &[AiPaneCandidate],
-    prev_cpu: &mut HashMap<String, (u32, u64, u16)>,
+    prev_cpu: &mut HashMap<String, (u32, u64, u16, u8)>,
     output_counts: &mut HashMap<String, u32>,
 ) -> (HashSet<String>, HashSet<String>) {
     let mut active_panes = HashSet::new();
@@ -755,40 +780,59 @@ fn classify_active_panes(
         let current_cpu = read_cpu_ticks_tree(ai_pid).unwrap_or(0);
 
         let output_count = output_counts.get(&c.pane_id).copied().unwrap_or(0);
-        let is_streaming = output_count >= MIN_OUTPUT_BURST;
+        let is_burst = output_count >= MIN_OUTPUT_BURST;
 
         // polls_since_active semantics:
         //   0 = never been active / fully idle
         //   1 = active right now (just activated or reactivated by streaming)
         //   2..=GRACE = was active, grace period counting down
         //   >GRACE = demoted to idle
-        let (is_active, new_polls) =
-            if let Some(&(prev_pid, prev_ticks, polls)) = prev_cpu.get(&c.pane_id) {
+        // consecutive_bursts: how many consecutive polls had output bursts.
+        //   Activation requires >= MIN_CONSECUTIVE_BURSTS to filter out
+        //   brief UI redraw noise from typing in TUI apps.
+        let (is_active, new_polls, new_bursts) =
+            if let Some(&(prev_pid, prev_ticks, polls, bursts)) = prev_cpu.get(&c.pane_id) {
                 if prev_pid != ai_pid {
-                    (is_streaming, if is_streaming { 1 } else { 0 })
-                } else if is_streaming {
-                    (true, 1)
+                    // PID changed — reset tracking
+                    let b = if is_burst { 1 } else { 0 };
+                    let activated = b >= MIN_CONSECUTIVE_BURSTS;
+                    (activated, if activated { 1 } else { 0 }, b)
+                } else if is_burst {
+                    let b = bursts.saturating_add(1);
+                    if polls >= 1 {
+                        // Already active — sustained streaming resets grace
+                        (true, 1, b)
+                    } else if b >= MIN_CONSECUTIVE_BURSTS {
+                        // Was idle, now enough consecutive bursts to activate
+                        (true, 1, b)
+                    } else {
+                        // Burst seen but not enough consecutive ones yet
+                        (false, 0, b)
+                    }
                 } else if polls == 0 {
-                    (false, 0)
+                    (false, 0, 0)
                 } else if polls <= AI_CPU_GRACE_POLLS {
                     let cpu_delta = current_cpu.saturating_sub(prev_ticks);
                     if cpu_delta >= MIN_CPU_DELTA_FOR_GRACE {
-                        (true, 1)
+                        (true, 1, 0)
                     } else {
                         let new_polls = polls.saturating_add(1);
-                        (new_polls <= AI_CPU_GRACE_POLLS, new_polls)
+                        (new_polls <= AI_CPU_GRACE_POLLS, new_polls, 0)
                     }
                 } else {
-                    (false, 0)
+                    (false, 0, 0)
                 }
             } else {
-                (is_streaming, if is_streaming { 1 } else { 0 })
+                // First time seeing this pane — start counting
+                let b = if is_burst { 1 } else { 0 };
+                (false, 0, b)
             };
 
         if AI_DEBUG {
             let prev_info = prev_cpu.get(&c.pane_id);
-            let prev_ticks = prev_info.map(|&(_, t, _)| t).unwrap_or(0);
-            let prev_polls = prev_info.map(|&(_, _, p)| p).unwrap_or(0);
+            let prev_ticks = prev_info.map(|&(_, t, _, _)| t).unwrap_or(0);
+            let prev_polls = prev_info.map(|&(_, _, p, _)| p).unwrap_or(0);
+            let prev_bursts = prev_info.map(|&(_, _, _, b)| b).unwrap_or(0);
             let cpu_delta = current_cpu.saturating_sub(prev_ticks);
             let single_cpu = read_cpu_ticks(ai_pid).unwrap_or(0);
             let single_delta = single_cpu.saturating_sub(prev_ticks);
@@ -799,15 +843,17 @@ fn classify_active_panes(
                 cpu_delta,
                 single_delta,
                 output_count,
-                is_streaming,
+                is_burst,
                 prev_polls,
                 new_polls,
+                prev_bursts,
+                new_bursts,
                 is_active,
                 "ai classify"
             );
         }
 
-        prev_cpu.insert(c.pane_id.clone(), (ai_pid, current_cpu, new_polls));
+        prev_cpu.insert(c.pane_id.clone(), (ai_pid, current_cpu, new_polls, new_bursts));
 
         if is_active {
             active_panes.insert(c.pane_id.clone());
@@ -1001,14 +1047,16 @@ mod tests {
         }];
         // polls=0 (never active), even with high CPU — should stay idle
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, 0u16));
+        prev.insert("%10".to_string(), (99999u32, 50000u64, 0u16, 0u8));
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
         assert!(!panes.contains("%10"), "CPU alone should never activate (output-primary)");
     }
 
     #[test]
-    fn classify_active_panes_output_burst_activates_first_seen() {
+    fn classify_active_panes_single_burst_does_not_activate_first_seen() {
+        // Single burst should NOT activate — needs consecutive bursts to
+        // filter out typing noise in TUI apps like Claude Code.
         let candidates = vec![AiPaneCandidate {
             pane_id: "%10".to_string(),
             window_id: "@1".to_string(),
@@ -1019,12 +1067,38 @@ mod tests {
         counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
-        assert!(panes.contains("%10"), "output burst should activate first-seen pane");
+        assert!(!panes.contains("%10"), "single burst should not activate first-seen pane");
         assert!(counts.is_empty(), "counts should be reset after poll");
+        let &(_, _, _, bursts) = prev.get("%10").unwrap();
+        assert_eq!(bursts, 1, "should have recorded 1 consecutive burst");
     }
 
     #[test]
-    fn classify_active_panes_output_burst_activates_existing() {
+    fn classify_active_panes_consecutive_bursts_activate() {
+        // Consecutive bursts (sustained streaming) should activate.
+        let candidates = vec![AiPaneCandidate {
+            pane_id: "%10".to_string(),
+            window_id: "@1".to_string(),
+            pane_pid: 99999,
+        }];
+        let mut prev = HashMap::new();
+        let mut counts = HashMap::new();
+
+        // First burst — not yet active
+        counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
+        assert!(!panes.contains("%10"), "first burst should not activate");
+
+        // Second burst — now activate
+        counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
+        assert!(panes.contains("%10"), "consecutive bursts should activate pane");
+        let &(_, _, polls, _) = prev.get("%10").unwrap();
+        assert_eq!(polls, 1, "polls should be 1 after activation");
+    }
+
+    #[test]
+    fn classify_active_panes_single_burst_does_not_activate_existing() {
         let candidates = vec![AiPaneCandidate {
             pane_id: "%10".to_string(),
             window_id: "@1".to_string(),
@@ -1032,15 +1106,44 @@ mod tests {
         }];
         // Existing pane with baseline (polls=0, never active)
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, 0u16));
+        prev.insert("%10".to_string(), (99999u32, 50000u64, 0u16, 0u8));
 
         let mut counts = HashMap::new();
         counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
-        assert!(panes.contains("%10"), "output burst should activate idle pane");
-        let &(_, _, polls) = prev.get("%10").unwrap();
-        assert_eq!(polls, 1, "polls should be 1 after activation");
+        assert!(!panes.contains("%10"), "single burst should not activate idle pane");
+        let &(_, _, polls, bursts) = prev.get("%10").unwrap();
+        assert_eq!(polls, 0, "should stay idle");
+        assert_eq!(bursts, 1, "should record 1 consecutive burst");
+    }
+
+    #[test]
+    fn classify_active_panes_burst_gap_resets_counter() {
+        // Burst → no burst → burst should NOT activate (counter resets)
+        let candidates = vec![AiPaneCandidate {
+            pane_id: "%10".to_string(),
+            window_id: "@1".to_string(),
+            pane_pid: 99999,
+        }];
+        let mut prev = HashMap::new();
+        let mut counts = HashMap::new();
+
+        // First burst
+        counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
+        assert!(!panes.contains("%10"));
+
+        // Gap (no burst)
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
+        assert!(!panes.contains("%10"));
+        let &(_, _, _, bursts) = prev.get("%10").unwrap();
+        assert_eq!(bursts, 0, "burst counter should reset on gap");
+
+        // Another burst — starts counting from 1 again
+        counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
+        assert!(!panes.contains("%10"), "should not activate after gap");
     }
 
     #[test]
@@ -1050,17 +1153,17 @@ mod tests {
             window_id: "@1".to_string(),
             pane_pid: 99999,
         }];
-        // Was active, grace is about to expire
+        // Was active (polls >= 1), grace is about to expire
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS));
+        prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS, 0u8));
 
-        // But output burst should reset
+        // Output burst on already-active pane should reset grace (no consecutive requirement)
         let mut counts = HashMap::new();
         counts.insert("%10".to_string(), MIN_OUTPUT_BURST + 10);
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
         assert!(panes.contains("%10"), "output burst should reset grace timer");
-        let &(_, _, polls) = prev.get("%10").unwrap();
+        let &(_, _, polls, _) = prev.get("%10").unwrap();
         assert_eq!(polls, 1, "polls should reset to 1");
     }
 
@@ -1074,14 +1177,14 @@ mod tests {
         // polls=1 means just activated by streaming, now no output but CPU still working
         // Since fake PID won't have /proc entry, cpu_delta=0, so grace counts down
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, 1u16));
+        prev.insert("%10".to_string(), (99999u32, 50000u64, 1u16, 0u8));
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
         // With fake PID, cpu_delta=0, so grace counts down (polls 1→2)
         // But still within grace period
         assert!(panes.contains("%10"), "should stay active within grace period");
 
-        let &(_, _, polls) = prev.get("%10").unwrap();
+        let &(_, _, polls, _) = prev.get("%10").unwrap();
         assert_eq!(polls, 2, "polls counter should increment (no CPU activity from fake pid)");
     }
 
@@ -1094,7 +1197,7 @@ mod tests {
         }];
         // polls at grace limit — next poll should demote to idle
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS));
+        prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS, 0u8));
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
         assert!(!panes.contains("%10"), "should be idle after grace period expires");
@@ -1109,7 +1212,7 @@ mod tests {
         }];
         // polls=2 means was active, been quiet for 2 polls — still within 3s grace
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, 2u16));
+        prev.insert("%10".to_string(), (99999u32, 50000u64, 2u16, 0u8));
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
         assert!(panes.contains("%10"), "should stay active during thinking (within grace)");
@@ -1119,7 +1222,7 @@ mod tests {
     fn classify_active_panes_cleans_stale_entries() {
         let candidates = vec![]; // no AI panes
         let mut prev = HashMap::new();
-        prev.insert("%gone".to_string(), (123u32, 50000u64, 0u16));
+        prev.insert("%gone".to_string(), (123u32, 50000u64, 0u16, 0u8));
 
         let _ = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
         assert!(prev.is_empty(), "stale entries should be cleaned");
@@ -1142,7 +1245,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_active_panes_grace_expired_only_streaming_reactivates() {
+    fn classify_active_panes_grace_expired_needs_consecutive_to_reactivate() {
         let candidates = vec![AiPaneCandidate {
             pane_id: "%10".to_string(),
             window_id: "@1".to_string(),
@@ -1150,17 +1253,22 @@ mod tests {
         }];
         // Grace fully expired (polls > GRACE)
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS + 1));
+        prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS + 1, 0u8));
 
-        // No streaming — should stay idle even with CPU
+        // No streaming — should demote to idle
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
-        assert!(!panes.contains("%10"), "grace-expired pane needs streaming to reactivate");
+        assert!(!panes.contains("%10"), "grace-expired pane should demote to idle");
 
-        // Now with streaming — should reactivate
+        // Single burst — starts counting but doesn't activate yet
         let mut counts = HashMap::new();
         counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
-        assert!(panes.contains("%10"), "streaming should reactivate grace-expired pane");
+        assert!(!panes.contains("%10"), "single burst after grace expiry should not reactivate");
+
+        // Second consecutive burst — now reactivate
+        counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
+        assert!(panes.contains("%10"), "consecutive bursts should reactivate grace-expired pane");
     }
 
     #[test]

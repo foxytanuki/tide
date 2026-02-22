@@ -39,8 +39,8 @@ pub struct Model {
     /// Pane IDs currently highlighted with AI background.
     pub highlighted_panes: HashSet<String>,
     /// AI process CPU tracking for activity detection.
-    /// Maps pane_id → (ai_pid, last_cpu_ticks, polls_since_active).
-    pub ai_cpu_tracker: HashMap<String, (u32, u64, u16)>,
+    /// Maps pane_id → (ai_pid, last_cpu_ticks, polls_since_active, consecutive_bursts).
+    pub ai_cpu_tracker: HashMap<String, (u32, u64, u16, u8)>,
     /// Count of %output events per pane since last poll (for streaming detection).
     /// Reset to 0 after each classify_active_panes call.
     pub ai_output_counts: HashMap<String, u32>,
@@ -181,6 +181,27 @@ impl Model {
             TreeNode::Window { info } => Some(info),
             TreeNode::Folder { .. } => None,
         }
+    }
+
+    /// Find any window ID in the tree that is not `exclude`.
+    pub fn find_another_window_id(&self, exclude: &str) -> Option<String> {
+        fn search(nodes: &[TreeNode], exclude: &str) -> Option<String> {
+            for node in nodes {
+                match node {
+                    TreeNode::Window { info } if info.id != exclude => {
+                        return Some(info.id.clone());
+                    }
+                    TreeNode::Folder { children, .. } => {
+                        if let Some(id) = search(children, exclude) {
+                            return Some(id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        search(&self.tree, exclude)
     }
 }
 
