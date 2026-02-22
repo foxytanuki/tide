@@ -619,11 +619,34 @@ fn handle_renaming_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
                 }
                 // Short-circuit if name is unchanged — avoid unnecessary
                 // tmux traffic and pending-rename tracking.
-                let already_named = model.flat_items().iter().any(|item| {
-                    matches!(
-                        get_node(model.tree(), &item.path),
-                        Ok(TreeNode::Window { info }) if info.id == window_id && info.name == new_name
-                    )
+                // Compare against the full tmux name (folder:child for foldered
+                // windows), not just the leaf name stored in info.name.
+                let already_named = model.flat_items().iter().enumerate().any(|(idx, item)| {
+                    if let Ok(TreeNode::Window { info }) = get_node(model.tree(), &item.path) {
+                        if info.id != window_id {
+                            return false;
+                        }
+                        let full_name = if let Some(parent_idx) =
+                            find_parent_folder(model.flat_items(), idx)
+                        {
+                            if let Some(parent_item) = model.flat_items().get(parent_idx) {
+                                if let Ok(TreeNode::Folder { name, .. }) =
+                                    get_node(model.tree(), &parent_item.path)
+                                {
+                                    format!("{}:{}", name, info.name)
+                                } else {
+                                    info.name.clone()
+                                }
+                            } else {
+                                info.name.clone()
+                            }
+                        } else {
+                            info.name.clone()
+                        };
+                        full_name == new_name
+                    } else {
+                        false
+                    }
                 });
                 if already_named {
                     model.mode = Mode::Normal;

@@ -428,7 +428,14 @@ async fn send_event(
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     } else {
-        tx.send(event).await.is_ok()
+        match tx.try_send(event) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("tmux event channel full, dropping non-output event");
+                true // drop, keep going
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
     }
 }
 
