@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt::Write as _;
 use std::future::Future;
 use std::io::Stdout;
 use std::pin::Pin;
@@ -95,13 +94,11 @@ pub async fn execute_commands<T: TmuxApi>(
                     } => (original_window_id.clone(), original_home_pane_id.clone()),
                 };
 
-                let source_window = model.sidebar_window_id.clone();
                 // suppress 2 events: join-pane + select-window
                 model.ignore_window_changes = 2;
                 model.pending_internal_focus_window = Some(target_window_id.clone());
 
-                // Query phase: save target layout and find join target
-                remember_window_layout_without_sidebar(model, tmux, &target_window_id).await;
+                // Query phase: find join target
                 let target_home =
                     choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id)
                         .await;
@@ -114,15 +111,12 @@ pub async fn execute_commands<T: TmuxApi>(
                 // Action phase: batch all visual tmux operations into a single
                 // command so tmux processes them in one server tick (no flicker).
                 // -l 30 sets sidebar width at join time to avoid intermediate resize.
-                let mut batch = format!(
+                let batch = format!(
                     "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
                     model.sidebar_pane_id, join_target,
                     target_window_id,
                     model.sidebar_pane_id,
                 );
-                if let Some(layout) = model.layout_without_sidebar_by_window.get(&source_window) {
-                    write!(batch, " ; select-layout -t {} {}", source_window, quote_tmux(layout)).unwrap();
-                }
 
                 if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
                     warn!(%err, "preview batch failed");
@@ -174,32 +168,23 @@ pub async fn execute_commands<T: TmuxApi>(
                     // Suppress session-window-changed events from join-pane + select-window
                     model.ignore_window_changes = 2;
                     model.pending_internal_focus_window = Some(orig_window.clone());
-                    let source_window = model.sidebar_window_id.clone();
-                    remember_window_layout_without_sidebar(model, tmux, &orig_window).await;
-
-                    // Batch: join sidebar back + switch + focus + restore source
-                    let mut batch = format!(
+                    // Batch: join sidebar back + switch + focus
+                    let batch = format!(
                         "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
                         model.sidebar_pane_id, orig_home,
                         orig_window,
                         model.sidebar_pane_id,
                     );
-                    if let Some(layout) = model.layout_without_sidebar_by_window.get(&source_window) {
-                        write!(batch, " ; select-layout -t {} {}", source_window, quote_tmux(layout)).unwrap();
-                    }
 
                     let restored = if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
                         warn!(%err, "restore batch failed, trying fallback");
                         // Fallback: join to window instead of home pane
-                        let mut fallback = format!(
+                        let fallback = format!(
                             "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
                             model.sidebar_pane_id, orig_window,
                             orig_window,
                             model.sidebar_pane_id,
                         );
-                        if let Some(layout) = model.layout_without_sidebar_by_window.get(&source_window) {
-                            write!(fallback, " ; select-layout -t {} {}", source_window, quote_tmux(layout)).unwrap();
-                        }
                         if let Err(err) = send_batch_with_reconcile(model, tmux, &fallback).await {
                             warn!(%err, "restore fallback batch also failed");
                             false
@@ -404,13 +389,11 @@ pub async fn execute_commands<T: TmuxApi>(
 
                 info!(target = %target_window_id, "following to window");
 
-                let source_window = model.sidebar_window_id.clone();
                 // suppress 1 event: join-pane only (no select-window in follow path)
                 model.ignore_window_changes = 1;
                 model.pending_internal_focus_window = Some(target_window_id.clone());
 
                 // Query phase
-                remember_window_layout_without_sidebar(model, tmux, &target_window_id).await;
                 let target_home =
                     choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id)
                         .await;
@@ -420,14 +403,11 @@ pub async fn execute_commands<T: TmuxApi>(
                     target_home.clone()
                 };
 
-                // Action phase: batch join (+ optional source restore)
-                let mut batch = format!(
+                // Action phase: batch join
+                let batch = format!(
                     "join-pane -dfhb -l 30 -s {} -t {}",
                     model.sidebar_pane_id, join_target,
                 );
-                if let Some(layout) = model.layout_without_sidebar_by_window.get(&source_window) {
-                    write!(batch, " ; select-layout -t {} {}", source_window, quote_tmux(layout)).unwrap();
-                }
 
                 if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
                     warn!(%err, "follow batch failed");
@@ -708,25 +688,6 @@ async fn choose_home_pane_in_window<T: TmuxApi>(
     first_non_sidebar
 }
 
-async fn read_window_layout<T: TmuxApi>(tmux: &mut T, window_id: &str) -> Option<String> {
-    if window_id.is_empty() {
-        return None;
-    }
-    let out = tmux
-        .send_command(&format!(
-            "display-message -t {} -p '#{{window_layout}}'",
-            window_id
-        ))
-        .await
-        .ok()?;
-    let layout = out.trim();
-    if layout.is_empty() {
-        None
-    } else {
-        Some(layout.to_string())
-    }
-}
-
 const AI_PROCESS_NAMES: &[&str] = &["claude", "codex", "gemini"];
 
 struct AiPaneCandidate {
@@ -861,12 +822,17 @@ fn classify_active_panes(
                 } else if polls == 0 {
                     (false, 0, 0)
                 } else if polls <= AI_CPU_GRACE_POLLS {
-                    let cpu_delta = current_cpu.saturating_sub(prev_ticks);
-                    if cpu_delta >= MIN_CPU_DELTA_FOR_GRACE {
+                    if output_count > 0 {
+                        // Any output sustains an already-active pane (spinner, etc.)
                         (true, 1, 0)
                     } else {
-                        let new_polls = polls.saturating_add(1);
-                        (new_polls <= AI_CPU_GRACE_POLLS, new_polls, 0)
+                        let cpu_delta = current_cpu.saturating_sub(prev_ticks);
+                        if cpu_delta >= MIN_CPU_DELTA_FOR_GRACE {
+                            (true, 1, 0)
+                        } else {
+                            let new_polls = polls.saturating_add(1);
+                            (new_polls <= AI_CPU_GRACE_POLLS, new_polls, 0)
+                        }
                     }
                 } else {
                     (false, 0, 0)
@@ -988,18 +954,6 @@ fn read_cpu_ticks_tree(pid: u32) -> Option<u64> {
         }
     }
     Some(total)
-}
-
-async fn remember_window_layout_without_sidebar<T: TmuxApi>(
-    model: &mut Model,
-    tmux: &mut T,
-    window_id: &str,
-) {
-    if let Some(layout) = read_window_layout(tmux, window_id).await {
-        model
-            .layout_without_sidebar_by_window
-            .insert(window_id.to_string(), layout);
-    }
 }
 
 #[cfg(test)]
@@ -1318,6 +1272,43 @@ mod tests {
         counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
         assert!(panes.contains("%10"), "consecutive bursts should reactivate grace-expired pane");
+    }
+
+    #[test]
+    fn classify_active_panes_any_output_sustains_grace() {
+        let candidates = vec![AiPaneCandidate {
+            pane_id: "%10".to_string(),
+            window_id: "@1".to_string(),
+            pane_pid: 99999,
+        }];
+        // polls=2 means active, been quiet for 2 polls — within grace
+        let mut prev = HashMap::new();
+        prev.insert("%10".to_string(), (99999u32, 50000u64, 2u16, 0u8));
+
+        // Even 1 output event (spinner) should sustain grace
+        let mut counts = HashMap::new();
+        counts.insert("%10".to_string(), 1u32);
+
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
+        assert!(panes.contains("%10"), "any output should sustain grace period");
+
+        let &(_, _, polls, _) = prev.get("%10").unwrap();
+        assert_eq!(polls, 1, "polls should reset to 1 when output sustains grace");
+    }
+
+    #[test]
+    fn classify_active_panes_no_output_no_cpu_grace_expires() {
+        let candidates = vec![AiPaneCandidate {
+            pane_id: "%10".to_string(),
+            window_id: "@1".to_string(),
+            pane_pid: 99999,
+        }];
+        // Start at grace limit — no output, no CPU → should expire
+        let mut prev = HashMap::new();
+        prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS, 0u8));
+
+        let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
+        assert!(!panes.contains("%10"), "no output + no CPU should let grace expire");
     }
 
     #[test]
