@@ -721,6 +721,10 @@ const MIN_CPU_DELTA_FOR_GRACE: u64 = 50;
 /// Enable verbose per-pane logging in classify_active_panes.
 const AI_DEBUG: bool = false;
 
+/// Maximum depth when walking the process tree to sum CPU ticks.
+/// Prevents runaway traversal on deeply nested process hierarchies.
+const MAX_PROC_TREE_DEPTH: u8 = 8;
+
 /// Determine which AI panes are actively working using %output as the
 /// primary signal and CPU as a secondary grace-sustaining signal.
 ///
@@ -748,7 +752,7 @@ fn classify_active_panes(
         seen_panes.insert(c.pane_id.clone());
 
         let ai_pid = find_ai_child_pid(c.pane_pid).unwrap_or(c.pane_pid);
-        let current_cpu = read_cpu_ticks(ai_pid).unwrap_or(0);
+        let current_cpu = read_cpu_ticks_tree(ai_pid).unwrap_or(0);
 
         let output_count = output_counts.get(&c.pane_id).copied().unwrap_or(0);
         let is_streaming = output_count >= MIN_OUTPUT_BURST;
@@ -786,11 +790,14 @@ fn classify_active_panes(
             let prev_ticks = prev_info.map(|&(_, t, _)| t).unwrap_or(0);
             let prev_polls = prev_info.map(|&(_, _, p)| p).unwrap_or(0);
             let cpu_delta = current_cpu.saturating_sub(prev_ticks);
+            let single_cpu = read_cpu_ticks(ai_pid).unwrap_or(0);
+            let single_delta = single_cpu.saturating_sub(prev_ticks);
             debug!(
                 pane = %c.pane_id,
                 window = %c.window_id,
                 ai_pid,
                 cpu_delta,
+                single_delta,
                 output_count,
                 is_streaming,
                 prev_polls,
@@ -842,6 +849,50 @@ fn read_cpu_ticks(pid: u32) -> Option<u64> {
     let utime: u64 = fields.get(11)?.parse().ok()?;
     let stime: u64 = fields.get(12)?.parse().ok()?;
     Some(utime + stime)
+}
+
+/// Read aggregate CPU time (utime + stime) across the entire process tree
+/// rooted at `pid`. Walks descendants via `/proc/PID/task/TID/children` to
+/// capture CPU from subprocesses (e.g. Claude Code spawning multiple subagents).
+fn read_cpu_ticks_tree(pid: u32) -> Option<u64> {
+    let root_cpu = read_cpu_ticks(pid)?;
+    let mut total = root_cpu;
+
+    // Iterative BFS with depth limit
+    let mut stack: Vec<(u32, u8)> = vec![(pid, 0)];
+    while let Some((current_pid, depth)) = stack.pop() {
+        if depth >= MAX_PROC_TREE_DEPTH {
+            continue;
+        }
+        // Read children from all TIDs of this process (multi-threaded processes
+        // may have children attached to non-main threads)
+        let task_dir = format!("/proc/{}/task", current_pid);
+        let tasks = match std::fs::read_dir(&task_dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for task_entry in tasks {
+            let tid = match task_entry {
+                Ok(e) => e.file_name(),
+                Err(_) => continue,
+            };
+            let children_path =
+                format!("/proc/{}/task/{}/children", current_pid, tid.to_string_lossy());
+            let children = match std::fs::read_to_string(&children_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            for child_str in children.split_whitespace() {
+                if let Ok(child_pid) = child_str.parse::<u32>() {
+                    if let Some(child_cpu) = read_cpu_ticks(child_pid) {
+                        total += child_cpu;
+                    }
+                    stack.push((child_pid, depth + 1));
+                }
+            }
+        }
+    }
+    Some(total)
 }
 
 async fn remember_window_layout_without_sidebar<T: TmuxApi>(
@@ -1120,6 +1171,38 @@ mod tests {
         let pid = std::process::id();
         let result = read_cpu_ticks(pid);
         assert!(result.is_some(), "should be able to read own process CPU ticks");
+    }
+
+    #[test]
+    fn read_cpu_ticks_tree_includes_own_process() {
+        let pid = std::process::id();
+        let single = read_cpu_ticks(pid).unwrap();
+        let tree = read_cpu_ticks_tree(pid).unwrap();
+        assert!(tree >= single, "tree CPU ({tree}) should be >= single process CPU ({single})");
+    }
+
+    #[test]
+    fn read_cpu_ticks_tree_nonexistent_pid() {
+        // PID 4_000_000 should not exist
+        let result = read_cpu_ticks_tree(4_000_000);
+        assert!(result.is_none(), "nonexistent PID should return None");
+    }
+
+    #[test]
+    fn read_cpu_ticks_tree_with_children() {
+        use std::process::Command;
+        // Spawn a child process that does some work
+        let child = Command::new("sleep").arg("0.1").spawn();
+        if let Ok(mut child) = child {
+            let pid = std::process::id();
+            let single = read_cpu_ticks(pid).unwrap();
+            let tree = read_cpu_ticks_tree(pid).unwrap();
+            assert!(
+                tree >= single,
+                "tree CPU ({tree}) with child should be >= single ({single})"
+            );
+            let _ = child.wait();
+        }
     }
 
     #[tokio::test]
