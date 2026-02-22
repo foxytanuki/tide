@@ -313,8 +313,8 @@ async fn main() -> Result<()> {
 
     let restart = model.restart_requested;
 
-    // Clean up AI border highlights before shutdown
-    let cleanup_cmds = vec![Cmd::ResetAllBorders];
+    // Restore preview layout and clean up AI border highlights before shutdown
+    let cleanup_cmds = vec![Cmd::RestorePreview, Cmd::ResetAllBorders];
     let _ = execute_commands(&mut model, &mut tmux, &mut terminal, cleanup_cmds).await;
 
     // Restore previous prefix+f binding (or unbind if none existed)

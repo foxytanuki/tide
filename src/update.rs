@@ -156,6 +156,17 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
 
             let mut stale_pending_ids = Vec::new();
             for (id, pending) in &mut model.pending_renames {
+                // Skip the last-tracked ID if it was already incremented above
+                if model.pending_rename_last_window_id.as_deref() == Some(id.as_str())
+                    && !windows.iter().any(|w| w.id == *id)
+                {
+                    // Already handled in the last_id block — skip to avoid
+                    // double-incrementing observed_count.
+                    if pending.observed_count >= MISSING_PENDING_RENAME_THRESHOLD {
+                        stale_pending_ids.push(id.clone());
+                    }
+                    continue;
+                }
                 if let Some(current) = windows.iter().find(|w| w.id == *id) {
                     if current.name != pending.target_name {
                         debug!(
@@ -236,7 +247,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             }
         }
         Msg::AiProcessPollResult { panes, windows } => {
-            if panes == model.ai_panes {
+            if panes == model.ai_panes && windows == model.ai_windows {
                 return vec![];
             }
             model.ai_panes = panes;

@@ -199,19 +199,19 @@ impl TmuxControl {
                     continue;
                 }
 
-                // If inside a response block, non-marker lines are response data
-                // EXCEPT: %-prefixed lines are never response data — they are either
-                // known notifications (emitted as events) or unknown notifications
-                // (silently dropped to avoid corrupting command responses).
+                // If inside a response block, non-marker lines are response data.
+                // %-prefixed lines that match a known notification are emitted as
+                // events and NOT appended to the response.  Unrecognized %-lines
+                // (e.g. pane IDs like %0, %1) ARE kept as response data.
                 if let Some(data) = in_progress.as_mut() {
                     if line.starts_with('%') {
                         if let Some(event) = parse_line(&line) {
                             if !send_event(&event_tx, event).await {
                                 break;
                             }
+                            continue;
                         }
-                        // Known or unknown %-notification: never append to response data
-                        continue;
+                        // Unrecognized %-line: fall through to append as response data
                     }
                     data.push_str(&line);
                     data.push('\n');
@@ -282,8 +282,14 @@ impl TmuxControl {
             Ok(Err(_)) => Err(anyhow!("tmux command response channel closed")),
             Err(_) => {
                 let mut state = self.waiters.lock().await;
-                state.queue.pop_back();
-                state.skip_responses += 1;
+                // Only increment skip_responses if our waiter is still in the
+                // queue.  If the reader already consumed it (race between
+                // response arrival and timeout), the queue is empty and we must
+                // not bump skip_responses — doing so would discard the next
+                // legitimate response.
+                if state.queue.pop_back().is_some() {
+                    state.skip_responses += 1;
+                }
                 Err(anyhow!("timed out waiting for tmux response"))
             }
         };
