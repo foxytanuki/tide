@@ -32,10 +32,15 @@ pub struct Model {
     pub pending_renames: HashMap<String, PendingRename>,
     /// Most recent pending-rename target, used to keep selection stable.
     pub pending_rename_last_window_id: Option<String>,
-    /// Window IDs currently running AI processes.
+    /// Pane IDs currently running AI processes (actively working).
+    pub ai_panes: HashSet<String>,
+    /// Window IDs derived from ai_panes (for sidebar indicator).
     pub ai_windows: HashSet<String>,
-    /// Window ID currently highlighted with AI border.
-    pub border_highlighted_window: Option<String>,
+    /// Pane IDs currently highlighted with AI background.
+    pub highlighted_panes: HashSet<String>,
+    /// AI process CPU tracking for activity detection.
+    /// Maps pane_id → (ai_pid, last_cpu_ticks, polls_since_active).
+    pub ai_cpu_tracker: HashMap<String, (u32, u64, u16)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,8 +97,10 @@ impl Model {
             pending_internal_focus_window: None,
             pending_renames: HashMap::new(),
             pending_rename_last_window_id: None,
+            ai_panes: HashSet::new(),
             ai_windows: HashSet::new(),
-            border_highlighted_window: None,
+            highlighted_panes: HashSet::new(),
+            ai_cpu_tracker: HashMap::new(),
         }
     }
 

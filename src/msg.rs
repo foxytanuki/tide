@@ -28,7 +28,10 @@ pub enum Msg {
     CloseWindow,
 
     // AI process detection
-    AiProcessPollResult(HashSet<String>), // window_ids with AI processes
+    AiProcessPollResult {
+        panes: HashSet<String>,   // active AI pane_ids
+        windows: HashSet<String>, // derived window_ids (for sidebar)
+    },
 
     Restart,
     Quit,

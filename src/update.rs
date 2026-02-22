@@ -20,7 +20,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         Msg::WindowChanged
             | Msg::WindowRenamed { .. }
             | Msg::WindowListLoaded(_)
-            | Msg::AiProcessPollResult(_)
+            | Msg::AiProcessPollResult { .. }
     ) {
         model.error_message = None;
         model.info_message = None;
@@ -234,9 +234,13 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                 followup_cmds
             }
         }
-        Msg::AiProcessPollResult(ai_windows) => {
-            model.ai_windows = ai_windows;
-            vec![Cmd::CheckBorder]
+        Msg::AiProcessPollResult { panes, windows } => {
+            if panes == model.ai_panes {
+                return vec![];
+            }
+            model.ai_panes = panes;
+            model.ai_windows = windows;
+            vec![Cmd::CheckBorder, Cmd::Render]
         }
         Msg::Key(event) => handle_key(model, event),
         Msg::Restart => {

@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::io::Stdout;
@@ -431,13 +431,17 @@ pub async fn execute_commands<T: TmuxApi>(
             },
             Cmd::PollAiProcesses => {
                 let list_cmd = format!(
-                    "list-panes -s -t {} -F '#{{window_id}}\t#{{pane_id}}\t#{{pane_current_command}}'",
+                    "list-panes -s -t {} -F '#{{window_id}}\t#{{pane_id}}\t#{{pane_current_command}}\t#{{pane_pid}}'",
                     model.session_name
                 );
                 match tmux.send_command(&list_cmd).await {
                     Ok(output) => {
-                        let ai_windows = parse_ai_pane_output(&output, &model.sidebar_pane_id);
-                        let follow_up = update(model, Msg::AiProcessPollResult(ai_windows));
+                        let candidates = find_ai_pane_candidates(&output, &model.sidebar_pane_id);
+                        let (panes, windows) = classify_active_panes(
+                            &candidates,
+                            &mut model.ai_cpu_tracker,
+                        );
+                        let follow_up = update(model, Msg::AiProcessPollResult { panes, windows });
                         for c in follow_up.into_iter().rev() {
                             queue.push_front(c);
                         }
@@ -448,49 +452,41 @@ pub async fn execute_commands<T: TmuxApi>(
                 }
             }
             Cmd::CheckBorder => {
-                let should_highlight = model.ai_windows.contains(&model.sidebar_window_id);
-                let current = model.border_highlighted_window.clone();
+                let wanted: HashSet<String> = model.ai_panes.clone();
+                let current = &model.highlighted_panes;
 
-                let need_highlight = if should_highlight {
-                    Some(model.sidebar_window_id.clone())
-                } else {
-                    None
-                };
-
-                if current == need_highlight {
-                    continue;
-                }
-
-                // Reset old highlight
-                if let Some(ref old_id) = current {
+                // Remove highlight from panes no longer active
+                let to_remove: Vec<String> = current.difference(&wanted).cloned().collect();
+                for pane_id in &to_remove {
                     let reset_cmd = format!(
-                        "set-window-option -t {} pane-border-style default ; set-window-option -t {} pane-active-border-style default",
-                        old_id, old_id
+                        "set-option -p -t {} -u pane-border-format",
+                        pane_id
                     );
                     let _ = tmux.send_command(&reset_cmd).await;
-                    debug!(window = %old_id, "border highlight removed");
+                    debug!(pane = %pane_id, "pane border format reset");
                 }
 
-                // Apply new highlight
-                if let Some(ref new_id) = need_highlight {
+                // Add highlight to newly active panes
+                let to_add: Vec<String> = wanted.difference(current).cloned().collect();
+                for pane_id in &to_add {
                     let set_cmd = format!(
-                        "set-window-option -t {} pane-border-style fg=yellow ; set-window-option -t {} pane-active-border-style fg=yellow",
-                        new_id, new_id
+                        "set-option -p -t {} pane-border-format \" #{{?pane_active,#[fg=yellow#,bold]● #P: #{{pane_current_command}} #{{pane_current_path}},#[fg=yellow]● #P: #{{pane_current_command}}}} \"",
+                        pane_id
                     );
                     let _ = tmux.send_command(&set_cmd).await;
-                    debug!(window = %new_id, "border highlight applied");
+                    debug!(pane = %pane_id, "pane border format set to AI active");
                 }
 
-                model.border_highlighted_window = need_highlight;
+                model.highlighted_panes = wanted;
             }
             Cmd::ResetAllBorders => {
-                if let Some(ref id) = model.border_highlighted_window.take() {
+                for pane_id in model.highlighted_panes.drain() {
                     let reset_cmd = format!(
-                        "set-window-option -t {} pane-border-style default ; set-window-option -t {} pane-active-border-style default",
-                        id, id
+                        "set-option -p -t {} -u pane-border-format",
+                        pane_id
                     );
                     let _ = tmux.send_command(&reset_cmd).await;
-                    debug!(window = %id, "border highlight reset on cleanup");
+                    debug!(pane = %pane_id, "pane border format reset on cleanup");
                 }
             }
             Cmd::Render => {
@@ -636,28 +632,142 @@ async fn read_window_layout<T: TmuxApi>(tmux: &mut T, window_id: &str) -> Option
 
 const AI_PROCESS_NAMES: &[&str] = &["claude", "codex", "gemini"];
 
-fn parse_ai_pane_output(output: &str, sidebar_pane_id: &str) -> HashSet<String> {
-    let mut ai_windows = HashSet::new();
+struct AiPaneCandidate {
+    pane_id: String,
+    window_id: String,
+    pane_pid: u32,
+}
+
+/// Parse tmux list-panes output to find panes running AI processes.
+fn find_ai_pane_candidates(output: &str, sidebar_pane_id: &str) -> Vec<AiPaneCandidate> {
+    let mut candidates = Vec::new();
     for line in output.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 3 {
+        if parts.len() < 4 {
             continue;
         }
         let window_id = parts[0].trim();
         let pane_id = parts[1].trim();
         let command = parts[2].trim();
+        let pid_str = parts[3].trim();
 
-        // Skip the sidebar pane itself
         if pane_id == sidebar_pane_id {
             continue;
         }
 
         let lower = command.to_lowercase();
-        if AI_PROCESS_NAMES.iter().any(|name| lower.contains(name)) {
-            ai_windows.insert(window_id.to_string());
+        if !AI_PROCESS_NAMES.iter().any(|name| lower.contains(name)) {
+            continue;
+        }
+
+        if let Ok(pane_pid) = pid_str.parse::<u32>() {
+            candidates.push(AiPaneCandidate {
+                pane_id: pane_id.to_string(),
+                window_id: window_id.to_string(),
+                pane_pid,
+            });
         }
     }
-    ai_windows
+    candidates
+}
+
+/// Number of consecutive idle polls before demoting an AI pane to inactive.
+/// At 1s poll interval, 30 polls = 30 seconds of grace after last CPU activity.
+/// Covers most "thinking" phases where CPU is near zero (API response wait).
+const AI_CPU_GRACE_POLLS: u16 = 30;
+
+/// Determine which AI panes are actively working by tracking CPU time.
+///
+/// Reads utime + stime from /proc/<pid>/stat. If CPU ticks increased since
+/// last poll, the pane is active (grace timer reset). Grace period covers
+/// brief idle gaps during thinking. All AI tools treated equally.
+///
+/// Returns (active_pane_ids, active_window_ids).
+fn classify_active_panes(
+    candidates: &[AiPaneCandidate],
+    prev_cpu: &mut HashMap<String, (u32, u64, u16)>,
+) -> (HashSet<String>, HashSet<String>) {
+    let mut active_panes = HashSet::new();
+    let mut active_windows = HashSet::new();
+    let mut seen_panes = HashSet::new();
+
+    for c in candidates {
+        seen_panes.insert(c.pane_id.clone());
+
+        let ai_pid = find_ai_child_pid(c.pane_pid).unwrap_or(c.pane_pid);
+        let current_cpu = read_cpu_ticks(ai_pid).unwrap_or(0);
+
+        // polls_since_active semantics:
+        //   0 = never been active (baseline only)
+        //   1 = active right now (CPU burst just seen)
+        //   2..=GRACE = was active, counting idle polls
+        //   >GRACE = demoted to idle
+        let (is_active, new_polls) =
+            if let Some(&(prev_pid, prev_ticks, polls)) = prev_cpu.get(&c.pane_id) {
+                if prev_pid != ai_pid {
+                    // PID changed — new process, need baseline
+                    (false, 0)
+                } else {
+                    let delta = current_cpu.saturating_sub(prev_ticks);
+                    if delta > 0 {
+                        // CPU activity — activate
+                        (true, 1)
+                    } else if polls == 0 {
+                        // Never been active — stay idle
+                        (false, 0)
+                    } else {
+                        // Was active, no CPU now — count toward grace expiry
+                        let new_polls = polls.saturating_add(1);
+                        (new_polls <= AI_CPU_GRACE_POLLS, new_polls)
+                    }
+                }
+            } else {
+                // First time seeing this pane — record baseline, stay idle
+                (false, 0)
+            };
+
+        prev_cpu.insert(c.pane_id.clone(), (ai_pid, current_cpu, new_polls));
+
+        if is_active {
+            active_panes.insert(c.pane_id.clone());
+            active_windows.insert(c.window_id.clone());
+        }
+    }
+
+    // Clean up stale entries for panes no longer running AI
+    prev_cpu.retain(|k, _| seen_panes.contains(k));
+
+    (active_panes, active_windows)
+}
+
+/// Walk /proc to find the AI process that is a child of the pane's shell.
+fn find_ai_child_pid(pane_pid: u32) -> Option<u32> {
+    let children_path = format!("/proc/{}/task/{}/children", pane_pid, pane_pid);
+    let children = std::fs::read_to_string(&children_path).ok()?;
+    for child_str in children.split_whitespace() {
+        let child_pid: u32 = child_str.parse().ok()?;
+        let comm_path = format!("/proc/{}/comm", child_pid);
+        if let Ok(comm) = std::fs::read_to_string(&comm_path) {
+            let lower = comm.trim().to_lowercase();
+            if AI_PROCESS_NAMES.iter().any(|name| lower.contains(name)) {
+                return Some(child_pid);
+            }
+        }
+    }
+    None
+}
+
+/// Read CPU time (utime + stime) from /proc/<pid>/stat.
+fn read_cpu_ticks(pid: u32) -> Option<u64> {
+    let path = format!("/proc/{}/stat", pid);
+    let content = std::fs::read_to_string(&path).ok()?;
+    // comm field can contain spaces/parens, so find last ')' first
+    let after_comm = content.rsplit_once(')')?.1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // After ')': [0]=state [1]=ppid ... [11]=utime [12]=stime
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(utime + stime)
 }
 
 async fn remember_window_layout_without_sidebar<T: TmuxApi>(
@@ -720,6 +830,127 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<Vec<WindowInfo>, String>> + Send + 'a>> {
             Box::pin(async move { Err("not used in this test".to_string()) })
         }
+    }
+
+    #[test]
+    fn find_ai_pane_candidates_filters_correctly() {
+        let output = "@1\t%10\tclaude\t1000\n@1\t%11\tzsh\t1001\n@2\t%20\tgemini\t1002\n@2\t%21\tcodex\t1003\n";
+        let candidates = find_ai_pane_candidates(output, "%sidebar");
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].pane_id, "%10");
+        assert_eq!(candidates[0].window_id, "@1");
+        assert_eq!(candidates[1].pane_id, "%20");
+        assert_eq!(candidates[1].window_id, "@2");
+        assert_eq!(candidates[2].pane_id, "%21");
+    }
+
+    #[test]
+    fn find_ai_pane_candidates_skips_sidebar() {
+        let output = "@1\t%sidebar\tclaude\t1000\n@1\t%10\tclaude\t1001\n";
+        let candidates = find_ai_pane_candidates(output, "%sidebar");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].pane_id, "%10");
+    }
+
+    #[test]
+    fn classify_active_panes_first_seen_is_idle() {
+        let candidates = vec![AiPaneCandidate {
+            pane_id: "%10".to_string(),
+            window_id: "@1".to_string(),
+
+            pane_pid: 99999,
+        }];
+        let mut prev = HashMap::new();
+        let (panes, _) = classify_active_panes(&candidates, &mut prev);
+        assert!(!panes.contains("%10"), "first-seen pane should be idle (baseline)");
+        assert!(prev.contains_key("%10"), "baseline should be recorded");
+    }
+
+    #[test]
+    fn classify_active_panes_never_active_stays_idle() {
+        let candidates = vec![AiPaneCandidate {
+            pane_id: "%10".to_string(),
+            window_id: "@1".to_string(),
+
+            pane_pid: 99999,
+        }];
+        // polls=0 means never been active — should stay idle
+        let mut prev = HashMap::new();
+        prev.insert("%10".to_string(), (99999u32, 50000u64, 0u16));
+
+        let (panes, _) = classify_active_panes(&candidates, &mut prev);
+        assert!(!panes.contains("%10"), "never-active pane should stay idle");
+    }
+
+    #[test]
+    fn classify_active_panes_grace_maintains_active() {
+        let candidates = vec![AiPaneCandidate {
+            pane_id: "%10".to_string(),
+            window_id: "@1".to_string(),
+
+            pane_pid: 99999,
+        }];
+        // polls=1 means just activated, no CPU delta — should stay active within grace
+        let mut prev = HashMap::new();
+        prev.insert("%10".to_string(), (99999u32, 50000u64, 1u16));
+
+        let (panes, _) = classify_active_panes(&candidates, &mut prev);
+        assert!(panes.contains("%10"), "should stay active within grace period");
+
+        let &(_, _, polls) = prev.get("%10").unwrap();
+        assert_eq!(polls, 2, "polls counter should increment");
+    }
+
+    #[test]
+    fn classify_active_panes_grace_expires_to_idle() {
+        let candidates = vec![AiPaneCandidate {
+            pane_id: "%10".to_string(),
+            window_id: "@1".to_string(),
+
+            pane_pid: 99999,
+        }];
+        // polls at grace limit — next poll should demote to idle
+        let mut prev = HashMap::new();
+        prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS));
+
+        let (panes, _) = classify_active_panes(&candidates, &mut prev);
+        assert!(!panes.contains("%10"), "should be idle after grace period expires");
+    }
+
+    #[test]
+    fn classify_active_panes_stays_active_during_thinking() {
+        let candidates = vec![AiPaneCandidate {
+            pane_id: "%10".to_string(),
+            window_id: "@1".to_string(),
+
+            pane_pid: 99999,
+        }];
+        // polls=15 means was active, been quiet for 15 polls — still within 30s grace
+        let mut prev = HashMap::new();
+        prev.insert("%10".to_string(), (99999u32, 50000u64, 15u16));
+
+        let (panes, _) = classify_active_panes(&candidates, &mut prev);
+        assert!(panes.contains("%10"), "should stay active during thinking (within grace)");
+    }
+
+    #[test]
+    fn classify_active_panes_cleans_stale_entries() {
+        let candidates = vec![]; // no AI panes
+        let mut prev = HashMap::new();
+        prev.insert("%gone".to_string(), (123u32, 50000u64, 0u16));
+
+        let _ = classify_active_panes(&candidates, &mut prev);
+        assert!(prev.is_empty(), "stale entries should be cleaned");
+    }
+
+    #[test]
+    fn read_cpu_ticks_parses_stat() {
+        // Test with a synthetic /proc/pid/stat line
+        // We can't easily unit-test read_cpu_ticks since it reads /proc,
+        // but we can verify it works on our own process
+        let pid = std::process::id();
+        let result = read_cpu_ticks(pid);
+        assert!(result.is_some(), "should be able to read own process CPU ticks");
     }
 
     #[tokio::test]

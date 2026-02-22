@@ -2,6 +2,8 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
+use std::collections::HashSet;
+
 use crate::model::{Mode, Model};
 use crate::tree::{get_node, FlatItem, FlatNodeKind, TreeNode};
 
@@ -58,8 +60,9 @@ fn render_tree_item(
     width: usize,
 ) -> ListItem<'static> {
     let indent = " ".repeat(item.depth * 2);
-    let mut line = String::new();
+    let mut content = String::new();
     let mut style = Style::default();
+    let mut show_ai_dot = false;
 
     match get_node(model.tree(), &item.path) {
         Ok(node) => match (&item.kind, node) {
@@ -72,31 +75,30 @@ fn render_tree_item(
                 },
             ) => {
                 let marker = if *expanded { "v" } else { ">" };
-                let content = format!("{}{} {}", indent, marker, name);
-                line.push_str(&truncate(&content, width));
+                content = format!("{}{} {}", indent, marker, name);
                 style = style.add_modifier(Modifier::BOLD);
                 if children.is_empty() {
                     style = style.fg(Color::DarkGray);
                 }
+                // Bubble up: show dot if any child window has AI activity
+                show_ai_dot = folder_has_ai_window(children, &model.ai_windows);
             }
             (FlatNodeKind::Window, TreeNode::Window { info }) => {
                 let branch = window_branch(model.tree(), &item.path);
                 if info.id == model.sidebar_window_id {
-                    let content = format!("{}{} * {}", indent, branch, info.name);
-                    line.push_str(&truncate(&content, width));
+                    content = format!("{}{} * {}", indent, branch, info.name);
                     style = style.fg(Color::Yellow);
                 } else {
-                    let content = format!("{}{} {}", indent, branch, info.name);
-                    line.push_str(&truncate(&content, width));
+                    content = format!("{}{} {}", indent, branch, info.name);
                 }
+                show_ai_dot = model.ai_windows.contains(&info.id);
             }
             _ => {
-                line.push_str(&indent);
-                line.push('?');
+                content = format!("{}?", indent);
             }
         },
         Err(_) => {
-            line.push('?');
+            content.push('?');
         }
     }
 
@@ -104,7 +106,38 @@ fn render_tree_item(
         style = style.add_modifier(Modifier::REVERSED);
     }
 
-    ListItem::new(line).style(style)
+    if show_ai_dot && width > 1 {
+        let truncated = truncate(&content, width.saturating_sub(2));
+        let text_width = truncated.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
+        let padding = width.saturating_sub(text_width).saturating_sub(1);
+        let line = Line::from(vec![
+            Span::styled(truncated, style),
+            Span::styled(" ".repeat(padding), style),
+            Span::styled("●", style.fg(Color::Yellow)),
+        ]);
+        ListItem::new(line)
+    } else {
+        ListItem::new(truncate(&content, width)).style(style)
+    }
+}
+
+/// Check if any window inside a folder (recursively) has AI activity.
+fn folder_has_ai_window(children: &[TreeNode], ai_windows: &HashSet<String>) -> bool {
+    for child in children {
+        match child {
+            TreeNode::Window { info } => {
+                if ai_windows.contains(&info.id) {
+                    return true;
+                }
+            }
+            TreeNode::Folder { children, .. } => {
+                if folder_has_ai_window(children, ai_windows) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn build_footer_text(model: &Model, width: usize) -> String {
