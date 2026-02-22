@@ -1001,7 +1001,16 @@ mod tests {
             wi("@2", 2, "proj:term"),
         ];
         update(&mut model, Msg::WindowListLoaded(windows));
-        // cursor=0 is the folder "proj"
+        // expanded folder is skipped, cursor lands on first child
+        assert_eq!(model.cursor(), 1);
+        // collapse the folder so cursor can sit on it
+        model.set_cursor(0);
+        model.mutate_tree(|tree| {
+            if let TreeNode::Folder { expanded, .. } = &mut tree[0] {
+                *expanded = false;
+            }
+        });
+        // after collapse + rebuild, cursor stays on the now-collapsed folder
         assert_eq!(model.cursor(), 0);
         let cmds = update(&mut model, Msg::NewWindow);
         assert_new_window_name(&cmds, "proj:tab1");

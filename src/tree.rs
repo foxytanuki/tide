@@ -33,6 +33,8 @@ pub struct FlatItem {
     pub depth: usize,
     pub path: Vec<usize>,
     pub kind: FlatNodeKind,
+    /// True when this is an expanded folder (used for cursor skip logic).
+    pub expanded: bool,
 }
 
 pub fn build_tree(windows: &[WindowInfo]) -> Vec<TreeNode> {
@@ -103,19 +105,34 @@ pub fn next_visible_item(flat: &[FlatItem], current: usize) -> Option<usize> {
         return None;
     }
 
-    let next = current + 1;
-    if next < flat.len() {
-        Some(next)
-    } else {
-        None
+    let mut idx = current + 1;
+    while idx < flat.len() {
+        // Skip expanded folders — cursor goes straight to their children
+        if flat[idx].kind == FlatNodeKind::Folder && flat[idx].expanded {
+            idx += 1;
+            continue;
+        }
+        return Some(idx);
     }
+    None
 }
 
 pub fn prev_visible_item(flat: &[FlatItem], current: usize) -> Option<usize> {
     if current == 0 || current >= flat.len() {
-        None
-    } else {
-        Some(current - 1)
+        return None;
+    }
+
+    let mut idx = current - 1;
+    loop {
+        // Skip expanded folders
+        if flat[idx].kind == FlatNodeKind::Folder && flat[idx].expanded {
+            if idx == 0 {
+                return None;
+            }
+            idx -= 1;
+            continue;
+        }
+        return Some(idx);
     }
 }
 
@@ -219,6 +236,7 @@ fn flatten_node(node: &TreeNode, depth: usize, path: &mut Vec<usize>, out: &mut 
                 depth,
                 path: path.clone(),
                 kind: FlatNodeKind::Folder,
+                expanded: *expanded,
             });
 
             if *expanded {
@@ -234,6 +252,7 @@ fn flatten_node(node: &TreeNode, depth: usize, path: &mut Vec<usize>, out: &mut 
                 depth,
                 path: path.clone(),
                 kind: FlatNodeKind::Window,
+                expanded: false,
             });
         }
     }
@@ -361,12 +380,14 @@ mod tests {
         assert_eq!(find_parent_folder(&flat, 0), None);
         assert_eq!(find_parent_folder(&flat, 3), None);
 
-        assert_eq!(next_visible_item(&flat, 0), Some(1));
+        // flat[0] = "proj" folder (expanded) → skipped by cursor
+        assert_eq!(next_visible_item(&flat, 0), Some(1)); // expanded folder → first child
         assert_eq!(next_visible_item(&flat, 2), Some(3));
         assert_eq!(next_visible_item(&flat, 3), None);
 
         assert_eq!(prev_visible_item(&flat, 0), None);
-        assert_eq!(prev_visible_item(&flat, 1), Some(0));
+        // expanded folder at [0] is skipped
+        assert_eq!(prev_visible_item(&flat, 1), None);
         assert_eq!(prev_visible_item(&flat, 3), Some(2));
     }
 

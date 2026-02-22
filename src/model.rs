@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::tree::{
-    expand_to_window_by_id, find_window_flat_index_by_id, flatten, get_node, FlatItem, TreeNode,
-    WindowInfo,
+    expand_to_window_by_id, find_window_flat_index_by_id, flatten, get_node, next_visible_item,
+    FlatItem, FlatNodeKind, TreeNode, WindowInfo,
 };
 
 pub struct Model {
@@ -23,7 +23,6 @@ pub struct Model {
     pub home_pane_id: String,
     pub sidebar_window_id: String,
     pub preview: PreviewState,
-    pub layout_without_sidebar_by_window: HashMap<String, String>,
     /// Number of internal window-focus notifications to suppress.
     pub ignore_window_changes: u8,
     /// Window ID expected while suppression is active.
@@ -102,7 +101,6 @@ impl Model {
             home_pane_id,
             sidebar_window_id,
             preview: PreviewState::Home,
-            layout_without_sidebar_by_window: HashMap::new(),
             ignore_window_changes: 0,
             pending_internal_focus_window: None,
             pending_renames: HashMap::new(),
@@ -167,6 +165,19 @@ impl Model {
             let max_index = self.flat_items.len() - 1;
             if self.cursor > max_index {
                 self.cursor = max_index;
+            }
+            // If cursor landed on an expanded folder, skip forward to first non-folder child
+            self.snap_cursor_off_expanded_folder();
+        }
+    }
+
+    /// If cursor is on an expanded folder, move it to the next non-expanded-folder item.
+    fn snap_cursor_off_expanded_folder(&mut self) {
+        if let Some(item) = self.flat_items.get(self.cursor) {
+            if item.kind == FlatNodeKind::Folder && item.expanded {
+                if let Some(next) = next_visible_item(&self.flat_items, self.cursor) {
+                    self.cursor = next;
+                }
             }
         }
     }
