@@ -86,8 +86,9 @@ fn render_tree_item(
                 if children.is_empty() {
                     style = style.fg(Color::DarkGray);
                 }
-                // Bubble up: show dot if any child window has AI activity
-                show_ai_dot = folder_has_ai_window(children, &model.ai_windows);
+                // Bubble up: show dot only when collapsed (expanded shows individual dots)
+                show_ai_dot =
+                    !*expanded && folder_has_ai_window(children, &model.ai_windows);
             }
             (FlatNodeKind::Window, TreeNode::Window { info }) => {
                 let branch = window_branch(model.tree(), &item.path);
