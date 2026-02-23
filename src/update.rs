@@ -248,12 +248,47 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             }
         }
         Msg::AiProcessPollResult { panes, windows } => {
-            if panes == model.ai_panes && windows == model.ai_windows {
-                return vec![];
+            use std::time::Instant;
+
+            const RECENTLY_FINISHED_TIMEOUT: std::time::Duration =
+                std::time::Duration::from_secs(5 * 60);
+
+            let now = Instant::now();
+            let mut recently_changed = false;
+
+            // Detect windows that just finished AI (were active, now gone)
+            for old_win in &model.ai_windows {
+                if !windows.contains(old_win) {
+                    model.recently_finished_ai.insert(old_win.clone(), now);
+                    recently_changed = true;
+                }
             }
+            // Remove windows that became active again
+            for new_win in &windows {
+                if model.recently_finished_ai.remove(new_win).is_some() {
+                    recently_changed = true;
+                }
+            }
+            // Expire old entries
+            let before_len = model.recently_finished_ai.len();
+            model
+                .recently_finished_ai
+                .retain(|_, finished_at| now.duration_since(*finished_at) < RECENTLY_FINISHED_TIMEOUT);
+            if model.recently_finished_ai.len() != before_len {
+                recently_changed = true;
+            }
+
+            let ai_changed = panes != model.ai_panes || windows != model.ai_windows;
             model.ai_panes = panes;
             model.ai_windows = windows;
-            vec![Cmd::CheckBorder, Cmd::Render]
+
+            if ai_changed {
+                vec![Cmd::CheckBorder, Cmd::Render]
+            } else if recently_changed {
+                vec![Cmd::Render]
+            } else {
+                vec![]
+            }
         }
         Msg::MouseClick { row } => {
             if !matches!(model.mode, Mode::Normal) {

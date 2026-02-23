@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use crate::tree::{
     expand_to_window_by_id, find_window_flat_index_by_id, flatten, get_node, next_visible_item,
@@ -50,6 +51,9 @@ pub struct Model {
     /// Circuit breaker: true after attempting RestorePreview before CloseWindow.
     /// Prevents infinite requeue loop if RestorePreview fails persistently.
     pub close_restore_attempted: bool,
+    /// Window IDs where AI recently finished, with completion timestamp.
+    /// Used to show fading badge: ○ (new moon) → disappear after timeout.
+    pub recently_finished_ai: HashMap<String, Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +117,7 @@ impl Model {
             ai_output_suppress: 0,
             terminal_size: (80, 24),
             close_restore_attempted: false,
+            recently_finished_ai: HashMap::new(),
         }
     }
 

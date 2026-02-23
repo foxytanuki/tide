@@ -2,7 +2,8 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use crate::model::{Mode, Model};
 use crate::tree::{get_node, FlatItem, FlatNodeKind, TreeNode};
@@ -59,6 +60,16 @@ pub fn render(model: &Model, frame: &mut Frame) {
     }
 }
 
+/// Badge state for a tree item's AI activity indicator.
+enum AiBadge {
+    /// No badge
+    None,
+    /// ● Active AI (yellow)
+    Active,
+    /// ○ Recently finished AI (dark gray)
+    Finished,
+}
+
 fn render_tree_item(
     model: &Model,
     index: usize,
@@ -68,7 +79,7 @@ fn render_tree_item(
     let indent = " ".repeat(item.depth * 2);
     let mut content = String::new();
     let mut style = Style::default();
-    let mut show_ai_dot = false;
+    let mut badge = AiBadge::None;
 
     match get_node(model.tree(), &item.path) {
         Ok(node) => match (&item.kind, node) {
@@ -87,8 +98,14 @@ fn render_tree_item(
                     style = style.fg(Color::DarkGray);
                 }
                 // Bubble up: show dot only when collapsed (expanded shows individual dots)
-                show_ai_dot =
-                    !*expanded && folder_has_ai_window(children, &model.ai_windows);
+                // Active takes priority over recently-finished
+                if !*expanded {
+                    if folder_has_ai_window(children, &model.ai_windows) {
+                        badge = AiBadge::Active;
+                    } else if folder_has_recently_finished(children, &model.recently_finished_ai) {
+                        badge = AiBadge::Finished;
+                    }
+                }
             }
             (FlatNodeKind::Window, TreeNode::Window { info }) => {
                 let branch = window_branch(model.tree(), &item.path);
@@ -98,7 +115,11 @@ fn render_tree_item(
                 } else {
                     content = format!("{}{} {}", indent, branch, info.name);
                 }
-                show_ai_dot = model.ai_windows.contains(&info.id);
+                if model.ai_windows.contains(&info.id) {
+                    badge = AiBadge::Active;
+                } else if model.recently_finished_ai.contains_key(&info.id) {
+                    badge = AiBadge::Finished;
+                }
             }
             _ => {
                 content = format!("{}?", indent);
@@ -113,18 +134,30 @@ fn render_tree_item(
         style = style.add_modifier(Modifier::REVERSED);
     }
 
-    if show_ai_dot && width > 1 {
-        let truncated = truncate(&content, width.saturating_sub(2));
-        let text_width = truncated.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
-        let padding = width.saturating_sub(text_width).saturating_sub(1);
-        let line = Line::from(vec![
-            Span::styled(truncated, style),
-            Span::styled(" ".repeat(padding), style),
-            Span::styled("●", style.fg(Color::Yellow)),
-        ]);
-        ListItem::new(line)
-    } else {
-        ListItem::new(truncate(&content, width)).style(style)
+    match badge {
+        AiBadge::Active if width > 1 => {
+            let truncated = truncate(&content, width.saturating_sub(2));
+            let text_width = truncated.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
+            let padding = width.saturating_sub(text_width).saturating_sub(1);
+            let line = Line::from(vec![
+                Span::styled(truncated, style),
+                Span::styled(" ".repeat(padding), style),
+                Span::styled("●", style.fg(Color::Yellow)),
+            ]);
+            ListItem::new(line)
+        }
+        AiBadge::Finished if width > 1 => {
+            let truncated = truncate(&content, width.saturating_sub(2));
+            let text_width = truncated.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
+            let padding = width.saturating_sub(text_width).saturating_sub(1);
+            let line = Line::from(vec![
+                Span::styled(truncated, style),
+                Span::styled(" ".repeat(padding), style),
+                Span::styled("○", style.fg(Color::DarkGray)),
+            ]);
+            ListItem::new(line)
+        }
+        _ => ListItem::new(truncate(&content, width)).style(style),
     }
 }
 
@@ -139,6 +172,28 @@ fn folder_has_ai_window(children: &[TreeNode], ai_windows: &HashSet<String>) -> 
             }
             TreeNode::Folder { children, .. } => {
                 if folder_has_ai_window(children, ai_windows) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check if any window inside a folder (recursively) has recently finished AI.
+fn folder_has_recently_finished(
+    children: &[TreeNode],
+    recently_finished: &HashMap<String, Instant>,
+) -> bool {
+    for child in children {
+        match child {
+            TreeNode::Window { info } => {
+                if recently_finished.contains_key(&info.id) {
+                    return true;
+                }
+            }
+            TreeNode::Folder { children, .. } => {
+                if folder_has_recently_finished(children, recently_finished) {
                     return true;
                 }
             }
