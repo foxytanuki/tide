@@ -440,14 +440,27 @@ pub async fn execute_commands<T: TmuxApi>(
                 queue.push_front(Cmd::CheckBorder);
             }
             Cmd::EnsureSidebarWidth => {
-                if let Err(err) = tmux
-                    .send_command(&format!(
-                        "resize-pane -t {} -x 30",
-                        model.sidebar_pane_id
-                    ))
-                    .await
-                {
-                    warn!(%err, "ensure resize-pane failed");
+                // Query current width to avoid unnecessary resize.
+                // Spurious resize-pane causes SIGWINCH on the right pane,
+                // making the cursor jump/flicker in the user's work area.
+                let width_cmd = format!(
+                    "display-message -t {} -p '#{{pane_width}}'",
+                    model.sidebar_pane_id
+                );
+                let needs_resize = match tmux.send_command(&width_cmd).await {
+                    Ok(output) => output.trim().parse::<u16>().unwrap_or(0) != 30,
+                    Err(_) => true, // can't check, try resize anyway
+                };
+                if needs_resize {
+                    if let Err(err) = tmux
+                        .send_command(&format!(
+                            "resize-pane -t {} -x 30",
+                            model.sidebar_pane_id
+                        ))
+                        .await
+                    {
+                        warn!(%err, "ensure resize-pane failed");
+                    }
                 }
             }
             Cmd::ValidateSidebarPanes => {
@@ -532,26 +545,29 @@ pub async fn execute_commands<T: TmuxApi>(
                 let wanted: HashSet<String> = model.ai_panes.clone();
                 let current = &model.highlighted_panes;
 
-                // Remove highlight from panes no longer active
+                // Collect all border changes and batch into a single tmux command
+                // to minimize server round-trips and reduce cursor flicker.
                 let to_remove: Vec<String> = current.difference(&wanted).cloned().collect();
-                for pane_id in &to_remove {
-                    let reset_cmd = format!(
-                        "set-option -p -t {} -u pane-border-format",
-                        pane_id
-                    );
-                    let _ = tmux.send_command(&reset_cmd).await;
-                    debug!(pane = %pane_id, "pane border format reset");
-                }
-
-                // Add highlight to newly active panes
                 let to_add: Vec<String> = wanted.difference(current).cloned().collect();
-                for pane_id in &to_add {
-                    let set_cmd = format!(
-                        "set-option -p -t {} pane-border-format \" #{{?pane_active,#[fg=yellow#,bold]● #P: #{{pane_current_command}} #{{pane_current_path}},#[fg=yellow]● #P: #{{pane_current_command}}}} \"",
-                        pane_id
-                    );
-                    let _ = tmux.send_command(&set_cmd).await;
-                    debug!(pane = %pane_id, "pane border format set to AI active");
+
+                if !to_remove.is_empty() || !to_add.is_empty() {
+                    let mut parts: Vec<String> = Vec::new();
+                    for pane_id in &to_remove {
+                        parts.push(format!(
+                            "set-option -p -t {} -u pane-border-format",
+                            pane_id
+                        ));
+                        debug!(pane = %pane_id, "pane border format reset");
+                    }
+                    for pane_id in &to_add {
+                        parts.push(format!(
+                            "set-option -p -t {} pane-border-format \" #{{?pane_active,#[fg=yellow#,bold]● #P: #{{pane_current_command}} #{{pane_current_path}},#[fg=yellow]● #P: #{{pane_current_command}}}} \"",
+                            pane_id
+                        ));
+                        debug!(pane = %pane_id, "pane border format set to AI active");
+                    }
+                    let batch = parts.join(" ; ");
+                    let _ = tmux.send_command(&batch).await;
                 }
 
                 model.highlighted_panes = wanted;

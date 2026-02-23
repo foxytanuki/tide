@@ -14,6 +14,7 @@ use std::os::unix::process::CommandExt;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use crossterm::cursor::{Hide as CursorHide, Show as CursorShow};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
 };
@@ -66,7 +67,12 @@ fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            CursorShow,
+            LeaveAlternateScreen
+        );
         original_hook(info);
     }));
 }
@@ -77,7 +83,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(stdout, DisableMouseCapture, CursorShow, LeaveAlternateScreen);
     }
 }
 
@@ -105,7 +111,7 @@ async fn main() -> Result<()> {
     let _guard = TerminalGuard;
 
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, CursorHide)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -223,6 +229,10 @@ async fn main() -> Result<()> {
         }
 
         tokio::select! {
+            // Prioritise user input over background tasks so keystrokes
+            // are never starved by AI poll or tmux event processing.
+            biased;
+
             maybe_ui = ui_rx.recv() => {
                 let Some(evt) = maybe_ui else {
                     warn!("ui channel closed");
