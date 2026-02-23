@@ -54,6 +54,11 @@ pub struct Model {
     /// Window IDs where AI recently finished, with completion timestamp.
     /// Used to show fading badge: ○ (new moon) → disappear after timeout.
     pub recently_finished_ai: HashMap<String, Instant>,
+    /// Saved "without sidebar" window layouts for pane width restoration.
+    /// Maps window_id → (terminal_width_at_save, layout_string).
+    /// Used to restore exact pane dimensions after sidebar join/leave cycles,
+    /// preventing integer-rounding drift on rightmost panes.
+    pub pane_layouts: HashMap<String, (u16, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +123,7 @@ impl Model {
             terminal_size: (80, 24),
             close_restore_attempted: false,
             recently_finished_ai: HashMap::new(),
+            pane_layouts: HashMap::new(),
         }
     }
 
