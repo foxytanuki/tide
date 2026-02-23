@@ -49,56 +49,6 @@ impl TmuxApi for TmuxControl {
     }
 }
 
-/// Query a window's layout string (e.g. "ab12,200x50,0,0{...}").
-/// Returns None on error or empty output.
-async fn query_window_layout<T: TmuxApi>(tmux: &mut T, window_id: &str) -> Option<String> {
-    match tmux
-        .send_command(&format!(
-            "display-message -t {} -p '#{{window_layout}}'",
-            window_id
-        ))
-        .await
-    {
-        Ok(output) => {
-            let layout = output.trim().to_string();
-            if layout.is_empty() {
-                None
-            } else {
-                Some(layout)
-            }
-        }
-        Err(_) => None,
-    }
-}
-
-/// Save a window's current layout (for later restoration after sidebar leaves).
-/// Stores the layout paired with the current terminal width so we can skip
-/// restoration if the terminal has been resized in the meantime.
-async fn save_window_layout<T: TmuxApi>(
-    model: &mut Model,
-    tmux: &mut T,
-    window_id: &str,
-) {
-    if let Some(layout) = query_window_layout(tmux, window_id).await {
-        let (term_w, _) = model.terminal_size;
-        model.pane_layouts.insert(window_id.to_string(), (term_w, layout));
-    }
-}
-
-/// Build a `select-layout` suffix for the window the sidebar is leaving.
-/// Returns an empty string if no saved layout exists or terminal was resized.
-fn restore_layout_suffix(model: &mut Model, leaving_window: &str) -> String {
-    if let Some((saved_w, layout)) = model.pane_layouts.get(leaving_window) {
-        let (term_w, _) = model.terminal_size;
-        if *saved_w == term_w {
-            return format!(" ; select-layout -t {} {}", leaving_window, layout);
-        }
-        // Terminal was resized — saved layout dimensions are stale
-        model.pane_layouts.remove(leaving_window);
-    }
-    String::new()
-}
-
 pub async fn execute_commands<T: TmuxApi>(
     model: &mut Model,
     tmux: &mut T,
@@ -158,22 +108,14 @@ pub async fn execute_commands<T: TmuxApi>(
                     target_home.clone()
                 };
 
-                // Save target window's layout before sidebar joins (for future restoration).
-                save_window_layout(model, tmux, &target_window_id).await;
-                let leaving_window = model.sidebar_window_id.clone();
-
                 // Action phase: batch all visual tmux operations into a single
                 // command so tmux processes them in one server tick (no flicker).
                 // -l 30 sets sidebar width at join time to avoid intermediate resize.
-                // Append select-layout for the window we're leaving to restore exact
-                // pane dimensions and prevent integer-rounding drift.
-                let restore = restore_layout_suffix(model, &leaving_window);
                 let batch = format!(
-                    "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}{}",
+                    "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
                     model.sidebar_pane_id, join_target,
                     target_window_id,
                     model.sidebar_pane_id,
-                    restore,
                 );
 
                 if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
@@ -182,12 +124,6 @@ pub async fn execute_commands<T: TmuxApi>(
                     model.error_message = Some(format!("preview: {err}"));
                     queue.push_front(Cmd::Render);
                     continue;
-                }
-
-                // Save the leaving window's layout on first departure (sidebar just left,
-                // panes expanded — this becomes the baseline for future restorations).
-                if !model.pane_layouts.contains_key(&leaving_window) {
-                    save_window_layout(model, tmux, &leaving_window).await;
                 }
 
                 // Resolve home pane if needed (query after move)
@@ -232,31 +168,22 @@ pub async fn execute_commands<T: TmuxApi>(
                     // Suppress session-window-changed events from join-pane + select-window
                     model.ignore_window_changes = 2;
                     model.pending_internal_focus_window = Some(orig_window.clone());
-
-                    // Save orig_window's layout before sidebar re-joins it
-                    save_window_layout(model, tmux, &orig_window).await;
-                    let leaving_window = model.sidebar_window_id.clone();
-                    let restore = restore_layout_suffix(model, &leaving_window);
-
-                    // Batch: join sidebar back + switch + focus + restore leaving window layout
+                    // Batch: join sidebar back + switch + focus
                     let batch = format!(
-                        "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}{}",
+                        "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
                         model.sidebar_pane_id, orig_home,
                         orig_window,
                         model.sidebar_pane_id,
-                        restore,
                     );
 
                     let restored = if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
                         warn!(%err, "restore batch failed, trying fallback");
                         // Fallback: join to window instead of home pane
-                        let restore_fb = restore_layout_suffix(model, &leaving_window);
                         let fallback = format!(
-                            "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}{}",
+                            "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
                             model.sidebar_pane_id, orig_window,
                             orig_window,
                             model.sidebar_pane_id,
-                            restore_fb,
                         );
                         if let Err(err) = send_batch_with_reconcile(model, tmux, &fallback).await {
                             warn!(%err, "restore fallback batch also failed");
@@ -449,7 +376,6 @@ pub async fn execute_commands<T: TmuxApi>(
                     model.error_message = Some(format!("kill-window: {err}"));
                     queue.push_front(Cmd::Render);
                 } else {
-                    model.pane_layouts.remove(&id);
                     // Proactively refresh — don't rely solely on %window-close notification
                     queue.push_front(Cmd::ListWindows);
                 }
@@ -477,15 +403,10 @@ pub async fn execute_commands<T: TmuxApi>(
                     target_home.clone()
                 };
 
-                // Save target window's layout before sidebar joins
-                save_window_layout(model, tmux, &target_window_id).await;
-                let leaving_window = model.sidebar_window_id.clone();
-
-                // Action phase: batch join + restore leaving window layout
-                let restore = restore_layout_suffix(model, &leaving_window);
+                // Action phase: batch join
                 let batch = format!(
-                    "join-pane -dfhb -l 30 -s {} -t {}{}",
-                    model.sidebar_pane_id, join_target, restore,
+                    "join-pane -dfhb -l 30 -s {} -t {}",
+                    model.sidebar_pane_id, join_target,
                 );
 
                 if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
@@ -494,11 +415,6 @@ pub async fn execute_commands<T: TmuxApi>(
                     model.error_message = Some(format!("follow: {err}"));
                     queue.push_front(Cmd::Render);
                     continue;
-                }
-
-                // Save leaving window's layout on first departure
-                if !model.pane_layouts.contains_key(&leaving_window) {
-                    save_window_layout(model, tmux, &leaving_window).await;
                 }
 
                 // Resolve home pane
