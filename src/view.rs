@@ -109,7 +109,11 @@ fn render_tree_item(
             }
             (FlatNodeKind::Window, TreeNode::Window { info }) => {
                 let branch = window_branch(model.tree(), &item.path);
-                if info.id == model.sidebar_window_id {
+                let active_id = model
+                    .pending_preview_id
+                    .as_deref()
+                    .unwrap_or(&model.sidebar_window_id);
+                if info.id == active_id {
                     content = format!("{}{} * {}", indent, branch, info.name);
                     style = style.fg(Color::Yellow);
                 } else {

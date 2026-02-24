@@ -277,6 +277,7 @@ pub async fn execute_commands<T: TmuxApi>(
                 );
 
                 model.sidebar_window_id = target_window_id;
+                model.pending_preview_id = None;
                 model.preview = PreviewState::Previewing {
                     original_window_id: orig_window,
                     original_home_pane_id: orig_home,

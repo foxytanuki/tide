@@ -57,6 +57,10 @@ pub struct Model {
     /// Saved "without sidebar" window layouts for pane width restoration.
     /// Maps window_id → (terminal_width_at_save, layout_string).
     pub pane_layouts: HashMap<String, (u16, String)>,
+    /// Window ID that the debounced preview will switch to.
+    /// Set on cursor movement, cleared when preview actually executes.
+    /// Used by view to show the active marker on the correct window during debounce.
+    pub pending_preview_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +126,7 @@ impl Model {
             close_restore_attempted: false,
             recently_finished_ai: HashMap::new(),
             pane_layouts: HashMap::new(),
+            pending_preview_id: None,
         }
     }
 

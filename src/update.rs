@@ -343,15 +343,13 @@ fn handle_cursor_down(model: &mut Model) -> Vec<Cmd> {
 }
 
 /// Preview: if cursor is on a window, swap its pane into the right slot.
-fn preview_current_item(model: &Model) -> Vec<Cmd> {
-    if let Some(info) = model.selected_window_info() {
-        vec![
-            Cmd::PreviewWindow {
-                id: info.id.clone(),
-            },
-            Cmd::Render,
-        ]
+fn preview_current_item(model: &mut Model) -> Vec<Cmd> {
+    let window_id = model.selected_window_info().map(|info| info.id.clone());
+    if let Some(id) = window_id {
+        model.pending_preview_id = Some(id.clone());
+        vec![Cmd::PreviewWindow { id }, Cmd::Render]
     } else {
+        model.pending_preview_id = None;
         vec![Cmd::Render]
     }
 }
