@@ -49,6 +49,60 @@ impl TmuxApi for TmuxControl {
     }
 }
 
+/// Query a window's layout string (e.g. "ab12,200x50,0,0{...}").
+/// Returns None on error or empty output.
+async fn query_window_layout<T: TmuxApi>(tmux: &mut T, window_id: &str) -> Option<String> {
+    match tmux
+        .send_command(&format!(
+            "display-message -t {} -p '#{{window_layout}}'",
+            window_id
+        ))
+        .await
+    {
+        Ok(output) => {
+            let layout = output.trim().to_string();
+            if layout.is_empty() {
+                None
+            } else {
+                Some(layout)
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+/// Save a window's current layout paired with terminal width.
+async fn save_window_layout<T: TmuxApi>(model: &mut Model, tmux: &mut T, window_id: &str) {
+    if let Some(layout) = query_window_layout(tmux, window_id).await {
+        let (term_w, _) = model.terminal_size;
+        model
+            .pane_layouts
+            .insert(window_id.to_string(), (term_w, layout));
+    }
+}
+
+/// Restore a window's saved layout (fire-and-forget, errors are logged).
+/// Skips restoration if the terminal width changed since save.
+async fn restore_window_layout<T: TmuxApi>(model: &mut Model, tmux: &mut T, window_id: &str) {
+    let layout = match model.pane_layouts.get(window_id) {
+        Some((saved_w, layout)) => {
+            let (term_w, _) = model.terminal_size;
+            if *saved_w != term_w {
+                model.pane_layouts.remove(window_id);
+                return;
+            }
+            layout.clone()
+        }
+        None => return,
+    };
+    if let Err(err) = tmux
+        .send_command(&format!("select-layout -t {} {}", window_id, layout))
+        .await
+    {
+        warn!(%err, window = %window_id, "restore window layout failed (ignored)");
+    }
+}
+
 pub async fn execute_commands<T: TmuxApi>(
     model: &mut Model,
     tmux: &mut T,
@@ -108,6 +162,10 @@ pub async fn execute_commands<T: TmuxApi>(
                     target_home.clone()
                 };
 
+                // Save target window's layout before sidebar joins (for future restoration).
+                save_window_layout(model, tmux, &target_window_id).await;
+                let leaving_window = model.sidebar_window_id.clone();
+
                 // Action phase: batch all visual tmux operations into a single
                 // command so tmux processes them in one server tick (no flicker).
                 // -l 30 sets sidebar width at join time to avoid intermediate resize.
@@ -124,6 +182,14 @@ pub async fn execute_commands<T: TmuxApi>(
                     model.error_message = Some(format!("preview: {err}"));
                     queue.push_front(Cmd::Render);
                     continue;
+                }
+
+                // Restore leaving window's pane layout (fire-and-forget).
+                // On first departure, save the expanded layout as baseline instead.
+                if model.pane_layouts.contains_key(&leaving_window) {
+                    restore_window_layout(model, tmux, &leaving_window).await;
+                } else {
+                    save_window_layout(model, tmux, &leaving_window).await;
                 }
 
                 // Resolve home pane if needed (query after move)
@@ -168,6 +234,11 @@ pub async fn execute_commands<T: TmuxApi>(
                     // Suppress session-window-changed events from join-pane + select-window
                     model.ignore_window_changes = 2;
                     model.pending_internal_focus_window = Some(orig_window.clone());
+
+                    // Save orig_window's layout before sidebar re-joins it
+                    save_window_layout(model, tmux, &orig_window).await;
+                    let leaving_window = model.sidebar_window_id.clone();
+
                     // Batch: join sidebar back + switch + focus
                     let batch = format!(
                         "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
@@ -194,6 +265,11 @@ pub async fn execute_commands<T: TmuxApi>(
                     } else {
                         true
                     };
+
+                    // Restore leaving window's layout after batch (fire-and-forget)
+                    if restored {
+                        restore_window_layout(model, tmux, &leaving_window).await;
+                    }
 
                     if restored {
                         model.sidebar_window_id = orig_window;
@@ -376,6 +452,7 @@ pub async fn execute_commands<T: TmuxApi>(
                     model.error_message = Some(format!("kill-window: {err}"));
                     queue.push_front(Cmd::Render);
                 } else {
+                    model.pane_layouts.remove(&id);
                     // Proactively refresh — don't rely solely on %window-close notification
                     queue.push_front(Cmd::ListWindows);
                 }
@@ -403,6 +480,10 @@ pub async fn execute_commands<T: TmuxApi>(
                     target_home.clone()
                 };
 
+                // Save target window's layout before sidebar joins
+                save_window_layout(model, tmux, &target_window_id).await;
+                let leaving_window = model.sidebar_window_id.clone();
+
                 // Action phase: batch join
                 let batch = format!(
                     "join-pane -dfhb -l 30 -s {} -t {}",
@@ -415,6 +496,13 @@ pub async fn execute_commands<T: TmuxApi>(
                     model.error_message = Some(format!("follow: {err}"));
                     queue.push_front(Cmd::Render);
                     continue;
+                }
+
+                // Restore leaving window's layout (or save baseline on first departure)
+                if model.pane_layouts.contains_key(&leaving_window) {
+                    restore_window_layout(model, tmux, &leaving_window).await;
+                } else {
+                    save_window_layout(model, tmux, &leaving_window).await;
                 }
 
                 // Resolve home pane
