@@ -3,7 +3,15 @@ use std::env;
 use anyhow::Result;
 use tokio::process::Command;
 
-pub const TIDE_SESSION_NAME: &str = "tide";
+pub const DEFAULT_SESSION_NAME: &str = "tide";
+
+/// Determine the target session name from CLI arg, falling back to default.
+pub fn target_session_name() -> String {
+    match env::args().nth(1) {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => DEFAULT_SESSION_NAME.to_string(),
+    }
+}
 
 fn exact_session_window_target(session: &str) -> String {
     format!("={session}:")
@@ -20,24 +28,25 @@ pub async fn launch_if_needed() -> Result<()> {
         return Ok(());
     }
 
+    let session = target_session_name();
     let inner_cmd = build_sidebar_inner_cmd();
 
     if env::var("TMUX").is_ok() {
         let current_session = detect_session_name().await;
-        ensure_session_exists(TIDE_SESSION_NAME)?;
+        ensure_session_exists(&session)?;
 
-        if current_session != TIDE_SESSION_NAME {
-            split_sidebar_in_session(TIDE_SESSION_NAME, &inner_cmd, true)?;
-            switch_client_to_session(TIDE_SESSION_NAME)?;
+        if current_session != session {
+            split_sidebar_in_session(&session, &inner_cmd, true)?;
+            switch_client_to_session(&session)?;
             std::process::exit(0);
         }
 
-        split_sidebar_in_session(TIDE_SESSION_NAME, &inner_cmd, false)?;
+        split_sidebar_in_session(&session, &inner_cmd, false)?;
         std::process::exit(0);
     } else {
-        ensure_session_exists(TIDE_SESSION_NAME)?;
-        split_sidebar_in_session(TIDE_SESSION_NAME, &inner_cmd, true)?;
-        attach_to_session(TIDE_SESSION_NAME)?;
+        ensure_session_exists(&session)?;
+        split_sidebar_in_session(&session, &inner_cmd, true)?;
+        attach_to_session(&session)?;
         std::process::exit(0);
     }
 }

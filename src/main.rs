@@ -93,17 +93,7 @@ async fn main() -> Result<()> {
 
     init_logging();
 
-    let session_name = match env::args().nth(1) {
-        Some(s) if !s.trim().is_empty() => s,
-        _ => launcher::detect_session_name().await,
-    };
-    if session_name != launcher::TIDE_SESSION_NAME {
-        anyhow::bail!(
-            "tide only supports '{}' session (got '{}')",
-            launcher::TIDE_SESSION_NAME,
-            session_name
-        );
-    }
+    let session_name = launcher::target_session_name();
     info!(session = %session_name, "starting tide");
 
     install_panic_hook();
@@ -222,6 +212,10 @@ async fn main() -> Result<()> {
     let mut ai_poll_interval = tokio::time::interval(Duration::from_millis(500));
     ai_poll_interval.reset(); // skip immediate first tick (we already polled above)
 
+    let mut pending_preview: Option<String> = None;
+    let preview_sleep = tokio::time::sleep(Duration::from_secs(86400));
+    tokio::pin!(preview_sleep);
+
     loop {
         if model.should_quit {
             debug!("should_quit is true, exiting");
@@ -239,31 +233,40 @@ async fn main() -> Result<()> {
                     break;
                 };
 
-                let cmds = match evt {
-                    Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                        update(&mut model, Msg::Key(key))
-                    }
-                    Event::Resize(w, h) => {
-                        model.terminal_size = (w, h);
-                        vec![Cmd::EnsureSidebarWidth, Cmd::Render]
-                    }
-                    Event::Mouse(mouse) => match mouse.kind {
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            update(&mut model, Msg::MouseClick { row: mouse.row })
-                        }
-                        MouseEventKind::ScrollUp => {
-                            update(&mut model, Msg::MouseScrollUp)
-                        }
-                        MouseEventKind::ScrollDown => {
-                            update(&mut model, Msg::MouseScrollDown)
-                        }
-                        _ => Vec::new(),
-                    }
-                    _ => Vec::new(),
-                };
+                let mut cmds = process_ui_event(&mut model, evt);
+
+                // Drain all pending UI events to batch rapid input (key repeat)
+                while let Ok(evt) = ui_rx.try_recv() {
+                    cmds.extend(process_ui_event(&mut model, evt));
+                }
+
+                // Coalesce: keep only the last PreviewWindow, deduplicate Renders
+                let mut cmds = coalesce_commands(cmds);
+
+                // Defer preview with debounce — sidebar renders immediately
+                // but the expensive tmux pane-swap waits until input settles.
+                if let Some(id) = extract_deferred_preview(&mut cmds) {
+                    pending_preview = Some(id);
+                    preview_sleep.as_mut().reset(
+                        tokio::time::Instant::now() + Duration::from_millis(50),
+                    );
+                } else if !cmds.is_empty() {
+                    // Non-cursor action cancels any pending deferred preview
+                    pending_preview = None;
+                }
 
                 if !cmds.is_empty() && !execute_commands(&mut model, &mut tmux, &mut terminal, cmds).await {
                     break;
+                }
+            }
+
+            // Debounced preview: fires after cursor movement settles
+            () = &mut preview_sleep, if pending_preview.is_some() => {
+                if let Some(id) = pending_preview.take() {
+                    let cmds = vec![Cmd::PreviewWindow { id }];
+                    if !execute_commands(&mut model, &mut tmux, &mut terminal, cmds).await {
+                        break;
+                    }
                 }
             }
 
@@ -417,4 +420,84 @@ fn spawn_input_thread(tx: mpsc::UnboundedSender<Event>) {
             }
         }
     });
+}
+
+/// Process a single UI event into commands.
+fn process_ui_event(model: &mut Model, evt: Event) -> Vec<Cmd> {
+    match evt {
+        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            update(model, Msg::Key(key))
+        }
+        Event::Resize(w, h) => {
+            model.terminal_size = (w, h);
+            vec![Cmd::EnsureSidebarWidth, Cmd::Render]
+        }
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                update(model, Msg::MouseClick { row: mouse.row })
+            }
+            MouseEventKind::ScrollUp => update(model, Msg::MouseScrollUp),
+            MouseEventKind::ScrollDown => update(model, Msg::MouseScrollDown),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Coalesce commands from batched UI events:
+/// keep only the last PreviewWindow and collapse multiple Renders into one.
+fn coalesce_commands(cmds: Vec<Cmd>) -> Vec<Cmd> {
+    if cmds.len() <= 2 {
+        return cmds;
+    }
+
+    let last_preview_idx = cmds
+        .iter()
+        .rposition(|c| matches!(c, Cmd::PreviewWindow { .. }));
+
+    let mut result = Vec::new();
+    let mut has_render = false;
+
+    for (i, cmd) in cmds.into_iter().enumerate() {
+        match &cmd {
+            Cmd::PreviewWindow { .. } => {
+                if Some(i) == last_preview_idx {
+                    result.push(cmd);
+                }
+            }
+            Cmd::Render => {
+                has_render = true;
+            }
+            _ => {
+                result.push(cmd);
+            }
+        }
+    }
+
+    if has_render {
+        result.push(Cmd::Render);
+    }
+
+    result
+}
+
+/// Extract PreviewWindow for deferred execution if the command list is a
+/// pure cursor movement (only PreviewWindow + Render). Returns the window ID.
+fn extract_deferred_preview(cmds: &mut Vec<Cmd>) -> Option<String> {
+    let dominated_by_cursor = cmds
+        .iter()
+        .all(|c| matches!(c, Cmd::PreviewWindow { .. } | Cmd::Render));
+    if !dominated_by_cursor {
+        return None;
+    }
+
+    if let Some(idx) = cmds
+        .iter()
+        .rposition(|c| matches!(c, Cmd::PreviewWindow { .. }))
+    {
+        if let Cmd::PreviewWindow { id } = cmds.remove(idx) {
+            return Some(id);
+        }
+    }
+    None
 }
