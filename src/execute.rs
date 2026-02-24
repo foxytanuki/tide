@@ -103,6 +103,64 @@ async fn restore_window_layout<T: TmuxApi>(model: &mut Model, tmux: &mut T, wind
     }
 }
 
+/// Query widths of all non-sidebar panes in a window.
+/// Returns Vec<(pane_id, width)> ordered as tmux lists them (left-to-right / top-to-bottom).
+async fn query_pane_widths<T: TmuxApi>(
+    tmux: &mut T,
+    window_id: &str,
+    sidebar_pane_id: &str,
+) -> Vec<(String, u16)> {
+    let output = tmux
+        .send_command(&format!(
+            "list-panes -t {} -F '#{{pane_id}}\t#{{pane_width}}'",
+            window_id
+        ))
+        .await
+        .unwrap_or_default();
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let pane_id = parts.next()?.trim();
+            let width: u16 = parts.next()?.trim().parse().ok()?;
+            if pane_id == sidebar_pane_id {
+                None
+            } else {
+                Some((pane_id.to_string(), width))
+            }
+        })
+        .collect()
+}
+
+/// After sidebar has left a window, resize non-sidebar panes proportionally
+/// to fill the freed space (sidebar_width + 1 separator = 31 cols).
+/// This preserves pane width ratios without relying on layout string save/restore.
+async fn restore_pane_widths_proportional<T: TmuxApi>(
+    tmux: &mut T,
+    pane_widths: &[(String, u16)],
+) {
+    if pane_widths.len() < 2 {
+        return; // single pane auto-fills, nothing to do
+    }
+    let total: u32 = pane_widths.iter().map(|(_, w)| *w as u32).sum();
+    if total == 0 {
+        return;
+    }
+    // sidebar (30 cols) + 1 separator = 31 cols freed
+    let target_total = total + 31;
+
+    // Resize all panes except the last (last auto-fills remaining space).
+    for (pane_id, width) in pane_widths.iter().rev().skip(1).rev() {
+        let new_width = (*width as u32 * target_total + total / 2) / total;
+        if let Err(err) = tmux
+            .send_command(&format!("resize-pane -t {} -x {}", pane_id, new_width))
+            .await
+        {
+            debug!(%err, pane = %pane_id, "proportional resize failed (ignored)");
+        }
+    }
+}
+
 pub async fn execute_commands<T: TmuxApi>(
     model: &mut Model,
     tmux: &mut T,
@@ -166,6 +224,12 @@ pub async fn execute_commands<T: TmuxApi>(
                 save_window_layout(model, tmux, &target_window_id).await;
                 let leaving_window = model.sidebar_window_id.clone();
 
+                // Capture leaving window's pane widths BEFORE sidebar moves,
+                // so we can restore proportions after sidebar departs.
+                let leaving_pane_widths = query_pane_widths(
+                    tmux, &leaving_window, &model.sidebar_pane_id,
+                ).await;
+
                 // Action phase: batch all visual tmux operations into a single
                 // command so tmux processes them in one server tick (no flicker).
                 // -l 30 sets sidebar width at join time to avoid intermediate resize.
@@ -184,12 +248,13 @@ pub async fn execute_commands<T: TmuxApi>(
                     continue;
                 }
 
-                // Restore leaving window's pane layout (fire-and-forget).
-                // On first departure, save the expanded layout as baseline instead.
+                // Restore leaving window's pane layout.
+                // Prefer saved layout string (exact), fall back to proportional
+                // width scaling (handles initial window that was never a target).
                 if model.pane_layouts.contains_key(&leaving_window) {
                     restore_window_layout(model, tmux, &leaving_window).await;
                 } else {
-                    save_window_layout(model, tmux, &leaving_window).await;
+                    restore_pane_widths_proportional(tmux, &leaving_pane_widths).await;
                 }
 
                 // Resolve home pane if needed (query after move)
@@ -239,6 +304,11 @@ pub async fn execute_commands<T: TmuxApi>(
                     save_window_layout(model, tmux, &orig_window).await;
                     let leaving_window = model.sidebar_window_id.clone();
 
+                    // Capture leaving window's pane widths before sidebar moves
+                    let leaving_pane_widths = query_pane_widths(
+                        tmux, &leaving_window, &model.sidebar_pane_id,
+                    ).await;
+
                     // Batch: join sidebar back + switch + focus
                     let batch = format!(
                         "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
@@ -266,9 +336,13 @@ pub async fn execute_commands<T: TmuxApi>(
                         true
                     };
 
-                    // Restore leaving window's layout after batch (fire-and-forget)
+                    // Restore leaving window's pane layout after batch
                     if restored {
-                        restore_window_layout(model, tmux, &leaving_window).await;
+                        if model.pane_layouts.contains_key(&leaving_window) {
+                            restore_window_layout(model, tmux, &leaving_window).await;
+                        } else {
+                            restore_pane_widths_proportional(tmux, &leaving_pane_widths).await;
+                        }
                     }
 
                     if restored {
@@ -484,6 +558,11 @@ pub async fn execute_commands<T: TmuxApi>(
                 save_window_layout(model, tmux, &target_window_id).await;
                 let leaving_window = model.sidebar_window_id.clone();
 
+                // Capture leaving window's pane widths before sidebar moves
+                let leaving_pane_widths = query_pane_widths(
+                    tmux, &leaving_window, &model.sidebar_pane_id,
+                ).await;
+
                 // Action phase: batch join
                 let batch = format!(
                     "join-pane -dfhb -l 30 -s {} -t {}",
@@ -498,11 +577,11 @@ pub async fn execute_commands<T: TmuxApi>(
                     continue;
                 }
 
-                // Restore leaving window's layout (or save baseline on first departure)
+                // Restore leaving window's pane layout
                 if model.pane_layouts.contains_key(&leaving_window) {
                     restore_window_layout(model, tmux, &leaving_window).await;
                 } else {
-                    save_window_layout(model, tmux, &leaving_window).await;
+                    restore_pane_widths_proportional(tmux, &leaving_pane_widths).await;
                 }
 
                 // Resolve home pane
