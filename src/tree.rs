@@ -42,7 +42,7 @@ pub fn build_tree(windows: &[WindowInfo]) -> Vec<TreeNode> {
     let mut folder_positions: HashMap<String, usize> = HashMap::new();
 
     for window in windows {
-        if let Some((folder_name, child_name)) = split_folder_name(&window.name) {
+        if let Some((folder_name, remainder)) = split_folder_name(&window.name) {
             let folder_index = if let Some(&idx) = folder_positions.get(folder_name) {
                 idx
             } else {
@@ -56,11 +56,37 @@ pub fn build_tree(windows: &[WindowInfo]) -> Vec<TreeNode> {
                 idx
             };
 
-            let mut child_info = window.clone();
-            child_info.name = child_name.to_string();
-
             if let Some(TreeNode::Folder { children, .. }) = roots.get_mut(folder_index) {
-                children.push(TreeNode::Window { info: child_info });
+                // Check for second-level folder: folder:subfolder:tab
+                if let Some((subfolder_name, leaf_name)) = split_folder_name(remainder) {
+                    let sub_key = format!("{}:{}", folder_name, subfolder_name);
+                    let sub_index =
+                        if let Some(&idx) = folder_positions.get(&sub_key) {
+                            idx
+                        } else {
+                            let idx = children.len();
+                            children.push(TreeNode::Folder {
+                                name: subfolder_name.to_string(),
+                                children: Vec::new(),
+                                expanded: true,
+                            });
+                            folder_positions.insert(sub_key, idx);
+                            idx
+                        };
+                    if let Some(TreeNode::Folder {
+                        children: sub_children,
+                        ..
+                    }) = children.get_mut(sub_index)
+                    {
+                        let mut child_info = window.clone();
+                        child_info.name = leaf_name.to_string();
+                        sub_children.push(TreeNode::Window { info: child_info });
+                    }
+                } else {
+                    let mut child_info = window.clone();
+                    child_info.name = remainder.to_string();
+                    children.push(TreeNode::Window { info: child_info });
+                }
             }
         } else {
             roots.push(TreeNode::Window {
@@ -433,6 +459,120 @@ mod tests {
             true
         );
         assert!(!expand_to_window_by_id(tree.as_mut_slice(), "@missing"));
+    }
+
+    #[test]
+    fn build_tree_two_level_nesting() {
+        let windows = vec![
+            w("@1", 1, "proj:sub:edit"),
+            w("@2", 2, "proj:sub:term"),
+            w("@3", 3, "proj:main"),
+            w("@4", 4, "solo"),
+        ];
+
+        let tree = build_tree(&windows);
+        assert_eq!(tree.len(), 2); // folder "proj" + window "solo"
+
+        match &tree[0] {
+            TreeNode::Folder {
+                name, children, ..
+            } => {
+                assert_eq!(name, "proj");
+                assert_eq!(children.len(), 2); // subfolder "sub" + window "main"
+
+                match &children[0] {
+                    TreeNode::Folder {
+                        name,
+                        children: sub_children,
+                        ..
+                    } => {
+                        assert_eq!(name, "sub");
+                        assert_eq!(sub_children.len(), 2);
+                        assert_eq!(window_name(&sub_children[0]), "edit");
+                        assert_eq!(window_name(&sub_children[1]), "term");
+                    }
+                    _ => panic!("expected subfolder"),
+                }
+
+                assert_eq!(window_name(&children[1]), "main");
+            }
+            _ => panic!("expected folder"),
+        }
+
+        assert_eq!(window_name(&tree[1]), "solo");
+    }
+
+    #[test]
+    fn flatten_two_level_nesting() {
+        let tree = build_tree(&[
+            w("@1", 1, "proj:sub:edit"),
+            w("@2", 2, "proj:sub:term"),
+            w("@3", 3, "proj:main"),
+            w("@4", 4, "solo"),
+        ]);
+
+        let flat = flatten(&tree);
+        // proj(0) > sub(1) > edit(2), term(3), main(4), solo(5)
+        // but proj and sub are expanded folders so depth 0,1,2,2,1,0
+        assert_eq!(flat.len(), 6);
+        assert_eq!(flat[0].depth, 0);
+        assert_eq!(flat[0].kind, FlatNodeKind::Folder); // proj
+        assert_eq!(flat[1].depth, 1);
+        assert_eq!(flat[1].kind, FlatNodeKind::Folder); // sub
+        assert_eq!(flat[2].depth, 2);
+        assert_eq!(flat[2].kind, FlatNodeKind::Window); // edit
+        assert_eq!(flat[3].depth, 2);
+        assert_eq!(flat[3].kind, FlatNodeKind::Window); // term
+        assert_eq!(flat[4].depth, 1);
+        assert_eq!(flat[4].kind, FlatNodeKind::Window); // main
+        assert_eq!(flat[5].depth, 0);
+        assert_eq!(flat[5].kind, FlatNodeKind::Window); // solo
+    }
+
+    #[test]
+    fn find_window_in_nested_folder() {
+        let tree = build_tree(&[
+            w("@1", 1, "proj:sub:edit"),
+            w("@2", 2, "solo"),
+        ]);
+        let flat = flatten(&tree);
+
+        assert_eq!(find_window_flat_index_by_id(&flat, &tree, "@1"), Some(2));
+    }
+
+    #[test]
+    fn expand_to_window_in_nested_folder() {
+        let mut tree = build_tree(&[
+            w("@1", 1, "proj:sub:edit"),
+            w("@2", 2, "solo"),
+        ]);
+
+        // Collapse both levels
+        if let TreeNode::Folder {
+            expanded, children, ..
+        } = &mut tree[0]
+        {
+            *expanded = false;
+            if let TreeNode::Folder { expanded, .. } = &mut children[0] {
+                *expanded = false;
+            }
+        }
+
+        assert!(expand_to_window_by_id(tree.as_mut_slice(), "@1"));
+
+        // Both levels should be expanded now
+        match &tree[0] {
+            TreeNode::Folder {
+                expanded, children, ..
+            } => {
+                assert!(*expanded);
+                match &children[0] {
+                    TreeNode::Folder { expanded, .. } => assert!(*expanded),
+                    _ => panic!("expected subfolder"),
+                }
+            }
+            _ => panic!("expected folder"),
+        }
     }
 
     fn window_name(node: &TreeNode) -> &str {

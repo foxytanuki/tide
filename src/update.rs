@@ -483,23 +483,7 @@ fn handle_rename_window(model: &mut Model) -> Vec<Cmd> {
                 Some(info) => info.clone(),
                 None => return vec![],
             };
-            // Reconstruct full tmux name (folder:child) if inside a folder
-            let full_name =
-                if let Some(parent_idx) = find_parent_folder(model.flat_items(), model.cursor()) {
-                    if let Some(parent_item) = model.flat_items().get(parent_idx) {
-                        if let Ok(TreeNode::Folder { name, .. }) =
-                            get_node(model.tree(), &parent_item.path)
-                        {
-                            format!("{}:{}", name, info.name)
-                        } else {
-                            info.name.clone()
-                        }
-                    } else {
-                        info.name.clone()
-                    }
-                } else {
-                    info.name.clone()
-                };
+            let full_name = reconstruct_full_name(model, model.cursor(), &info.name);
             set_input(model, full_name);
             model.mode = Mode::Renaming {
                 window_id: info.id.clone(),
@@ -507,18 +491,48 @@ fn handle_rename_window(model: &mut Model) -> Vec<Cmd> {
             vec![Cmd::Render]
         }
         FlatNodeKind::Folder => {
-            let folder_name = if let Ok(TreeNode::Folder { name, .. }) =
-                get_node(model.tree(), &item.path)
-            {
-                name.clone()
-            } else {
+            let folder_full_name = reconstruct_folder_full_name(model, &item.path);
+            if folder_full_name.is_empty() {
                 return vec![];
+            }
+            set_input(model, folder_full_name.clone());
+            model.mode = Mode::RenamingFolder {
+                folder_name: folder_full_name,
             };
-            set_input(model, folder_name.clone());
-            model.mode = Mode::RenamingFolder { folder_name };
             vec![Cmd::Render]
         }
     }
+}
+
+/// Reconstruct full tmux name for a window by walking up ancestor folders.
+/// e.g. if window "edit" is in subfolder "sub" in folder "proj", returns "proj:sub:edit".
+fn reconstruct_full_name(model: &Model, flat_idx: usize, leaf_name: &str) -> String {
+    let mut parts = vec![leaf_name.to_string()];
+    let mut idx = flat_idx;
+    while let Some(parent_idx) = find_parent_folder(model.flat_items(), idx) {
+        if let Some(parent_item) = model.flat_items().get(parent_idx) {
+            if let Ok(TreeNode::Folder { name, .. }) = get_node(model.tree(), &parent_item.path) {
+                parts.push(name.clone());
+            }
+        }
+        idx = parent_idx;
+    }
+    parts.reverse();
+    parts.join(":")
+}
+
+/// Reconstruct full colon-separated path for a folder node.
+/// e.g. subfolder "sub" under folder "proj" returns "proj:sub".
+fn reconstruct_folder_full_name(model: &Model, path: &[usize]) -> String {
+    let mut parts = Vec::new();
+    // Walk from root to this node, collecting folder names
+    for depth in 0..path.len() {
+        let ancestor_path = &path[..=depth];
+        if let Ok(TreeNode::Folder { name, .. }) = get_node(model.tree(), ancestor_path) {
+            parts.push(name.clone());
+        }
+    }
+    parts.join(":")
 }
 
 fn handle_close_window(model: &mut Model) -> Vec<Cmd> {
@@ -887,8 +901,9 @@ fn determine_new_window_name(model: &Model) -> String {
 
     match item.kind {
         FlatNodeKind::Folder => {
-            if let Ok(TreeNode::Folder { name, .. }) = get_node(model.tree(), &item.path) {
-                let generated = next_tab_name(&existing, Some(name));
+            let folder_full = reconstruct_folder_full_name(model, &item.path);
+            if !folder_full.is_empty() {
+                let generated = next_tab_name(&existing, Some(&folder_full));
                 debug!(
                     cursor = model.cursor(),
                     generated,
@@ -903,10 +918,10 @@ fn determine_new_window_name(model: &Model) -> String {
         FlatNodeKind::Window => {
             if let Some(parent_idx) = find_parent_folder(model.flat_items(), model.cursor()) {
                 if let Some(parent_item) = model.flat_items().get(parent_idx) {
-                    if let Ok(TreeNode::Folder { name, .. }) =
-                        get_node(model.tree(), &parent_item.path)
-                    {
-                        let generated = next_tab_name(&existing, Some(name));
+                    let parent_full =
+                        reconstruct_folder_full_name(model, &parent_item.path);
+                    if !parent_full.is_empty() {
+                        let generated = next_tab_name(&existing, Some(&parent_full));
                         debug!(
                             cursor = model.cursor(),
                             generated,
@@ -925,33 +940,87 @@ fn determine_new_window_name(model: &Model) -> String {
     }
 }
 
-/// Collect (window_id, child_name) pairs for all windows in a folder.
-fn collect_folder_children(tree: &[TreeNode], folder_name: &str) -> Vec<(String, String)> {
-    for node in tree {
-        if let TreeNode::Folder {
-            name, children, ..
-        } = node
-        {
-            if name == folder_name {
-                return children
-                    .iter()
-                    .filter_map(|child| {
-                        if let TreeNode::Window { info } = child {
-                            Some((info.id.clone(), info.name.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-            }
-        }
+/// Collect (window_id, suffix) pairs for all windows in a folder (recursively).
+/// `folder_path` is the colon-separated full path, e.g. "proj" or "proj:sub".
+/// `suffix` is the part after the folder, e.g. for folder "proj" containing
+/// subfolder "sub" with window "edit", suffix is "sub:edit".
+fn collect_folder_children(tree: &[TreeNode], folder_path: &str) -> Vec<(String, String)> {
+    if let Some(TreeNode::Folder { children, .. }) = find_folder_by_path(tree, folder_path) {
+        let mut result = Vec::new();
+        collect_folder_children_recursive(children, None, &mut result);
+        return result;
     }
     Vec::new()
 }
 
-/// Collect folder name → expanded state from the tree
+/// Navigate to a folder node by colon-separated path (e.g. "proj" or "proj:sub").
+fn find_folder_by_path<'a>(tree: &'a [TreeNode], path: &str) -> Option<&'a TreeNode> {
+    let parts: Vec<&str> = path.split(':').collect();
+    let mut nodes = tree;
+    let mut target: Option<&TreeNode> = None;
+    for part in &parts {
+        let mut found = false;
+        for node in nodes {
+            if let TreeNode::Folder {
+                name, children, ..
+            } = node
+            {
+                if name == part {
+                    target = Some(node);
+                    nodes = children;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            return None;
+        }
+    }
+    target
+}
+
+fn collect_folder_children_recursive(
+    nodes: &[TreeNode],
+    prefix: Option<&str>,
+    out: &mut Vec<(String, String)>,
+) {
+    for node in nodes {
+        match node {
+            TreeNode::Window { info } => {
+                let suffix = match prefix {
+                    Some(p) => format!("{}:{}", p, info.name),
+                    None => info.name.clone(),
+                };
+                out.push((info.id.clone(), suffix));
+            }
+            TreeNode::Folder {
+                name, children, ..
+            } => {
+                let new_prefix = match prefix {
+                    Some(p) => format!("{}:{}", p, name),
+                    None => name.clone(),
+                };
+                collect_folder_children_recursive(children, Some(&new_prefix), out);
+            }
+        }
+    }
+}
+
+/// Collect folder full-path → expanded state from the tree.
+/// Uses colon-separated paths as keys (e.g. "proj", "proj:sub") to avoid
+/// collisions between same-named subfolders under different parents.
 fn collect_folder_expanded(nodes: &[TreeNode]) -> HashMap<String, bool> {
     let mut map = HashMap::new();
+    collect_folder_expanded_inner(nodes, None, &mut map);
+    map
+}
+
+fn collect_folder_expanded_inner(
+    nodes: &[TreeNode],
+    prefix: Option<&str>,
+    map: &mut HashMap<String, bool>,
+) {
     for node in nodes {
         if let TreeNode::Folder {
             name,
@@ -959,17 +1028,26 @@ fn collect_folder_expanded(nodes: &[TreeNode]) -> HashMap<String, bool> {
             children,
         } = node
         {
-            map.insert(name.clone(), *expanded);
-            // Recurse into children for nested folders
-            let child_map = collect_folder_expanded(children);
-            map.extend(child_map);
+            let full_path = match prefix {
+                Some(p) => format!("{}:{}", p, name),
+                None => name.clone(),
+            };
+            map.insert(full_path.clone(), *expanded);
+            collect_folder_expanded_inner(children, Some(&full_path), map);
         }
     }
-    map
 }
 
 /// Restore folder expanded state after tree rebuild
 fn restore_folder_expanded(nodes: &mut [TreeNode], state: &HashMap<String, bool>) {
+    restore_folder_expanded_inner(nodes, None, state);
+}
+
+fn restore_folder_expanded_inner(
+    nodes: &mut [TreeNode],
+    prefix: Option<&str>,
+    state: &HashMap<String, bool>,
+) {
     for node in nodes {
         if let TreeNode::Folder {
             name,
@@ -977,10 +1055,14 @@ fn restore_folder_expanded(nodes: &mut [TreeNode], state: &HashMap<String, bool>
             children,
         } = node
         {
-            if let Some(&was_expanded) = state.get(name.as_str()) {
+            let full_path = match prefix {
+                Some(p) => format!("{}:{}", p, name),
+                None => name.clone(),
+            };
+            if let Some(&was_expanded) = state.get(full_path.as_str()) {
                 *expanded = was_expanded;
             }
-            restore_folder_expanded(children, state);
+            restore_folder_expanded_inner(children, Some(&full_path), state);
         }
     }
 }
