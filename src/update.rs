@@ -12,9 +12,9 @@ use crate::tree::{
 };
 use crate::view::tree_item_at;
 
-pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
-    const MISSING_PENDING_RENAME_THRESHOLD: u8 = 6;
+const MISSING_PENDING_RENAME_THRESHOLD: u8 = 6;
 
+pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
     // Clear error on any user action (exclude background events)
     if !matches!(
         msg,
@@ -46,186 +46,10 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         }
         Msg::RenameWindow => handle_rename_window(model),
         Msg::CloseWindow => handle_close_window(model),
-        Msg::WindowFocusChanged(window_id) => {
-            // Suppress only the internally expected window-focus events.
-            // If an unexpected window_id arrives while suppression is active,
-            // treat it as a real user switch instead of consuming suppression.
-            if model.ignore_window_changes > 0 {
-                let expected = model.pending_internal_focus_window.as_deref();
-                if expected == Some(window_id.as_str()) {
-                    model.ignore_window_changes -= 1;
-                    if model.ignore_window_changes == 0 {
-                        model.pending_internal_focus_window = None;
-                    }
-                    return vec![Cmd::EnsureSidebarWidth];
-                }
-            }
-
-            // Ignore events for the window the sidebar is already in.
-            if window_id == model.sidebar_window_id {
-                return vec![Cmd::EnsureSidebarWidth];
-            }
-
-            // User explicitly switched windows; clear preview state
-            model.preview = PreviewState::Home;
-            model.ignore_window_changes = 0;
-            model.pending_internal_focus_window = None;
-            vec![
-                Cmd::FollowToWindow { window_id },
-                Cmd::EnsureSidebarWidth,
-                Cmd::ListWindows,
-            ]
-        }
+        Msg::WindowFocusChanged(window_id) => handle_window_focus_changed(model, window_id),
         Msg::WindowChanged => vec![Cmd::ListWindows],
-        Msg::WindowRenamed { window_id, name } => {
-            if let Some(pending) = model.pending_renames.get_mut(&window_id) {
-                let expected_name = pending.target_name.clone();
-                if name != expected_name {
-                    debug!(
-                        id = window_id.as_str(),
-                        current = name.as_str(),
-                        expected = expected_name.as_str(),
-                        "pending rename mismatch from event, correcting immediately"
-                    );
-                    pending.observed_count = 0;
-                    model.pending_rename_last_window_id = Some(window_id.clone());
-                    return vec![Cmd::RenameWindow {
-                        id: window_id,
-                        name: expected_name,
-                    }];
-                }
-
-                pending.observed_count = pending.observed_count.saturating_add(1);
-                debug!(
-                    id = window_id.as_str(),
-                    name = name.as_str(),
-                    observed = pending.observed_count,
-                    "pending rename observed from event"
-                );
-                Vec::new()
-            } else {
-                vec![Cmd::ListWindows]
-            }
-        }
-        Msg::WindowListLoaded(windows) => {
-            // Save folder expanded state before rebuilding
-            let expanded_state = collect_folder_expanded(model.tree());
-            let mut followup_cmds = Vec::new();
-            let mut selected_window_id = model
-                .pending_rename_last_window_id
-                .as_ref()
-                .filter(|id| model.pending_renames.contains_key(*id))
-                .cloned()
-                .or_else(|| match &model.mode {
-                    Mode::Renaming { window_id } => Some(window_id.clone()),
-                    _ => model.selected_window_info().map(|info| info.id.clone()),
-                });
-
-            let selected_exists = selected_window_id
-                .as_deref()
-                .is_some_and(|id| windows.iter().any(|w| w.id == *id));
-
-            debug!(
-                pending_count = model.pending_renames.len(),
-                pending_last = model.pending_rename_last_window_id.as_deref(),
-                mode = ?model.mode,
-                selected = selected_window_id.as_deref(),
-                exists = selected_exists,
-                cursor = model.cursor(),
-                "window list loaded"
-            );
-
-            if let Some(last_id) = model.pending_rename_last_window_id.clone() {
-                let last_exists = windows.iter().any(|w| w.id == last_id);
-                if !last_exists {
-                    if let Some(pending) = model.pending_renames.get_mut(&last_id) {
-                        pending.observed_count = pending.observed_count.saturating_add(1);
-                        debug!(
-                            id = last_id.as_str(),
-                            observed = pending.observed_count,
-                            "latest pending rename target missing from window list"
-                        );
-                    }
-                    selected_window_id = None;
-                }
-            }
-
-            let mut new_tree = build_tree(&windows);
-            restore_folder_expanded(&mut new_tree, &expanded_state);
-            let selected_ref = selected_window_id.as_deref();
-            model.replace_tree_preserve_selection(new_tree, selected_ref);
-
-            let mut stale_pending_ids = Vec::new();
-            for (id, pending) in &mut model.pending_renames {
-                // Skip the last-tracked ID if it was already incremented above
-                if model.pending_rename_last_window_id.as_deref() == Some(id.as_str())
-                    && !windows.iter().any(|w| w.id == *id)
-                {
-                    // Already handled in the last_id block — skip to avoid
-                    // double-incrementing observed_count.
-                    if pending.observed_count >= MISSING_PENDING_RENAME_THRESHOLD {
-                        stale_pending_ids.push(id.clone());
-                    }
-                    continue;
-                }
-                if let Some(current) = windows.iter().find(|w| w.id == *id) {
-                    if current.name != pending.target_name {
-                        debug!(
-                            id = id,
-                            current = current.name.as_str(),
-                            expected = pending.target_name.as_str(),
-                            observed = pending.observed_count,
-                            "pending rename mismatch, correcting"
-                        );
-                        followup_cmds.push(Cmd::RenameWindow {
-                            id: id.clone(),
-                            name: pending.target_name.clone(),
-                        });
-                        pending.observed_count = 0;
-                    } else {
-                        pending.observed_count = pending.observed_count.saturating_add(1);
-                        debug!(
-                            id = id,
-                            name = current.name.as_str(),
-                            observed = pending.observed_count,
-                            "pending rename observed"
-                        );
-                    }
-                } else {
-                    pending.observed_count = pending.observed_count.saturating_add(1);
-                    if pending.observed_count >= MISSING_PENDING_RENAME_THRESHOLD {
-                        stale_pending_ids.push(id.clone());
-                    }
-                }
-            }
-
-            for stale_id in stale_pending_ids {
-                debug!(
-                    id = stale_id.as_str(),
-                    "pending rename stale (missing) and cleared"
-                );
-                model.pending_renames.remove(&stale_id);
-                if model.pending_rename_last_window_id.as_deref() == Some(stale_id.as_str()) {
-                    model.pending_rename_last_window_id = None;
-                }
-            }
-
-            if let Some(last_id) = model.pending_rename_last_window_id.as_deref() {
-                if !model.pending_renames.contains_key(last_id) {
-                    model.pending_rename_last_window_id = None;
-                }
-            }
-
-            debug!(
-                cursor = model.cursor(),
-                selected = selected_ref,
-                "window list selection restored"
-            );
-
-            clear_mode_if_missing_target(model, &windows);
-            followup_cmds.push(Cmd::Render);
-            followup_cmds
-        }
+        Msg::WindowRenamed { window_id, name } => handle_window_renamed(model, window_id, name),
+        Msg::WindowListLoaded(windows) => handle_window_list_loaded(model, windows),
         Msg::AiProcessPollResult { panes, windows } => {
             use std::time::Instant;
 
@@ -299,6 +123,213 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         Msg::Quit => {
             model.should_quit = true;
             vec![Cmd::ResetAllBorders, Cmd::RestorePreview, Cmd::Quit]
+        }
+    }
+}
+
+fn handle_window_focus_changed(model: &mut Model, window_id: String) -> Vec<Cmd> {
+    // Suppress only the internally expected window-focus events.
+    // If an unexpected window_id arrives while suppression is active,
+    // treat it as a real user switch instead of consuming suppression.
+    if model.ignore_window_changes > 0 {
+        let expected = model.pending_internal_focus_window.as_deref();
+        if expected == Some(window_id.as_str()) {
+            model.ignore_window_changes -= 1;
+            if model.ignore_window_changes == 0 {
+                model.pending_internal_focus_window = None;
+            }
+            return vec![Cmd::EnsureSidebarWidth];
+        }
+    }
+
+    // Ignore events for the window the sidebar is already in.
+    if window_id == model.sidebar_window_id {
+        return vec![Cmd::EnsureSidebarWidth];
+    }
+
+    // User explicitly switched windows; clear preview state.
+    model.preview = PreviewState::Home;
+    model.ignore_window_changes = 0;
+    model.pending_internal_focus_window = None;
+    vec![
+        Cmd::FollowToWindow { window_id },
+        Cmd::EnsureSidebarWidth,
+        Cmd::ListWindows,
+    ]
+}
+
+fn handle_window_renamed(model: &mut Model, window_id: String, name: String) -> Vec<Cmd> {
+    if let Some(pending) = model.pending_renames.get_mut(&window_id) {
+        let expected_name = pending.target_name.clone();
+        if name != expected_name {
+            debug!(
+                id = window_id.as_str(),
+                current = name.as_str(),
+                expected = expected_name.as_str(),
+                "pending rename mismatch from event, correcting immediately"
+            );
+            pending.observed_count = 0;
+            model.pending_rename_last_window_id = Some(window_id.clone());
+            return vec![Cmd::RenameWindow {
+                id: window_id,
+                name: expected_name,
+            }];
+        }
+
+        pending.observed_count = pending.observed_count.saturating_add(1);
+        debug!(
+            id = window_id.as_str(),
+            name = name.as_str(),
+            observed = pending.observed_count,
+            "pending rename observed from event"
+        );
+        Vec::new()
+    } else {
+        vec![Cmd::ListWindows]
+    }
+}
+
+fn handle_window_list_loaded(model: &mut Model, windows: Vec<WindowInfo>) -> Vec<Cmd> {
+    // Save folder expanded state before rebuilding.
+    let expanded_state = collect_folder_expanded(model.tree());
+    let mut selected_window_id = derive_selected_window_id(model);
+
+    let selected_exists = selected_window_id
+        .as_deref()
+        .is_some_and(|id| windows.iter().any(|w| w.id == *id));
+    debug!(
+        pending_count = model.pending_renames.len(),
+        pending_last = model.pending_rename_last_window_id.as_deref(),
+        mode = ?model.mode,
+        selected = selected_window_id.as_deref(),
+        exists = selected_exists,
+        cursor = model.cursor(),
+        "window list loaded"
+    );
+
+    bump_last_pending_if_missing(model, &windows, &mut selected_window_id);
+
+    let mut new_tree = build_tree(&windows);
+    restore_folder_expanded(&mut new_tree, &expanded_state);
+    let selected_ref = selected_window_id.as_deref();
+    model.replace_tree_preserve_selection(new_tree, selected_ref);
+
+    let (mut followup_cmds, stale_pending_ids) = reconcile_pending_renames(model, &windows);
+    clear_stale_pending_renames(model, stale_pending_ids);
+    clear_orphaned_last_pending_rename(model);
+
+    debug!(
+        cursor = model.cursor(),
+        selected = selected_ref,
+        "window list selection restored"
+    );
+
+    clear_mode_if_missing_target(model, &windows);
+    followup_cmds.push(Cmd::Render);
+    followup_cmds
+}
+
+fn derive_selected_window_id(model: &Model) -> Option<String> {
+    model
+        .pending_rename_last_window_id
+        .as_ref()
+        .filter(|id| model.pending_renames.contains_key(*id))
+        .cloned()
+        .or_else(|| match &model.mode {
+            Mode::Renaming { window_id } => Some(window_id.clone()),
+            _ => model.selected_window_info().map(|info| info.id.clone()),
+        })
+}
+
+fn bump_last_pending_if_missing(
+    model: &mut Model,
+    windows: &[WindowInfo],
+    selected_window_id: &mut Option<String>,
+) {
+    if let Some(last_id) = model.pending_rename_last_window_id.clone() {
+        let last_exists = windows.iter().any(|w| w.id == last_id);
+        if !last_exists {
+            if let Some(pending) = model.pending_renames.get_mut(&last_id) {
+                pending.observed_count = pending.observed_count.saturating_add(1);
+                debug!(
+                    id = last_id.as_str(),
+                    observed = pending.observed_count,
+                    "latest pending rename target missing from window list"
+                );
+            }
+            *selected_window_id = None;
+        }
+    }
+}
+
+fn reconcile_pending_renames(model: &mut Model, windows: &[WindowInfo]) -> (Vec<Cmd>, Vec<String>) {
+    let mut followup_cmds = Vec::new();
+    let mut stale_pending_ids = Vec::new();
+
+    for (id, pending) in &mut model.pending_renames {
+        // Skip the last-tracked ID if it was already incremented above.
+        if model.pending_rename_last_window_id.as_deref() == Some(id.as_str())
+            && !windows.iter().any(|w| w.id == *id)
+        {
+            // Already handled in the last_id block — skip to avoid
+            // double-incrementing observed_count.
+            if pending.observed_count >= MISSING_PENDING_RENAME_THRESHOLD {
+                stale_pending_ids.push(id.clone());
+            }
+            continue;
+        }
+
+        if let Some(current) = windows.iter().find(|w| w.id == *id) {
+            if current.name != pending.target_name {
+                debug!(
+                    id = id,
+                    current = current.name.as_str(),
+                    expected = pending.target_name.as_str(),
+                    observed = pending.observed_count,
+                    "pending rename mismatch, correcting"
+                );
+                followup_cmds.push(Cmd::RenameWindow {
+                    id: id.clone(),
+                    name: pending.target_name.clone(),
+                });
+                pending.observed_count = 0;
+            } else {
+                pending.observed_count = pending.observed_count.saturating_add(1);
+                debug!(
+                    id = id,
+                    name = current.name.as_str(),
+                    observed = pending.observed_count,
+                    "pending rename observed"
+                );
+            }
+        } else {
+            pending.observed_count = pending.observed_count.saturating_add(1);
+            if pending.observed_count >= MISSING_PENDING_RENAME_THRESHOLD {
+                stale_pending_ids.push(id.clone());
+            }
+        }
+    }
+
+    (followup_cmds, stale_pending_ids)
+}
+
+fn clear_stale_pending_renames(model: &mut Model, stale_pending_ids: Vec<String>) {
+    for stale_id in stale_pending_ids {
+        debug!(
+            id = stale_id.as_str(),
+            "pending rename stale (missing) and cleared"
+        );
+        model.pending_renames.remove(&stale_id);
+        if model.pending_rename_last_window_id.as_deref() == Some(stale_id.as_str()) {
+            model.pending_rename_last_window_id = None;
+        }
+    }
+}
+
+fn clear_orphaned_last_pending_rename(model: &mut Model) {
+    if let Some(last_id) = model.pending_rename_last_window_id.as_deref() {
+        if !model.pending_renames.contains_key(last_id) {
+            model.pending_rename_last_window_id = None;
         }
     }
 }
