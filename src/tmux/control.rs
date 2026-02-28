@@ -36,6 +36,8 @@ struct WaiterState {
     skip_responses: usize,
 }
 
+const COMMAND_TIMEOUT_SECS: u64 = 5;
+
 pub struct TmuxControl {
     stdin: tokio::fs::File,
     events: mpsc::Receiver<super::TmuxEvent>,
@@ -87,114 +89,7 @@ impl TmuxControl {
 
         let waiters_for_task = Arc::clone(&waiters);
         let reader_task = tokio::spawn(async move {
-            let mut in_progress: Option<String> = None;
-            // Coalesced "resync needed" marker when non-output events arrive
-            // while the channel is full. We retry delivery each loop.
-            let mut pending_resync_event = false;
-
-            loop {
-                if !flush_pending_resync_event(&event_tx, &mut pending_resync_event) {
-                    break;
-                }
-
-                let line = match line_rx.recv().await {
-                    Some(line) => line,
-                    None => break,
-                };
-
-                if let Some(marker) = parse_control_marker(&line) {
-                    match marker {
-                        ControlMarker::Begin => {
-                            if let Some(old_data) = in_progress.take() {
-                                let mut state = waiters_for_task.lock().await;
-                                if state.skip_responses > 0 {
-                                    state.skip_responses -= 1;
-                                } else if let Some(waiter) = state.queue.pop_front() {
-                                    let _ = waiter.send(Err(anyhow!(
-                                        "response block interrupted by new %begin (data: {})",
-                                        old_data.trim()
-                                    )));
-                                }
-                            }
-                            in_progress = Some(String::new());
-                        }
-                        ControlMarker::End | ControlMarker::ErrorEnd => {
-                            let is_error = matches!(marker, ControlMarker::ErrorEnd);
-                            match in_progress.take() {
-                                Some(data) => {
-                                    let mut state = waiters_for_task.lock().await;
-                                    if state.skip_responses > 0 {
-                                        state.skip_responses -= 1;
-                                    } else {
-                                        while let Some(waiter) = state.queue.pop_front() {
-                                            let result = if is_error {
-                                                let err_msg = data.trim().to_string();
-                                                Err(anyhow!(
-                                                    "tmux command error: {}",
-                                                    if err_msg.is_empty() {
-                                                        "unknown error".to_string()
-                                                    } else {
-                                                        err_msg
-                                                    }
-                                                ))
-                                            } else {
-                                                Ok(data.clone())
-                                            };
-
-                                            if waiter.send(result).is_ok() {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                None => {
-                                    // Unsolicited %end/%error (e.g., from attach init)
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                // If inside a response block, non-marker lines are response data.
-                // %-prefixed lines that match a known notification are emitted as
-                // events and NOT appended to the response.  Unrecognized %-lines
-                // (e.g. pane IDs like %0, %1) ARE kept as response data.
-                if let Some(data) = in_progress.as_mut() {
-                    if line.starts_with('%') {
-                        if let Some(event) = parse_line(&line) {
-                            if !send_event(&event_tx, event, &mut pending_resync_event) {
-                                break;
-                            }
-                            continue;
-                        }
-                        // Unrecognized %-line: fall through to append as response data
-                    }
-                    data.push_str(&line);
-                    data.push('\n');
-                    continue;
-                }
-
-                // Outside a response block, %-prefixed lines are events
-                if line.starts_with('%') {
-                    if let Some(event) = parse_line(&line) {
-                        if !send_event(&event_tx, event, &mut pending_resync_event) {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            let mut state = waiters_for_task.lock().await;
-            while let Some(waiter) = state.queue.pop_front() {
-                let _ = waiter.send(Err(anyhow!("tmux control stream closed")));
-            }
-
-            let _ = event_tx
-                .send(super::TmuxEvent::Error(
-                    "tmux control process stdout closed".to_string(),
-                ))
-                .await;
+            run_reader_loop(&mut line_rx, &event_tx, waiters_for_task).await;
         });
 
         Ok(Self {
@@ -207,49 +102,9 @@ impl TmuxControl {
     }
 
     pub async fn send_command(&mut self, cmd: &str) -> Result<String> {
-        let cmd = cmd.trim_end_matches('\n');
-        if cmd.contains('\n') {
-            return Err(anyhow!(
-                "tmux command must not contain embedded newlines: {:?}",
-                cmd
-            ));
-        }
-
-        let (tx, rx) = oneshot::channel::<Result<String>>();
-        self.waiters.lock().await.queue.push_back(tx);
-
-        tracing::trace!(cmd, "tmux send");
-        if let Err(err) = self.stdin.write_all(cmd.as_bytes()).await {
-            self.waiters.lock().await.queue.pop_back();
-            return Err(anyhow!("failed to write tmux command: {err}"));
-        }
-
-        if let Err(err) = self.stdin.write_all(b"\n").await {
-            self.waiters.lock().await.queue.pop_back();
-            return Err(anyhow!("failed to write tmux command newline: {err}"));
-        }
-
-        if let Err(err) = self.stdin.flush().await {
-            self.waiters.lock().await.queue.pop_back();
-            return Err(anyhow!("failed to flush tmux stdin: {err}"));
-        }
-
-        let result = match timeout(Duration::from_secs(5), rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(anyhow!("tmux command response channel closed")),
-            Err(_) => {
-                let mut state = self.waiters.lock().await;
-                // Only increment skip_responses if our waiter is still in the
-                // queue.  If the reader already consumed it (race between
-                // response arrival and timeout), the queue is empty and we must
-                // not bump skip_responses — doing so would discard the next
-                // legitimate response.
-                if state.queue.pop_back().is_some() {
-                    state.skip_responses += 1;
-                }
-                Err(anyhow!("timed out waiting for tmux response"))
-            }
-        };
+        let cmd = validate_single_line_command(cmd)?;
+        let response_rx = self.enqueue_response_waiter().await;
+        let result = self.send_and_wait_for_response(cmd, response_rx).await;
 
         if let Err(ref err) = result {
             tracing::warn!(cmd, %err, "tmux command failed");
@@ -289,6 +144,243 @@ impl TmuxControl {
         let _ = self.child.wait().await;
         self.reader_task.abort();
     }
+
+    async fn enqueue_response_waiter(&self) -> oneshot::Receiver<Result<String>> {
+        let (tx, rx) = oneshot::channel::<Result<String>>();
+        self.waiters.lock().await.queue.push_back(tx);
+        rx
+    }
+
+    async fn send_and_wait_for_response(
+        &mut self,
+        cmd: &str,
+        response_rx: oneshot::Receiver<Result<String>>,
+    ) -> Result<String> {
+        tracing::trace!(cmd, "tmux send");
+        if let Err(err) = self.write_command_line(cmd).await {
+            self.waiters.lock().await.queue.pop_back();
+            return Err(err);
+        }
+        self.await_command_response(response_rx).await
+    }
+
+    async fn write_command_line(&mut self, cmd: &str) -> Result<()> {
+        self.stdin
+            .write_all(cmd.as_bytes())
+            .await
+            .map_err(|err| anyhow!("failed to write tmux command: {err}"))?;
+        self.stdin
+            .write_all(b"\n")
+            .await
+            .map_err(|err| anyhow!("failed to write tmux command newline: {err}"))?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|err| anyhow!("failed to flush tmux stdin: {err}"))?;
+        Ok(())
+    }
+
+    async fn await_command_response(
+        &mut self,
+        response_rx: oneshot::Receiver<Result<String>>,
+    ) -> Result<String> {
+        match timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS), response_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(anyhow!("tmux command response channel closed")),
+            Err(_) => self.handle_response_timeout().await,
+        }
+    }
+
+    async fn handle_response_timeout(&mut self) -> Result<String> {
+        let mut state = self.waiters.lock().await;
+        // Only increment skip_responses if our waiter is still in the queue.
+        // If the reader already consumed it (race between response arrival and
+        // timeout), the queue is empty and we must not bump skip_responses —
+        // doing so would discard the next legitimate response.
+        if state.queue.pop_back().is_some() {
+            state.skip_responses += 1;
+        }
+        Err(anyhow!("timed out waiting for tmux response"))
+    }
+}
+
+fn validate_single_line_command(cmd: &str) -> Result<&str> {
+    let cmd = cmd.trim_end_matches('\n');
+    if cmd.contains('\n') {
+        return Err(anyhow!(
+            "tmux command must not contain embedded newlines: {:?}",
+            cmd
+        ));
+    }
+    Ok(cmd)
+}
+
+async fn run_reader_loop(
+    line_rx: &mut mpsc::Receiver<String>,
+    event_tx: &mpsc::Sender<super::TmuxEvent>,
+    waiters: Arc<Mutex<WaiterState>>,
+) {
+    let mut in_progress: Option<String> = None;
+    // Coalesced "resync needed" marker when non-output events arrive
+    // while the channel is full. We retry delivery each loop.
+    let mut pending_resync_event = false;
+
+    loop {
+        if !flush_pending_resync_event(event_tx, &mut pending_resync_event) {
+            break;
+        }
+
+        let line = match line_rx.recv().await {
+            Some(line) => line,
+            None => break,
+        };
+
+        if let Some(marker) = parse_control_marker(&line) {
+            handle_control_marker(marker, &mut in_progress, &waiters).await;
+            continue;
+        }
+
+        if let Some(data) = in_progress.as_mut() {
+            if !handle_line_inside_response_block(
+                line.as_str(),
+                data,
+                event_tx,
+                &mut pending_resync_event,
+            ) {
+                break;
+            }
+            continue;
+        }
+
+        if !handle_line_outside_response_block(line.as_str(), event_tx, &mut pending_resync_event) {
+            break;
+        }
+    }
+
+    notify_stream_closed(waiters, event_tx).await;
+}
+
+async fn handle_control_marker(
+    marker: ControlMarker,
+    in_progress: &mut Option<String>,
+    waiters: &Arc<Mutex<WaiterState>>,
+) {
+    match marker {
+        ControlMarker::Begin => begin_response_block(in_progress, waiters).await,
+        ControlMarker::End | ControlMarker::ErrorEnd => {
+            end_response_block(
+                in_progress,
+                waiters,
+                matches!(marker, ControlMarker::ErrorEnd),
+            )
+            .await
+        }
+    }
+}
+
+async fn begin_response_block(in_progress: &mut Option<String>, waiters: &Arc<Mutex<WaiterState>>) {
+    if let Some(old_data) = in_progress.take() {
+        let mut state = waiters.lock().await;
+        if state.skip_responses > 0 {
+            state.skip_responses -= 1;
+        } else if let Some(waiter) = state.queue.pop_front() {
+            let _ = waiter.send(Err(anyhow!(
+                "response block interrupted by new %begin (data: {})",
+                old_data.trim()
+            )));
+        }
+    }
+    *in_progress = Some(String::new());
+}
+
+async fn end_response_block(
+    in_progress: &mut Option<String>,
+    waiters: &Arc<Mutex<WaiterState>>,
+    is_error: bool,
+) {
+    match in_progress.take() {
+        Some(data) => {
+            let mut state = waiters.lock().await;
+            if state.skip_responses > 0 {
+                state.skip_responses -= 1;
+                return;
+            }
+            while let Some(waiter) = state.queue.pop_front() {
+                let result = if is_error {
+                    let err_msg = data.trim().to_string();
+                    Err(anyhow!(
+                        "tmux command error: {}",
+                        if err_msg.is_empty() {
+                            "unknown error".to_string()
+                        } else {
+                            err_msg
+                        }
+                    ))
+                } else {
+                    Ok(data.clone())
+                };
+
+                if waiter.send(result).is_ok() {
+                    break;
+                }
+            }
+        }
+        None => {
+            // Unsolicited %end/%error (e.g., from attach init)
+        }
+    }
+}
+
+fn handle_line_inside_response_block(
+    line: &str,
+    in_progress_data: &mut String,
+    event_tx: &mpsc::Sender<super::TmuxEvent>,
+    pending_resync_event: &mut bool,
+) -> bool {
+    // If inside a response block, non-marker lines are response data.
+    // %-prefixed lines that match a known notification are emitted as
+    // events and NOT appended to the response. Unrecognized %-lines
+    // (e.g. pane IDs like %0, %1) ARE kept as response data.
+    if line.starts_with('%') {
+        if let Some(event) = parse_line(line) {
+            return send_event(event_tx, event, pending_resync_event);
+        }
+        // Unrecognized %-line: fall through to append as response data
+    }
+    in_progress_data.push_str(line);
+    in_progress_data.push('\n');
+    true
+}
+
+fn handle_line_outside_response_block(
+    line: &str,
+    event_tx: &mpsc::Sender<super::TmuxEvent>,
+    pending_resync_event: &mut bool,
+) -> bool {
+    // Outside a response block, %-prefixed lines are events.
+    if line.starts_with('%') {
+        if let Some(event) = parse_line(line) {
+            return send_event(event_tx, event, pending_resync_event);
+        }
+    }
+    true
+}
+
+async fn notify_stream_closed(
+    waiters: Arc<Mutex<WaiterState>>,
+    event_tx: &mpsc::Sender<super::TmuxEvent>,
+) {
+    let mut state = waiters.lock().await;
+    while let Some(waiter) = state.queue.pop_front() {
+        let _ = waiter.send(Err(anyhow!("tmux control stream closed")));
+    }
+    drop(state);
+
+    let _ = event_tx
+        .send(super::TmuxEvent::Error(
+            "tmux control process stdout closed".to_string(),
+        ))
+        .await;
 }
 
 async fn ensure_tmux_attached_or_error(

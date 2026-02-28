@@ -109,27 +109,18 @@ fn build_sidebar_inner_cmd() -> String {
 }
 
 fn ensure_session_exists(session: &str) -> Result<()> {
-    let already = std::process::Command::new("tmux")
-        .args(["has-session", "-t", session])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let already = tmux_has_session(session);
     if already {
         return Ok(());
     }
-    let status = std::process::Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            session,
-            "-n",
-            INITIAL_WINDOW_NAME,
-        ])
-        .env_remove("TMUX")
-        .status()?;
+    let status = tmux_status_with_tmux_removed(&[
+        "new-session",
+        "-d",
+        "-s",
+        session,
+        "-n",
+        INITIAL_WINDOW_NAME,
+    ])?;
     if !status.success() {
         anyhow::bail!("failed to create tmux session '{}'", session);
     }
@@ -166,9 +157,7 @@ fn split_sidebar_in_session(session: &str, inner_cmd: &str, detached: bool) -> R
 
 fn switch_client_to_session(session: &str) -> Result<()> {
     let session_target = exact_session_target(session);
-    let status = std::process::Command::new("tmux")
-        .args(["switch-client", "-t", &session_target])
-        .status()?;
+    let status = tmux_status(&["switch-client", "-t", &session_target])?;
     if status.success() {
         Ok(())
     } else {
@@ -178,9 +167,7 @@ fn switch_client_to_session(session: &str) -> Result<()> {
 
 fn attach_to_session(session: &str) -> Result<()> {
     let session_target = exact_session_target(session);
-    let status = std::process::Command::new("tmux")
-        .args(["attach-session", "-t", &session_target])
-        .status()?;
+    let status = tmux_status(&["attach-session", "-t", &session_target])?;
     if status.success() {
         Ok(())
     } else {
@@ -194,9 +181,7 @@ fn disable_window_rename_options(target: &str) {
 }
 
 fn set_window_option(target: &str, option: &str, value: &str) -> Result<()> {
-    let status = std::process::Command::new("tmux")
-        .args(["set-window-option", "-t", target, option, value])
-        .status()?;
+    let status = tmux_status(&["set-window-option", "-t", target, option, value])?;
     if status.success() {
         Ok(())
     } else {
@@ -207,4 +192,25 @@ fn set_window_option(target: &str, option: &str, value: &str) -> Result<()> {
             target
         )
     }
+}
+
+fn tmux_has_session(session: &str) -> bool {
+    std::process::Command::new("tmux")
+        .args(["has-session", "-t", session])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn tmux_status(args: &[&str]) -> Result<std::process::ExitStatus> {
+    Ok(std::process::Command::new("tmux").args(args).status()?)
+}
+
+fn tmux_status_with_tmux_removed(args: &[&str]) -> Result<std::process::ExitStatus> {
+    Ok(std::process::Command::new("tmux")
+        .args(args)
+        .env_remove("TMUX")
+        .status()?)
 }
