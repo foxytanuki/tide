@@ -8,7 +8,7 @@ use crate::model::{Mode, Model, PendingRename, PreviewState};
 use crate::msg::Msg;
 use crate::tree::{
     build_tree, find_parent_folder, get_node, get_node_mut, next_visible_item, prev_visible_item,
-    toggle_expand, FlatNodeKind, TreeNode,
+    toggle_expand, FlatNodeKind, TreeNode, WindowInfo,
 };
 use crate::view::tree_item_at;
 
@@ -222,33 +222,9 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
                 "window list selection restored"
             );
 
-            // If in Renaming/ConfirmClose mode, check target still exists
-            match &model.mode {
-                Mode::Renaming { window_id } | Mode::ConfirmClose { window_id } => {
-                    let still_exists = windows.iter().any(|w| w.id == *window_id);
-                    if !still_exists {
-                        model.mode = Mode::Normal;
-                        clear_input(model);
-                    }
-                }
-                Mode::RenamingFolder { folder_name } => {
-                    let folder_exists = windows
-                        .iter()
-                        .any(|w| w.name.starts_with(&format!("{}:", folder_name)));
-                    if !folder_exists {
-                        model.mode = Mode::Normal;
-                        clear_input(model);
-                    }
-                }
-                Mode::Normal | Mode::CreatingProject => {}
-            }
-
-            if followup_cmds.is_empty() {
-                vec![Cmd::Render]
-            } else {
-                followup_cmds.push(Cmd::Render);
-                followup_cmds
-            }
+            clear_mode_if_missing_target(model, &windows);
+            followup_cmds.push(Cmd::Render);
+            followup_cmds
         }
         Msg::AiProcessPollResult { panes, windows } => {
             use std::time::Instant;
@@ -324,6 +300,40 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             model.should_quit = true;
             vec![Cmd::ResetAllBorders, Cmd::RestorePreview, Cmd::Quit]
         }
+    }
+}
+
+fn join_folder_path(prefix: Option<&str>, name: &str) -> String {
+    match prefix {
+        Some(p) => format!("{}:{}", p, name),
+        None => name.to_string(),
+    }
+}
+
+fn reset_to_normal_mode(model: &mut Model) {
+    model.mode = Mode::Normal;
+    clear_input(model);
+}
+
+fn exit_to_normal_mode(model: &mut Model) -> Vec<Cmd> {
+    reset_to_normal_mode(model);
+    vec![Cmd::Render]
+}
+
+fn clear_mode_if_missing_target(model: &mut Model, windows: &[WindowInfo]) {
+    let should_reset = match &model.mode {
+        Mode::Renaming { window_id } | Mode::ConfirmClose { window_id } => {
+            !windows.iter().any(|w| w.id == *window_id)
+        }
+        Mode::RenamingFolder { folder_name } => {
+            let folder_prefix = format!("{folder_name}:");
+            windows.iter().all(|w| !w.name.starts_with(&folder_prefix))
+        }
+        Mode::Normal | Mode::CreatingProject => false,
+    };
+
+    if should_reset {
+        reset_to_normal_mode(model);
     }
 }
 
@@ -708,11 +718,7 @@ fn handle_renaming_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
                 vec![]
             }
         }
-        KeyCode::Esc => {
-            model.mode = Mode::Normal;
-            clear_input(model);
-            vec![Cmd::Render]
-        }
+        KeyCode::Esc => exit_to_normal_mode(model),
         _ => vec![],
     }
 }
@@ -735,11 +741,7 @@ fn handle_creating_project_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
             let window_name = format!("{}:tab1", name);
             vec![Cmd::NewWindow { name: window_name }]
         }
-        KeyCode::Esc => {
-            model.mode = Mode::Normal;
-            clear_input(model);
-            vec![Cmd::Render]
-        }
+        KeyCode::Esc => exit_to_normal_mode(model),
         _ => vec![],
     }
 }
@@ -787,11 +789,7 @@ fn handle_renaming_folder_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
                 vec![]
             }
         }
-        KeyCode::Esc => {
-            model.mode = Mode::Normal;
-            clear_input(model);
-            vec![Cmd::Render]
-        }
+        KeyCode::Esc => exit_to_normal_mode(model),
         _ => vec![],
     }
 }
@@ -835,10 +833,7 @@ fn collect_window_names_inner(nodes: &[TreeNode], prefix: Option<&str>) -> Vec<S
                 names.push(name);
             }
             TreeNode::Folder { name, children, .. } => {
-                let full_prefix = match prefix {
-                    Some(p) => format!("{}:{}", p, name),
-                    None => name.clone(),
-                };
+                let full_prefix = join_folder_path(prefix, name);
                 names.extend(collect_window_names_inner(children, Some(&full_prefix)));
             }
         }
@@ -975,10 +970,7 @@ fn collect_folder_children_recursive(
                 out.push((info.id.clone(), suffix));
             }
             TreeNode::Folder { name, children, .. } => {
-                let new_prefix = match prefix {
-                    Some(p) => format!("{}:{}", p, name),
-                    None => name.clone(),
-                };
+                let new_prefix = join_folder_path(prefix, name);
                 collect_folder_children_recursive(children, Some(&new_prefix), out);
             }
         }
@@ -1006,10 +998,7 @@ fn collect_folder_expanded_inner(
             children,
         } = node
         {
-            let full_path = match prefix {
-                Some(p) => format!("{}:{}", p, name),
-                None => name.clone(),
-            };
+            let full_path = join_folder_path(prefix, name);
             map.insert(full_path.clone(), *expanded);
             collect_folder_expanded_inner(children, Some(&full_path), map);
         }
@@ -1033,10 +1022,7 @@ fn restore_folder_expanded_inner(
             children,
         } = node
         {
-            let full_path = match prefix {
-                Some(p) => format!("{}:{}", p, name),
-                None => name.clone(),
-            };
+            let full_path = join_folder_path(prefix, name);
             if let Some(&was_expanded) = state.get(full_path.as_str()) {
                 *expanded = was_expanded;
             }
