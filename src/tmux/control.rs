@@ -68,42 +68,7 @@ impl TmuxControl {
                 .with_context(|| format!("failed to spawn tmux -CC attach -t {session}"))?,
         ));
 
-        // Give the child a moment to fail (e.g. bad session name)
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        if let Some(status) = guard.0.as_mut().unwrap().try_wait()? {
-            // Try to read error output from pty master
-            let mut err_buf = [0u8; 1024];
-            let err_msg = {
-                use std::io::Read;
-                use std::os::unix::io::AsRawFd;
-                match pty_master.try_clone() {
-                    Ok(mut master_clone) => {
-                        unsafe {
-                            let flags = libc::fcntl(master_clone.as_raw_fd(), libc::F_GETFL);
-                            libc::fcntl(
-                                master_clone.as_raw_fd(),
-                                libc::F_SETFL,
-                                flags | libc::O_NONBLOCK,
-                            );
-                        }
-                        match master_clone.read(&mut err_buf) {
-                            Ok(n) => String::from_utf8_lossy(&err_buf[..n]).trim().to_string(),
-                            Err(_) => String::new(),
-                        }
-                    }
-                    Err(_) => String::new(),
-                }
-            };
-            return Err(anyhow!(
-                "tmux -CC exited immediately ({}): {}",
-                status,
-                if err_msg.is_empty() {
-                    "no output"
-                } else {
-                    &err_msg
-                }
-            ));
-        }
+        ensure_tmux_attached_or_error(&mut guard, &pty_master).await?;
 
         // Split pty master into reader and writer
         let master_for_write = pty_master.try_clone().context("dup pty master for write")?;
@@ -111,39 +76,8 @@ impl TmuxControl {
 
         let stdin = tokio::fs::File::from_std(master_for_write);
 
-        // Spawn a blocking thread to read lines from the pty master
-        let (line_tx, mut line_rx) = mpsc::channel::<String>(512);
-        std::thread::Builder::new()
-            .name("tmux-reader".into())
-            .spawn(move || {
-                use std::io::BufRead;
-                let reader = std::io::BufReader::new(master_for_read);
-                let mut reader = reader;
-                let mut buf = Vec::<u8>::new();
-
-                loop {
-                    buf.clear();
-                    match reader.read_until(b'\n', &mut buf) {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            if matches!(buf.last(), Some(b'\n')) {
-                                buf.pop();
-                            }
-                            if matches!(buf.last(), Some(b'\r')) {
-                                buf.pop();
-                            }
-
-                            let line = String::from_utf8_lossy(&buf).into_owned();
-                            if line_tx.blocking_send(line).is_err() {
-                                break;
-                            }
-                        }
-                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
-                    }
-                }
-            })
-            .context("failed to spawn tmux reader thread")?;
+        // Spawn a blocking thread to read lines from the pty master.
+        let mut line_rx = spawn_tmux_reader_thread(master_for_read)?;
 
         let (event_tx, event_rx) = mpsc::channel::<super::TmuxEvent>(256);
         let waiters: Arc<Mutex<WaiterState>> = Arc::new(Mutex::new(WaiterState {
@@ -355,6 +289,80 @@ impl TmuxControl {
         let _ = self.child.wait().await;
         self.reader_task.abort();
     }
+}
+
+async fn ensure_tmux_attached_or_error(
+    guard: &mut ChildGuard,
+    pty_master: &std::fs::File,
+) -> Result<()> {
+    // Give the child a moment to fail (e.g. bad session name).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    if let Some(status) = guard.0.as_mut().expect("guard child missing").try_wait()? {
+        let err_msg = read_nonblocking_pty_output(pty_master).unwrap_or_default();
+        return Err(anyhow!(
+            "tmux -CC exited immediately ({}): {}",
+            status,
+            if err_msg.is_empty() {
+                "no output"
+            } else {
+                &err_msg
+            }
+        ));
+    }
+    Ok(())
+}
+
+fn read_nonblocking_pty_output(pty_master: &std::fs::File) -> Result<String> {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+
+    let mut err_buf = [0u8; 1024];
+    let mut master_clone = pty_master.try_clone().context("dup pty master for error read")?;
+    unsafe {
+        let flags = libc::fcntl(master_clone.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(master_clone.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let msg = match master_clone.read(&mut err_buf) {
+        Ok(n) => String::from_utf8_lossy(&err_buf[..n]).trim().to_string(),
+        Err(_) => String::new(),
+    };
+    Ok(msg)
+}
+
+fn spawn_tmux_reader_thread(master_for_read: std::fs::File) -> Result<mpsc::Receiver<String>> {
+    let (line_tx, line_rx) = mpsc::channel::<String>(512);
+    std::thread::Builder::new()
+        .name("tmux-reader".into())
+        .spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(master_for_read);
+            let mut reader = reader;
+            let mut buf = Vec::<u8>::new();
+
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if matches!(buf.last(), Some(b'\n')) {
+                            buf.pop();
+                        }
+                        if matches!(buf.last(), Some(b'\r')) {
+                            buf.pop();
+                        }
+
+                        let line = String::from_utf8_lossy(&buf).into_owned();
+                        if line_tx.blocking_send(line).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+        .context("failed to spawn tmux reader thread")?;
+    Ok(line_rx)
 }
 
 impl Drop for TmuxControl {
