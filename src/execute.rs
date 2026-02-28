@@ -756,10 +756,7 @@ async fn handle_list_windows<T: TmuxApi>(
             model
                 .pane_layouts
                 .retain(|id, _| windows.iter().any(|w| w.id == *id));
-            let follow_up = update(model, Msg::WindowListLoaded(windows));
-            for c in follow_up.into_iter().rev() {
-                queue.push_front(c);
-            }
+            enqueue_follow_up(queue, update(model, Msg::WindowListLoaded(windows)));
         }
         Err(err) => {
             warn!(%err, "list-windows failed");
@@ -787,14 +784,17 @@ async fn poll_ai_processes<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue: &
                 &mut model.ai_cpu_tracker,
                 &mut model.ai_output_counts,
             );
-            let follow_up = update(model, Msg::AiProcessPollResult { panes, windows });
-            for c in follow_up.into_iter().rev() {
-                queue.push_front(c);
-            }
+            enqueue_follow_up(queue, update(model, Msg::AiProcessPollResult { panes, windows }));
         }
         Err(err) => {
             debug!(%err, "ai process poll failed");
         }
+    }
+}
+
+fn enqueue_follow_up(queue: &mut VecDeque<Cmd>, follow_up: Vec<Cmd>) {
+    for cmd in follow_up.into_iter().rev() {
+        queue.push_front(cmd);
     }
 }
 
