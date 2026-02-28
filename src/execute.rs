@@ -161,622 +161,671 @@ pub async fn execute_commands<T: TmuxApi>(
         match cmd {
             Cmd::PreviewWindow {
                 id: target_window_id,
-            } => {
-                // If previewing and target is the original window, restore
-                if let PreviewState::Previewing {
-                    ref original_window_id,
-                    ..
-                } = model.preview
-                {
-                    if target_window_id == *original_window_id {
-                        debug!(target = %target_window_id, "preview target is original, restoring");
-                        queue.push_front(Cmd::Render);
-                        queue.push_front(Cmd::RestorePreview);
-                        continue;
-                    }
-                }
-
-                // Already on this window, no-op
-                if target_window_id == model.sidebar_window_id {
-                    continue;
-                }
-
-                debug!(target = %target_window_id, "previewing window");
-
-                // Record original state if starting fresh preview
-                let (orig_window, orig_home) = match &model.preview {
-                    PreviewState::Home => {
-                        (model.sidebar_window_id.clone(), model.home_pane_id.clone())
-                    }
-                    PreviewState::Previewing {
-                        original_window_id,
-                        original_home_pane_id,
-                    } => (original_window_id.clone(), original_home_pane_id.clone()),
-                };
-
-                // suppress 2 events: join-pane + select-window
-                model.ignore_window_changes = 2;
-                model.pending_internal_focus_window = Some(target_window_id.clone());
-
-                // Query phase: find join target
-                // Always target the leftmost pane so sidebar stays at far left.
-                let target_leftmost =
-                    choose_leftmost_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id)
-                        .await;
-                let target_home =
-                    choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id)
-                        .await;
-                let join_target = if target_leftmost.is_empty() {
-                    model.error_message =
-                        Some("preview: could not resolve leftmost pane".to_string());
-                    queue.push_front(Cmd::Render);
-                    continue;
-                } else {
-                    target_leftmost
-                };
-
-                // Save target window's layout before sidebar joins (for future restoration).
-                save_window_layout(model, tmux, &target_window_id).await;
-                let leaving_window = model.sidebar_window_id.clone();
-
-                // Action phase: batch all visual tmux operations into a single
-                // command so tmux processes them in one server tick (no flicker).
-                // -l 30 sets sidebar width at join time to avoid intermediate resize.
-                let batch = format!(
-                    "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
-                    model.sidebar_pane_id, join_target, target_window_id, model.sidebar_pane_id,
-                );
-
-                if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
-                    warn!(%err, "preview batch failed");
-                    clear_internal_window_change_suppression(model);
-                    model.error_message = Some(format!("preview: {err}"));
-                    queue.push_front(Cmd::Render);
-                    continue;
-                }
-
-                // Restore leaving window's pane layout when we have an exact
-                // "without sidebar" snapshot.
-                let had_saved_layout = model.pane_layouts.contains_key(&leaving_window);
-                restore_window_layout(model, tmux, &leaving_window).await;
-                if !had_saved_layout {
-                    // No exact snapshot yet (typically startup window).
-                    // Persist current post-move layout as baseline for next switch.
-                    save_window_layout(model, tmux, &leaving_window).await;
-                }
-
-                // Resolve home pane if needed (query after move)
-                let new_home = if !target_home.is_empty() {
-                    target_home
-                } else {
-                    choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id)
-                        .await
-                };
-
-                if !new_home.is_empty() {
-                    model.home_pane_id = new_home;
-                }
-
-                debug!(
-                    sidebar_window = %target_window_id,
-                    home_pane = %model.home_pane_id,
-                    orig_window = %orig_window,
-                    "preview active"
-                );
-
-                model.sidebar_window_id = target_window_id;
-                model.pending_preview_id = None;
-                model.preview = PreviewState::Previewing {
-                    original_window_id: orig_window,
-                    original_home_pane_id: orig_home,
-                };
-                // Suppress %output for next 2 polls to discard pane redraw noise
-                model.ai_output_suppress = 2;
-                queue.push_front(Cmd::CheckBorder);
-            }
-            Cmd::RestorePreview => {
-                if let PreviewState::Previewing {
-                    ref original_window_id,
-                    ref original_home_pane_id,
-                } = model.preview
-                {
-                    let orig_window = original_window_id.clone();
-                    let orig_home = original_home_pane_id.clone();
-
-                    debug!(orig_window = %orig_window, "restoring preview");
-
-                    // Suppress session-window-changed events from join-pane + select-window
-                    model.ignore_window_changes = 2;
-                    model.pending_internal_focus_window = Some(orig_window.clone());
-
-                    // Save orig_window's layout before sidebar re-joins it
-                    save_window_layout(model, tmux, &orig_window).await;
-                    let leaving_window = model.sidebar_window_id.clone();
-
-                    // Always target the leftmost pane so sidebar stays at far left.
-                    let orig_leftmost =
-                        choose_leftmost_pane_in_window(tmux, &orig_window, &model.sidebar_pane_id)
-                            .await;
-
-                    // Batch: join sidebar back + switch + focus
-                    if orig_leftmost.is_empty() {
-                        model.error_message =
-                            Some("restore preview: could not resolve leftmost pane".to_string());
-                        queue.push_front(Cmd::Render);
-                        continue;
-                    }
-                    let batch = format!(
-                        "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
-                        model.sidebar_pane_id, orig_leftmost, orig_window, model.sidebar_pane_id,
-                    );
-
-                    let restored = if let Err(err) =
-                        send_batch_with_reconcile(model, tmux, &batch).await
-                    {
-                        warn!(%err, "restore batch failed, trying fallback");
-                        // Fallback: retry join to leftmost pane (re-query, because pane IDs may have changed).
-                        let fallback_leftmost = choose_leftmost_pane_in_window(
-                            tmux,
-                            &orig_window,
-                            &model.sidebar_pane_id,
-                        )
-                        .await;
-                        if fallback_leftmost.is_empty() {
-                            warn!("restore fallback: no leftmost pane available");
-                            false
-                        } else {
-                            let fallback = format!(
-                            "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
-                            model.sidebar_pane_id, fallback_leftmost, orig_window, model.sidebar_pane_id,
-                        );
-                            if let Err(err) =
-                                send_batch_with_reconcile(model, tmux, &fallback).await
-                            {
-                                warn!(%err, "restore fallback batch also failed");
-                                false
-                            } else {
-                                true
-                            }
-                        }
-                    } else {
-                        true
-                    };
-
-                    // Restore leaving window's pane layout after batch.
-                    if restored {
-                        let had_saved_layout = model.pane_layouts.contains_key(&leaving_window);
-                        restore_window_layout(model, tmux, &leaving_window).await;
-                        if !had_saved_layout {
-                            save_window_layout(model, tmux, &leaving_window).await;
-                        }
-                    }
-
-                    if restored {
-                        model.sidebar_window_id = orig_window;
-                        // Re-detect home pane: orig_home may be stale (e.g. pane
-                        // was closed), especially after the fallback path.
-                        let fresh_home = choose_home_pane_in_window(
-                            tmux,
-                            &model.sidebar_window_id,
-                            &model.sidebar_pane_id,
-                        )
-                        .await;
-                        model.home_pane_id = if fresh_home.is_empty() {
-                            orig_home
-                        } else {
-                            fresh_home
-                        };
-                        model.preview = PreviewState::Home;
-                    } else {
-                        // Keep reconciled runtime state from failed batch attempts.
-                        clear_internal_window_change_suppression(model);
-                        if model.sidebar_window_id == orig_window {
-                            model.preview = PreviewState::Home;
-                        }
-                        model.error_message =
-                            Some("restore preview failed; state reconciled".to_string());
-                    }
-                    // Discard %output events from pane redraw during window switch
-                    model.ai_output_counts.clear();
-                    queue.push_front(Cmd::CheckBorder);
-                }
-            }
+            } => handle_preview_window(model, tmux, &mut queue, target_window_id).await,
+            Cmd::RestorePreview => handle_restore_preview(model, tmux, &mut queue).await,
             Cmd::FocusRightPane => {
-                debug!("focusing right pane");
-                if let Err(err) = tmux.send_command("select-pane -R").await {
-                    warn!(%err, "select-pane -R failed");
-                    model.error_message = Some(format!("select-pane: {err}"));
-                    queue.push_front(Cmd::Render);
-                }
+                handle_focus_right_pane(model, tmux, &mut queue).await;
             }
-            Cmd::NewWindow { name } => {
-                debug!(name, "creating new window");
-                let new_cmd = format!(
-                    "new-window -d -n {} -P -F '#{{window_id}}'",
-                    quote_tmux(&name)
-                );
-                match tmux.send_command(&new_cmd).await {
-                    Ok(output) => {
-                        let window_id = output.trim();
-                        if !window_id.is_empty() {
-                            let disable_rename = format!(
-                                "set-window-option -t {} automatic-rename off ; set-window-option -t {} allow-rename off",
-                                window_id, window_id
-                            );
-                            if let Err(err) = tmux.send_command(&disable_rename).await {
-                                warn!(
-                                    id = %window_id,
-                                    name = %name,
-                                    %err,
-                                    "failed to disable rename updates for new window"
-                                );
-                            } else {
-                                debug!(
-                                    id = %window_id,
-                                    "disabled automatic/allow-rename for new window"
-                                );
-                            }
-
-                            model.pending_renames.insert(
-                                window_id.to_string(),
-                                PendingRename {
-                                    target_name: name.clone(),
-                                    observed_count: 0,
-                                },
-                            );
-                            model.pending_rename_last_window_id = Some(window_id.to_string());
-                            debug!(
-                                id = %window_id,
-                                name = %name,
-                                "tracking new window for rename stabilization"
-                            );
-                            queue.push_front(Cmd::Render);
-                            queue.push_front(Cmd::PreviewWindow {
-                                id: window_id.to_string(),
-                            });
-                            queue.push_front(Cmd::ListWindows);
-                        } else {
-                            warn!("new-window returned empty window id");
-                        }
-                    }
-                    Err(err) => {
-                        warn!(%err, "new-window failed");
-                        model.error_message = Some(format!("new-window: {err}"));
-                        queue.push_front(Cmd::Render);
-                    }
-                }
-            }
+            Cmd::NewWindow { name } => handle_new_window(model, tmux, &mut queue, name).await,
             Cmd::RenameWindow { id, name } => {
-                debug!(id, name, "renaming window");
-                let disable_rename = format!(
-                    "set-window-option -t {} automatic-rename off ; set-window-option -t {} allow-rename off",
-                    id, id
-                );
-                if let Err(err) = tmux.send_command(&disable_rename).await {
-                    warn!(%id, %err, "failed to disable automatic-rename before rename");
-                } else {
-                    debug!(%id, "disabled rename options before rename");
-                }
-                let cmd_str = format!("rename-window -t {} {}", id, quote_tmux(&name));
-                if let Err(err) = tmux.send_command(&cmd_str).await {
-                    warn!(%err, "rename-window failed");
-                    model.error_message = Some(format!("rename-window: {err}"));
-                    queue.push_front(Cmd::Render);
-                } else {
-                    if let Err(err) = tmux.send_command(&disable_rename).await {
-                        warn!(
-                            %id,
-                            %err,
-                            "failed to keep rename updates disabled after rename"
-                        );
-                    } else {
-                        debug!(%id, "kept rename options disabled after rename");
-                    }
-                    queue.push_front(Cmd::ListWindows);
-                }
+                handle_rename_window(model, tmux, &mut queue, id, name).await;
             }
-            Cmd::CloseWindow { id } => {
-                // Never kill the window hosting the sidebar
-                if model.sidebar_window_id == id {
-                    match &model.preview {
-                        PreviewState::Previewing { .. } => {
-                            if model.close_restore_attempted {
-                                // Circuit breaker: already tried restore once, don't loop
-                                model.close_restore_attempted = false;
-                                warn!(
-                                    id,
-                                    "close-after-restore failed, refusing to close sidebar window"
-                                );
-                                model.error_message =
-                                    Some("cannot close: sidebar stuck in window".to_string());
-                                queue.push_front(Cmd::Render);
-                                continue;
-                            }
-                            model.close_restore_attempted = true;
-                            debug!(id, "closing previewed window, restoring first");
-                            queue.push_front(Cmd::CloseWindow { id });
-                            queue.push_front(Cmd::RestorePreview);
-                            continue;
-                        }
-                        PreviewState::Home => {
-                            if model.close_restore_attempted {
-                                model.close_restore_attempted = false;
-                                warn!(
-                                    id,
-                                    "close-after-evacuate failed, refusing to close sidebar window"
-                                );
-                                model.error_message =
-                                    Some("cannot close: sidebar stuck in window".to_string());
-                                queue.push_front(Cmd::Render);
-                                continue;
-                            }
-                            // Find another window to evacuate sidebar to
-                            if let Some(other_id) = model.find_another_window_id(&id) {
-                                model.close_restore_attempted = true;
-                                debug!(id, other = %other_id, "evacuating sidebar before close");
-                                queue.push_front(Cmd::CloseWindow { id });
-                                queue.push_front(Cmd::FollowToWindow {
-                                    window_id: other_id,
-                                });
-                                continue;
-                            } else {
-                                warn!(id, "no other window to evacuate sidebar to");
-                                model.error_message = Some("cannot close last window".to_string());
-                                queue.push_front(Cmd::Render);
-                                continue;
-                            }
-                        }
-                    }
-                }
-                model.close_restore_attempted = false;
-                debug!(id, "closing window");
-                let cmd_str = format!("kill-window -t {id}");
-                if let Err(err) = tmux.send_command(&cmd_str).await {
-                    warn!(%err, "kill-window failed");
-                    model.error_message = Some(format!("kill-window: {err}"));
-                    queue.push_front(Cmd::Render);
-                } else {
-                    model.pane_layouts.remove(&id);
-                    // Proactively refresh — don't rely solely on %window-close notification
-                    queue.push_front(Cmd::ListWindows);
-                }
-            }
+            Cmd::CloseWindow { id } => handle_close_window(model, tmux, &mut queue, id).await,
             Cmd::FollowToWindow {
                 window_id: target_window_id,
-            } => {
-                if target_window_id == model.sidebar_window_id {
-                    continue;
-                }
-
-                info!(target = %target_window_id, "following to window");
-
-                // suppress 1 event: join-pane only (no select-window in follow path)
-                model.ignore_window_changes = 1;
-                model.pending_internal_focus_window = Some(target_window_id.clone());
-
-                // Query phase
-                // Always target the leftmost pane so sidebar stays at far left.
-                let target_leftmost =
-                    choose_leftmost_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id)
-                        .await;
-                let target_home =
-                    choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id)
-                        .await;
-                let join_target = if target_leftmost.is_empty() {
-                    model.error_message =
-                        Some("follow: could not resolve leftmost pane".to_string());
-                    queue.push_front(Cmd::Render);
-                    continue;
-                } else {
-                    target_leftmost
-                };
-
-                // Save target window's layout before sidebar joins
-                save_window_layout(model, tmux, &target_window_id).await;
-                let leaving_window = model.sidebar_window_id.clone();
-
-                // Action phase: batch join
-                let batch = format!(
-                    "join-pane -dfhb -l 30 -s {} -t {}",
-                    model.sidebar_pane_id, join_target,
-                );
-
-                if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
-                    warn!(%err, "follow batch failed");
-                    clear_internal_window_change_suppression(model);
-                    model.error_message = Some(format!("follow: {err}"));
-                    queue.push_front(Cmd::Render);
-                    continue;
-                }
-
-                // Restore leaving window's pane layout
-                let had_saved_layout = model.pane_layouts.contains_key(&leaving_window);
-                restore_window_layout(model, tmux, &leaving_window).await;
-                if !had_saved_layout {
-                    save_window_layout(model, tmux, &leaving_window).await;
-                }
-
-                // Resolve home pane
-                let new_home = if !target_home.is_empty() {
-                    target_home
-                } else {
-                    choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id)
-                        .await
-                };
-
-                if !new_home.is_empty() {
-                    model.home_pane_id = new_home;
-                }
-
-                debug!(
-                    sidebar_window = %target_window_id,
-                    home_pane = %model.home_pane_id,
-                    "follow complete"
-                );
-                model.sidebar_window_id = target_window_id;
-                // Suppress %output for next 2 polls to discard pane redraw noise
-                model.ai_output_suppress = 2;
-                queue.push_front(Cmd::CheckBorder);
-            }
-            Cmd::EnsureSidebarWidth => {
-                // Query current width to avoid unnecessary resize.
-                // Spurious resize-pane causes SIGWINCH on the right pane,
-                // making the cursor jump/flicker in the user's work area.
-                let width_cmd = format!(
-                    "display-message -t {} -p '#{{pane_width}}'",
-                    model.sidebar_pane_id
-                );
-                let needs_resize = match tmux.send_command(&width_cmd).await {
-                    Ok(output) => output.trim().parse::<u16>().unwrap_or(0) != 30,
-                    Err(_) => true, // can't check, try resize anyway
-                };
-                if needs_resize {
-                    if let Err(err) = tmux
-                        .send_command(&format!("resize-pane -t {} -x 30", model.sidebar_pane_id))
-                        .await
-                    {
-                        warn!(%err, "ensure resize-pane failed");
-                    }
-                }
-            }
-            Cmd::ValidateSidebarPanes => {
-                let pane_list = tmux
-                    .send_command(&format!(
-                        "list-panes -t {} -F '#{{pane_id}}'",
-                        model.sidebar_window_id
-                    ))
-                    .await
-                    .unwrap_or_default();
-
-                let has_content = pane_list
-                    .lines()
-                    .map(|l| l.trim())
-                    .any(|l| !l.is_empty() && l != model.sidebar_pane_id);
-
-                if !has_content {
-                    debug!(
-                        window = %model.sidebar_window_id,
-                        "sidebar window lost all content panes, evacuating"
-                    );
-                    match &model.preview {
-                        PreviewState::Previewing { .. } => {
-                            queue.push_front(Cmd::ListWindows);
-                            queue.push_front(Cmd::RestorePreview);
-                        }
-                        PreviewState::Home => {
-                            let sidebar_wid = model.sidebar_window_id.clone();
-                            if let Some(other_id) = model.find_another_window_id(&sidebar_wid) {
-                                queue.push_front(Cmd::ListWindows);
-                                queue.push_front(Cmd::FollowToWindow {
-                                    window_id: other_id,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            Cmd::ListWindows => match tmux.list_windows().await {
-                Ok(windows) => {
-                    debug!(count = windows.len(), "refreshed window list");
-                    for window in &windows {
-                        if window.id == model.sidebar_window_id {
-                            continue;
-                        }
-                        if !model.pane_layouts.contains_key(&window.id) {
-                            save_window_layout(model, tmux, &window.id).await;
-                        }
-                    }
-                    model
-                        .pane_layouts
-                        .retain(|id, _| windows.iter().any(|w| w.id == *id));
-                    let follow_up = update(model, Msg::WindowListLoaded(windows));
-                    for c in follow_up.into_iter().rev() {
-                        queue.push_front(c);
-                    }
-                }
-                Err(err) => {
-                    warn!(%err, "list-windows failed");
-                    model.error_message = Some(format!("list-windows: {err}"));
-                    queue.push_front(Cmd::Render);
-                }
-            },
-            Cmd::PollAiProcesses => {
-                // If suppressing output after window switch, discard counts
-                if model.ai_output_suppress > 0 {
-                    model.ai_output_suppress -= 1;
-                    model.ai_output_counts.clear();
-                }
-                let list_cmd = format!(
-                    "list-panes -s -t {} -F '#{{window_id}}\t#{{pane_id}}\t#{{pane_current_command}}\t#{{pane_pid}}'",
-                    model.session_name
-                );
-                match tmux.send_command(&list_cmd).await {
-                    Ok(output) => {
-                        let candidates = find_ai_pane_candidates(&output, &model.sidebar_pane_id);
-                        let (panes, windows) = classify_active_panes(
-                            &candidates,
-                            &mut model.ai_cpu_tracker,
-                            &mut model.ai_output_counts,
-                        );
-                        let follow_up = update(model, Msg::AiProcessPollResult { panes, windows });
-                        for c in follow_up.into_iter().rev() {
-                            queue.push_front(c);
-                        }
-                    }
-                    Err(err) => {
-                        debug!(%err, "ai process poll failed");
-                    }
-                }
-            }
-            Cmd::CheckBorder => {
-                let wanted: HashSet<String> = model.ai_panes.clone();
-                let current = &model.highlighted_panes;
-
-                // Collect all border changes and batch into a single tmux command
-                // to minimize server round-trips and reduce cursor flicker.
-                let to_remove: Vec<String> = current.difference(&wanted).cloned().collect();
-                let to_add: Vec<String> = wanted.difference(current).cloned().collect();
-
-                if !to_remove.is_empty() || !to_add.is_empty() {
-                    let mut parts: Vec<String> = Vec::new();
-                    for pane_id in &to_remove {
-                        parts.push(format!(
-                            "set-option -p -t {} -u pane-border-format",
-                            pane_id
-                        ));
-                        debug!(pane = %pane_id, "pane border format reset");
-                    }
-                    for pane_id in &to_add {
-                        parts.push(format!(
-                            "set-option -p -t {} pane-border-format \" #{{?pane_active,#[fg=yellow#,bold]● #P: #{{pane_current_command}} #{{pane_current_path}},#[fg=yellow]● #P: #{{pane_current_command}}}} \"",
-                            pane_id
-                        ));
-                        debug!(pane = %pane_id, "pane border format set to AI active");
-                    }
-                    let batch = parts.join(" ; ");
-                    let _ = tmux.send_command(&batch).await;
-                }
-
-                model.highlighted_panes = wanted;
-            }
-            Cmd::ResetAllBorders => {
-                for pane_id in model.highlighted_panes.drain() {
-                    let reset_cmd = format!("set-option -p -t {} -u pane-border-format", pane_id);
-                    let _ = tmux.send_command(&reset_cmd).await;
-                    debug!(pane = %pane_id, "pane border format reset on cleanup");
-                }
-            }
-            Cmd::Render => {
-                if let Err(err) = terminal.draw(|f| render(model, f)) {
-                    model.error_message = Some(format!("render: {err}"));
-                }
-            }
+            } => handle_follow_to_window(model, tmux, &mut queue, target_window_id).await,
+            Cmd::EnsureSidebarWidth => ensure_sidebar_width(model, tmux).await,
+            Cmd::ValidateSidebarPanes => validate_sidebar_panes(model, tmux, &mut queue).await,
+            Cmd::ListWindows => handle_list_windows(model, tmux, &mut queue).await,
+            Cmd::PollAiProcesses => poll_ai_processes(model, tmux, &mut queue).await,
+            Cmd::CheckBorder => check_border(model, tmux).await,
+            Cmd::ResetAllBorders => reset_all_borders(model, tmux).await,
+            Cmd::Render => render_model(model, terminal),
             Cmd::Restart => return false,
             Cmd::Quit => return false,
         }
     }
 
     true
+}
+
+async fn handle_preview_window<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    queue: &mut VecDeque<Cmd>,
+    target_window_id: String,
+) {
+    // If previewing and target is the original window, restore.
+    if let PreviewState::Previewing {
+        ref original_window_id,
+        ..
+    } = model.preview
+    {
+        if target_window_id == *original_window_id {
+            debug!(target = %target_window_id, "preview target is original, restoring");
+            queue.push_front(Cmd::Render);
+            queue.push_front(Cmd::RestorePreview);
+            return;
+        }
+    }
+
+    // Already on this window, no-op.
+    if target_window_id == model.sidebar_window_id {
+        return;
+    }
+
+    debug!(target = %target_window_id, "previewing window");
+
+    // Record original state if starting fresh preview.
+    let (orig_window, orig_home) = match &model.preview {
+        PreviewState::Home => (model.sidebar_window_id.clone(), model.home_pane_id.clone()),
+        PreviewState::Previewing {
+            original_window_id,
+            original_home_pane_id,
+        } => (original_window_id.clone(), original_home_pane_id.clone()),
+    };
+
+    // suppress 2 events: join-pane + select-window.
+    model.ignore_window_changes = 2;
+    model.pending_internal_focus_window = Some(target_window_id.clone());
+
+    // Query phase: find join target.
+    // Always target the leftmost pane so sidebar stays at far left.
+    let target_leftmost =
+        choose_leftmost_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id).await;
+    let target_home =
+        choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id).await;
+    let join_target = if target_leftmost.is_empty() {
+        model.error_message = Some("preview: could not resolve leftmost pane".to_string());
+        queue.push_front(Cmd::Render);
+        return;
+    } else {
+        target_leftmost
+    };
+
+    // Save target window's layout before sidebar joins (for future restoration).
+    save_window_layout(model, tmux, &target_window_id).await;
+    let leaving_window = model.sidebar_window_id.clone();
+
+    // Action phase: batch all visual tmux operations into a single
+    // command so tmux processes them in one server tick (no flicker).
+    // -l 30 sets sidebar width at join time to avoid intermediate resize.
+    let batch = format!(
+        "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
+        model.sidebar_pane_id, join_target, target_window_id, model.sidebar_pane_id,
+    );
+
+    if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
+        warn!(%err, "preview batch failed");
+        clear_internal_window_change_suppression(model);
+        model.error_message = Some(format!("preview: {err}"));
+        queue.push_front(Cmd::Render);
+        return;
+    }
+
+    // Restore leaving window's pane layout when we have an exact
+    // "without sidebar" snapshot.
+    let had_saved_layout = model.pane_layouts.contains_key(&leaving_window);
+    restore_window_layout(model, tmux, &leaving_window).await;
+    if !had_saved_layout {
+        // No exact snapshot yet (typically startup window).
+        // Persist current post-move layout as baseline for next switch.
+        save_window_layout(model, tmux, &leaving_window).await;
+    }
+
+    // Resolve home pane if needed (query after move).
+    let new_home = if !target_home.is_empty() {
+        target_home
+    } else {
+        choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id).await
+    };
+
+    if !new_home.is_empty() {
+        model.home_pane_id = new_home;
+    }
+
+    debug!(
+        sidebar_window = %target_window_id,
+        home_pane = %model.home_pane_id,
+        orig_window = %orig_window,
+        "preview active"
+    );
+
+    model.sidebar_window_id = target_window_id;
+    model.pending_preview_id = None;
+    model.preview = PreviewState::Previewing {
+        original_window_id: orig_window,
+        original_home_pane_id: orig_home,
+    };
+    // Suppress %output for next 2 polls to discard pane redraw noise.
+    model.ai_output_suppress = 2;
+    queue.push_front(Cmd::CheckBorder);
+}
+
+async fn handle_restore_preview<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    queue: &mut VecDeque<Cmd>,
+) {
+    if let PreviewState::Previewing {
+        ref original_window_id,
+        ref original_home_pane_id,
+    } = model.preview
+    {
+        let orig_window = original_window_id.clone();
+        let orig_home = original_home_pane_id.clone();
+
+        debug!(orig_window = %orig_window, "restoring preview");
+
+        // Suppress session-window-changed events from join-pane + select-window.
+        model.ignore_window_changes = 2;
+        model.pending_internal_focus_window = Some(orig_window.clone());
+
+        // Save orig_window's layout before sidebar re-joins it.
+        save_window_layout(model, tmux, &orig_window).await;
+        let leaving_window = model.sidebar_window_id.clone();
+
+        // Always target the leftmost pane so sidebar stays at far left.
+        let orig_leftmost =
+            choose_leftmost_pane_in_window(tmux, &orig_window, &model.sidebar_pane_id).await;
+
+        // Batch: join sidebar back + switch + focus.
+        if orig_leftmost.is_empty() {
+            model.error_message =
+                Some("restore preview: could not resolve leftmost pane".to_string());
+            queue.push_front(Cmd::Render);
+            return;
+        }
+        let batch = format!(
+            "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
+            model.sidebar_pane_id, orig_leftmost, orig_window, model.sidebar_pane_id,
+        );
+
+        let restored = if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
+            warn!(%err, "restore batch failed, trying fallback");
+            // Fallback: retry join to leftmost pane (re-query, because pane IDs may have changed).
+            let fallback_leftmost =
+                choose_leftmost_pane_in_window(tmux, &orig_window, &model.sidebar_pane_id).await;
+            if fallback_leftmost.is_empty() {
+                warn!("restore fallback: no leftmost pane available");
+                false
+            } else {
+                let fallback = format!(
+                    "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
+                    model.sidebar_pane_id, fallback_leftmost, orig_window, model.sidebar_pane_id,
+                );
+                if let Err(err) = send_batch_with_reconcile(model, tmux, &fallback).await {
+                    warn!(%err, "restore fallback batch also failed");
+                    false
+                } else {
+                    true
+                }
+            }
+        } else {
+            true
+        };
+
+        // Restore leaving window's pane layout after batch.
+        if restored {
+            let had_saved_layout = model.pane_layouts.contains_key(&leaving_window);
+            restore_window_layout(model, tmux, &leaving_window).await;
+            if !had_saved_layout {
+                save_window_layout(model, tmux, &leaving_window).await;
+            }
+        }
+
+        if restored {
+            model.sidebar_window_id = orig_window.clone();
+            // Re-detect home pane: orig_home may be stale (e.g. pane
+            // was closed), especially after the fallback path.
+            let fresh_home =
+                choose_home_pane_in_window(tmux, &model.sidebar_window_id, &model.sidebar_pane_id)
+                    .await;
+            model.home_pane_id = if fresh_home.is_empty() {
+                orig_home
+            } else {
+                fresh_home
+            };
+            model.preview = PreviewState::Home;
+        } else {
+            // Keep reconciled runtime state from failed batch attempts.
+            clear_internal_window_change_suppression(model);
+            if model.sidebar_window_id == orig_window {
+                model.preview = PreviewState::Home;
+            }
+            model.error_message = Some("restore preview failed; state reconciled".to_string());
+        }
+        // Discard %output events from pane redraw during window switch.
+        model.ai_output_counts.clear();
+        queue.push_front(Cmd::CheckBorder);
+    }
+}
+
+async fn handle_focus_right_pane<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    queue: &mut VecDeque<Cmd>,
+) {
+    debug!("focusing right pane");
+    if let Err(err) = tmux.send_command("select-pane -R").await {
+        warn!(%err, "select-pane -R failed");
+        model.error_message = Some(format!("select-pane: {err}"));
+        queue.push_front(Cmd::Render);
+    }
+}
+
+async fn handle_new_window<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    queue: &mut VecDeque<Cmd>,
+    name: String,
+) {
+    debug!(name, "creating new window");
+    let new_cmd = format!(
+        "new-window -d -n {} -P -F '#{{window_id}}'",
+        quote_tmux(&name)
+    );
+    match tmux.send_command(&new_cmd).await {
+        Ok(output) => {
+            let window_id = output.trim();
+            if !window_id.is_empty() {
+                let disable_rename = format!(
+                    "set-window-option -t {} automatic-rename off ; set-window-option -t {} allow-rename off",
+                    window_id, window_id
+                );
+                if let Err(err) = tmux.send_command(&disable_rename).await {
+                    warn!(
+                        id = %window_id,
+                        name = %name,
+                        %err,
+                        "failed to disable rename updates for new window"
+                    );
+                } else {
+                    debug!(id = %window_id, "disabled automatic/allow-rename for new window");
+                }
+
+                model.pending_renames.insert(
+                    window_id.to_string(),
+                    PendingRename {
+                        target_name: name.clone(),
+                        observed_count: 0,
+                    },
+                );
+                model.pending_rename_last_window_id = Some(window_id.to_string());
+                debug!(
+                    id = %window_id,
+                    name = %name,
+                    "tracking new window for rename stabilization"
+                );
+                queue.push_front(Cmd::Render);
+                queue.push_front(Cmd::PreviewWindow {
+                    id: window_id.to_string(),
+                });
+                queue.push_front(Cmd::ListWindows);
+            } else {
+                warn!("new-window returned empty window id");
+            }
+        }
+        Err(err) => {
+            warn!(%err, "new-window failed");
+            model.error_message = Some(format!("new-window: {err}"));
+            queue.push_front(Cmd::Render);
+        }
+    }
+}
+
+async fn handle_rename_window<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    queue: &mut VecDeque<Cmd>,
+    id: String,
+    name: String,
+) {
+    debug!(id, name, "renaming window");
+    let disable_rename = format!(
+        "set-window-option -t {} automatic-rename off ; set-window-option -t {} allow-rename off",
+        id, id
+    );
+    if let Err(err) = tmux.send_command(&disable_rename).await {
+        warn!(%id, %err, "failed to disable automatic-rename before rename");
+    } else {
+        debug!(%id, "disabled rename options before rename");
+    }
+    let cmd_str = format!("rename-window -t {} {}", id, quote_tmux(&name));
+    if let Err(err) = tmux.send_command(&cmd_str).await {
+        warn!(%err, "rename-window failed");
+        model.error_message = Some(format!("rename-window: {err}"));
+        queue.push_front(Cmd::Render);
+    } else {
+        if let Err(err) = tmux.send_command(&disable_rename).await {
+            warn!(
+                %id,
+                %err,
+                "failed to keep rename updates disabled after rename"
+            );
+        } else {
+            debug!(%id, "kept rename options disabled after rename");
+        }
+        queue.push_front(Cmd::ListWindows);
+    }
+}
+
+async fn handle_close_window<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    queue: &mut VecDeque<Cmd>,
+    id: String,
+) {
+    // Never kill the window hosting the sidebar.
+    if model.sidebar_window_id == id {
+        match &model.preview {
+            PreviewState::Previewing { .. } => {
+                if model.close_restore_attempted {
+                    // Circuit breaker: already tried restore once, don't loop.
+                    model.close_restore_attempted = false;
+                    warn!(
+                        id,
+                        "close-after-restore failed, refusing to close sidebar window"
+                    );
+                    model.error_message = Some("cannot close: sidebar stuck in window".to_string());
+                    queue.push_front(Cmd::Render);
+                    return;
+                }
+                model.close_restore_attempted = true;
+                debug!(id, "closing previewed window, restoring first");
+                queue.push_front(Cmd::CloseWindow { id });
+                queue.push_front(Cmd::RestorePreview);
+                return;
+            }
+            PreviewState::Home => {
+                if model.close_restore_attempted {
+                    model.close_restore_attempted = false;
+                    warn!(
+                        id,
+                        "close-after-evacuate failed, refusing to close sidebar window"
+                    );
+                    model.error_message = Some("cannot close: sidebar stuck in window".to_string());
+                    queue.push_front(Cmd::Render);
+                    return;
+                }
+                // Find another window to evacuate sidebar to.
+                if let Some(other_id) = model.find_another_window_id(&id) {
+                    model.close_restore_attempted = true;
+                    debug!(id, other = %other_id, "evacuating sidebar before close");
+                    queue.push_front(Cmd::CloseWindow { id });
+                    queue.push_front(Cmd::FollowToWindow {
+                        window_id: other_id,
+                    });
+                    return;
+                } else {
+                    warn!(id, "no other window to evacuate sidebar to");
+                    model.error_message = Some("cannot close last window".to_string());
+                    queue.push_front(Cmd::Render);
+                    return;
+                }
+            }
+        }
+    }
+
+    model.close_restore_attempted = false;
+    debug!(id, "closing window");
+    let cmd_str = format!("kill-window -t {id}");
+    if let Err(err) = tmux.send_command(&cmd_str).await {
+        warn!(%err, "kill-window failed");
+        model.error_message = Some(format!("kill-window: {err}"));
+        queue.push_front(Cmd::Render);
+    } else {
+        model.pane_layouts.remove(&id);
+        // Proactively refresh — don't rely solely on %window-close notification.
+        queue.push_front(Cmd::ListWindows);
+    }
+}
+
+async fn handle_follow_to_window<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    queue: &mut VecDeque<Cmd>,
+    target_window_id: String,
+) {
+    if target_window_id == model.sidebar_window_id {
+        return;
+    }
+
+    info!(target = %target_window_id, "following to window");
+
+    // suppress 1 event: join-pane only (no select-window in follow path).
+    model.ignore_window_changes = 1;
+    model.pending_internal_focus_window = Some(target_window_id.clone());
+
+    // Query phase.
+    // Always target the leftmost pane so sidebar stays at far left.
+    let target_leftmost =
+        choose_leftmost_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id).await;
+    let target_home =
+        choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id).await;
+    let join_target = if target_leftmost.is_empty() {
+        model.error_message = Some("follow: could not resolve leftmost pane".to_string());
+        queue.push_front(Cmd::Render);
+        return;
+    } else {
+        target_leftmost
+    };
+
+    // Save target window's layout before sidebar joins.
+    save_window_layout(model, tmux, &target_window_id).await;
+    let leaving_window = model.sidebar_window_id.clone();
+
+    // Action phase: batch join.
+    let batch = format!(
+        "join-pane -dfhb -l 30 -s {} -t {}",
+        model.sidebar_pane_id, join_target,
+    );
+
+    if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
+        warn!(%err, "follow batch failed");
+        clear_internal_window_change_suppression(model);
+        model.error_message = Some(format!("follow: {err}"));
+        queue.push_front(Cmd::Render);
+        return;
+    }
+
+    // Restore leaving window's pane layout.
+    let had_saved_layout = model.pane_layouts.contains_key(&leaving_window);
+    restore_window_layout(model, tmux, &leaving_window).await;
+    if !had_saved_layout {
+        save_window_layout(model, tmux, &leaving_window).await;
+    }
+
+    // Resolve home pane.
+    let new_home = if !target_home.is_empty() {
+        target_home
+    } else {
+        choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id).await
+    };
+
+    if !new_home.is_empty() {
+        model.home_pane_id = new_home;
+    }
+
+    debug!(
+        sidebar_window = %target_window_id,
+        home_pane = %model.home_pane_id,
+        "follow complete"
+    );
+    model.sidebar_window_id = target_window_id;
+    // Suppress %output for next 2 polls to discard pane redraw noise.
+    model.ai_output_suppress = 2;
+    queue.push_front(Cmd::CheckBorder);
+}
+
+async fn ensure_sidebar_width<T: TmuxApi>(model: &Model, tmux: &mut T) {
+    // Query current width to avoid unnecessary resize.
+    // Spurious resize-pane causes SIGWINCH on the right pane,
+    // making the cursor jump/flicker in the user's work area.
+    let width_cmd = format!(
+        "display-message -t {} -p '#{{pane_width}}'",
+        model.sidebar_pane_id
+    );
+    let needs_resize = match tmux.send_command(&width_cmd).await {
+        Ok(output) => output.trim().parse::<u16>().unwrap_or(0) != 30,
+        Err(_) => true, // can't check, try resize anyway
+    };
+    if needs_resize {
+        if let Err(err) = tmux
+            .send_command(&format!("resize-pane -t {} -x 30", model.sidebar_pane_id))
+            .await
+        {
+            warn!(%err, "ensure resize-pane failed");
+        }
+    }
+}
+
+async fn validate_sidebar_panes<T: TmuxApi>(
+    model: &Model,
+    tmux: &mut T,
+    queue: &mut VecDeque<Cmd>,
+) {
+    let pane_list = tmux
+        .send_command(&format!(
+            "list-panes -t {} -F '#{{pane_id}}'",
+            model.sidebar_window_id
+        ))
+        .await
+        .unwrap_or_default();
+
+    let has_content = pane_list
+        .lines()
+        .map(|l| l.trim())
+        .any(|l| !l.is_empty() && l != model.sidebar_pane_id);
+
+    if !has_content {
+        debug!(
+            window = %model.sidebar_window_id,
+            "sidebar window lost all content panes, evacuating"
+        );
+        match &model.preview {
+            PreviewState::Previewing { .. } => {
+                queue.push_front(Cmd::ListWindows);
+                queue.push_front(Cmd::RestorePreview);
+            }
+            PreviewState::Home => {
+                let sidebar_wid = model.sidebar_window_id.clone();
+                if let Some(other_id) = model.find_another_window_id(&sidebar_wid) {
+                    queue.push_front(Cmd::ListWindows);
+                    queue.push_front(Cmd::FollowToWindow {
+                        window_id: other_id,
+                    });
+                }
+            }
+        }
+    }
+}
+
+async fn handle_list_windows<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    queue: &mut VecDeque<Cmd>,
+) {
+    match tmux.list_windows().await {
+        Ok(windows) => {
+            debug!(count = windows.len(), "refreshed window list");
+            for window in &windows {
+                if window.id == model.sidebar_window_id {
+                    continue;
+                }
+                if !model.pane_layouts.contains_key(&window.id) {
+                    save_window_layout(model, tmux, &window.id).await;
+                }
+            }
+            model
+                .pane_layouts
+                .retain(|id, _| windows.iter().any(|w| w.id == *id));
+            let follow_up = update(model, Msg::WindowListLoaded(windows));
+            for c in follow_up.into_iter().rev() {
+                queue.push_front(c);
+            }
+        }
+        Err(err) => {
+            warn!(%err, "list-windows failed");
+            model.error_message = Some(format!("list-windows: {err}"));
+            queue.push_front(Cmd::Render);
+        }
+    }
+}
+
+async fn poll_ai_processes<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue: &mut VecDeque<Cmd>) {
+    // If suppressing output after window switch, discard counts.
+    if model.ai_output_suppress > 0 {
+        model.ai_output_suppress -= 1;
+        model.ai_output_counts.clear();
+    }
+    let list_cmd = format!(
+        "list-panes -s -t {} -F '#{{window_id}}\t#{{pane_id}}\t#{{pane_current_command}}\t#{{pane_pid}}'",
+        model.session_name
+    );
+    match tmux.send_command(&list_cmd).await {
+        Ok(output) => {
+            let candidates = find_ai_pane_candidates(&output, &model.sidebar_pane_id);
+            let (panes, windows) = classify_active_panes(
+                &candidates,
+                &mut model.ai_cpu_tracker,
+                &mut model.ai_output_counts,
+            );
+            let follow_up = update(model, Msg::AiProcessPollResult { panes, windows });
+            for c in follow_up.into_iter().rev() {
+                queue.push_front(c);
+            }
+        }
+        Err(err) => {
+            debug!(%err, "ai process poll failed");
+        }
+    }
+}
+
+async fn check_border<T: TmuxApi>(model: &mut Model, tmux: &mut T) {
+    let wanted: HashSet<String> = model.ai_panes.clone();
+    let current = &model.highlighted_panes;
+
+    // Collect all border changes and batch into a single tmux command
+    // to minimize server round-trips and reduce cursor flicker.
+    let to_remove: Vec<String> = current.difference(&wanted).cloned().collect();
+    let to_add: Vec<String> = wanted.difference(current).cloned().collect();
+
+    if !to_remove.is_empty() || !to_add.is_empty() {
+        let mut parts: Vec<String> = Vec::new();
+        for pane_id in &to_remove {
+            parts.push(format!(
+                "set-option -p -t {} -u pane-border-format",
+                pane_id
+            ));
+            debug!(pane = %pane_id, "pane border format reset");
+        }
+        for pane_id in &to_add {
+            parts.push(format!(
+                "set-option -p -t {} pane-border-format \" #{{?pane_active,#[fg=yellow#,bold]● #P: #{{pane_current_command}} #{{pane_current_path}},#[fg=yellow]● #P: #{{pane_current_command}}}} \"",
+                pane_id
+            ));
+            debug!(pane = %pane_id, "pane border format set to AI active");
+        }
+        let batch = parts.join(" ; ");
+        let _ = tmux.send_command(&batch).await;
+    }
+
+    model.highlighted_panes = wanted;
+}
+
+async fn reset_all_borders<T: TmuxApi>(model: &mut Model, tmux: &mut T) {
+    for pane_id in model.highlighted_panes.drain() {
+        let reset_cmd = format!("set-option -p -t {} -u pane-border-format", pane_id);
+        let _ = tmux.send_command(&reset_cmd).await;
+        debug!(pane = %pane_id, "pane border format reset on cleanup");
+    }
+}
+
+fn render_model(model: &mut Model, terminal: &mut AppTerminal) {
+    if let Err(err) = terminal.draw(|f| render(model, f)) {
+        model.error_message = Some(format!("render: {err}"));
+    }
 }
 
 fn clear_internal_window_change_suppression(model: &mut Model) {
