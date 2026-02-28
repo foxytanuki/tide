@@ -15,6 +15,7 @@ use crate::update::update;
 use crate::view::render;
 
 pub type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
+const SIDEBAR_WIDTH_CHARS: u16 = 30;
 
 pub trait TmuxApi {
     fn send_command<'a>(
@@ -249,10 +250,14 @@ async fn handle_preview_window<T: TmuxApi>(
 
     // Action phase: batch all visual tmux operations into a single
     // command so tmux processes them in one server tick (no flicker).
-    // -l 30 sets sidebar width at join time to avoid intermediate resize.
+    // -l {SIDEBAR_WIDTH_CHARS} sets sidebar width at join time to avoid intermediate resize.
     let batch = format!(
-        "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
-        model.sidebar_pane_id, join_target, target_window_id, model.sidebar_pane_id,
+        "join-pane -dfhb -l {} -s {} -t {} ; select-window -t {} ; select-pane -t {}",
+        SIDEBAR_WIDTH_CHARS,
+        model.sidebar_pane_id,
+        join_target,
+        target_window_id,
+        model.sidebar_pane_id,
     );
 
     if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
@@ -337,8 +342,12 @@ async fn handle_restore_preview<T: TmuxApi>(
             return;
         }
         let batch = format!(
-            "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
-            model.sidebar_pane_id, orig_leftmost, orig_window, model.sidebar_pane_id,
+            "join-pane -dfhb -l {} -s {} -t {} ; select-window -t {} ; select-pane -t {}",
+            SIDEBAR_WIDTH_CHARS,
+            model.sidebar_pane_id,
+            orig_leftmost,
+            orig_window,
+            model.sidebar_pane_id,
         );
 
         let restored = if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
@@ -351,8 +360,12 @@ async fn handle_restore_preview<T: TmuxApi>(
                 false
             } else {
                 let fallback = format!(
-                    "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
-                    model.sidebar_pane_id, fallback_leftmost, orig_window, model.sidebar_pane_id,
+                    "join-pane -dfhb -l {} -s {} -t {} ; select-window -t {} ; select-pane -t {}",
+                    SIDEBAR_WIDTH_CHARS,
+                    model.sidebar_pane_id,
+                    fallback_leftmost,
+                    orig_window,
+                    model.sidebar_pane_id,
                 );
                 if let Err(err) = send_batch_with_reconcile(model, tmux, &fallback).await {
                     warn!(%err, "restore fallback batch also failed");
@@ -617,8 +630,8 @@ async fn handle_follow_to_window<T: TmuxApi>(
 
     // Action phase: batch join.
     let batch = format!(
-        "join-pane -dfhb -l 30 -s {} -t {}",
-        model.sidebar_pane_id, join_target,
+        "join-pane -dfhb -l {} -s {} -t {}",
+        SIDEBAR_WIDTH_CHARS, model.sidebar_pane_id, join_target,
     );
 
     if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
@@ -667,12 +680,15 @@ async fn ensure_sidebar_width<T: TmuxApi>(model: &Model, tmux: &mut T) {
         model.sidebar_pane_id
     );
     let needs_resize = match tmux.send_command(&width_cmd).await {
-        Ok(output) => output.trim().parse::<u16>().unwrap_or(0) != 30,
+        Ok(output) => output.trim().parse::<u16>().unwrap_or(0) != SIDEBAR_WIDTH_CHARS,
         Err(_) => true, // can't check, try resize anyway
     };
     if needs_resize {
         if let Err(err) = tmux
-            .send_command(&format!("resize-pane -t {} -x 30", model.sidebar_pane_id))
+            .send_command(&format!(
+                "resize-pane -t {} -x {}",
+                model.sidebar_pane_id, SIDEBAR_WIDTH_CHARS
+            ))
             .await
         {
             warn!(%err, "ensure resize-pane failed");
