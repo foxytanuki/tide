@@ -157,8 +157,15 @@ impl TmuxControl {
         let waiters_for_task = Arc::clone(&waiters);
         let reader_task = tokio::spawn(async move {
             let mut in_progress: Option<String> = None;
+            // Coalesced "resync needed" marker when non-output events arrive
+            // while the channel is full. We retry delivery each loop.
+            let mut pending_resync_event = false;
 
             loop {
+                if !flush_pending_resync_event(&event_tx, &mut pending_resync_event) {
+                    break;
+                }
+
                 let line = match line_rx.recv().await {
                     Some(line) => line,
                     None => break,
@@ -225,7 +232,7 @@ impl TmuxControl {
                 if let Some(data) = in_progress.as_mut() {
                     if line.starts_with('%') {
                         if let Some(event) = parse_line(&line) {
-                            if !send_event(&event_tx, event).await {
+                            if !send_event(&event_tx, event, &mut pending_resync_event) {
                                 break;
                             }
                             continue;
@@ -240,7 +247,7 @@ impl TmuxControl {
                 // Outside a response block, %-prefixed lines are events
                 if line.starts_with('%') {
                     if let Some(event) = parse_line(&line) {
-                        if !send_event(&event_tx, event).await {
+                        if !send_event(&event_tx, event, &mut pending_resync_event) {
                             break;
                         }
                     }
@@ -411,13 +418,41 @@ fn open_pty() -> Result<(std::fs::File, std::fs::File)> {
     }
 }
 
-/// Send an event through the channel.  PaneOutput events are best-effort
-/// (try_send) to avoid backpressure from high-frequency streaming output
-/// stalling %begin/%end processing and command responses.  All other
-/// events use blocking send.  Returns false when the channel is closed.
-async fn send_event(
+/// Retry a deferred coalesced resync event (`SessionChanged("", "")`).
+/// Returns false when the channel is closed.
+fn flush_pending_resync_event(
+    tx: &mpsc::Sender<super::TmuxEvent>,
+    pending_resync_event: &mut bool,
+) -> bool {
+    if !*pending_resync_event {
+        return true;
+    }
+
+    match tx.try_send(super::TmuxEvent::SessionChanged(
+        String::new(),
+        String::new(),
+    )) {
+        Ok(()) => {
+            *pending_resync_event = false;
+            true
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
+/// Send an event through the channel.
+/// - PaneOutput is best-effort and dropped on backpressure.
+/// - Non-output events are never silently dropped: if the channel is full we
+///   set a deferred coalesced resync marker, later emitted as
+///   `SessionChanged(\"\", \"\")` to trigger a full ListWindows refresh.
+///   This avoids blocking reader progress while preserving eventual consistency.
+///
+/// Returns false when the channel is closed.
+fn send_event(
     tx: &mpsc::Sender<super::TmuxEvent>,
     event: super::TmuxEvent,
+    pending_resync_event: &mut bool,
 ) -> bool {
     if matches!(event, super::TmuxEvent::PaneOutput(_)) {
         // Best-effort: drop if channel is full rather than blocking.
@@ -431,7 +466,12 @@ async fn send_event(
         match tx.try_send(event) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!("tmux event channel full, dropping non-output event");
+                if !*pending_resync_event {
+                    *pending_resync_event = true;
+                    tracing::warn!(
+                        "tmux event channel full; deferring coalesced session resync event"
+                    );
+                }
                 true // drop, keep going
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
@@ -474,4 +514,55 @@ fn parse_window_line(line: &str) -> Result<WindowInfo> {
         name,
         active,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn pane_output_is_dropped_when_channel_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(super::super::TmuxEvent::WindowAdd("@1".to_string()))
+            .expect("prefill channel");
+
+        let mut pending_resync = false;
+        let ok = send_event(
+            &tx,
+            super::super::TmuxEvent::PaneOutput("%9".to_string()),
+            &mut pending_resync,
+        );
+        assert!(ok);
+        assert!(!pending_resync);
+
+        let evt = rx.try_recv().expect("expected prefilled event");
+        assert_eq!(evt, super::super::TmuxEvent::WindowAdd("@1".to_string()));
+    }
+
+    #[test]
+    fn non_output_full_channel_defers_coalesced_resync() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(super::super::TmuxEvent::WindowAdd("@1".to_string()))
+            .expect("prefill channel");
+
+        let mut pending_resync = false;
+        let ok = send_event(
+            &tx,
+            super::super::TmuxEvent::WindowClose("@1".to_string()),
+            &mut pending_resync,
+        );
+        assert!(ok);
+        assert!(pending_resync);
+
+        let _ = rx.try_recv().expect("expected prefilled event");
+        assert!(flush_pending_resync_event(&tx, &mut pending_resync));
+        assert!(!pending_resync);
+
+        let evt = rx.try_recv().expect("expected deferred resync event");
+        assert_eq!(
+            evt,
+            super::super::TmuxEvent::SessionChanged(String::new(), String::new())
+        );
+    }
 }

@@ -364,7 +364,7 @@ async fn main() -> Result<()> {
 
 async fn detect_sidebar_context(tmux: &mut TmuxControl) -> Result<(String, String, String)> {
     let sidebar_pane_id = env::var("TMUX_PANE")
-        .context("TMUX_PANE not set; tmuxide must run inside a tmux pane")?;
+        .context("TMUX_PANE not set; tide must run inside a tmux pane")?;
     if sidebar_pane_id.is_empty() {
         anyhow::bail!("TMUX_PANE is empty");
     }
