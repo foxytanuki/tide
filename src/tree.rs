@@ -43,48 +43,32 @@ pub fn build_tree(windows: &[WindowInfo]) -> Vec<TreeNode> {
 
     for window in windows {
         if let Some((folder_name, remainder)) = split_folder_name(&window.name) {
-            let folder_index = if let Some(&idx) = folder_positions.get(folder_name) {
-                idx
-            } else {
-                let idx = roots.len();
-                roots.push(TreeNode::Folder {
-                    name: folder_name.to_string(),
-                    children: Vec::new(),
-                    expanded: true,
-                });
-                folder_positions.insert(folder_name.to_string(), idx);
-                idx
-            };
+            let folder_index = ensure_folder_index(
+                &mut roots,
+                &mut folder_positions,
+                folder_name.to_string(),
+                folder_name,
+            );
 
             if let Some(TreeNode::Folder { children, .. }) = roots.get_mut(folder_index) {
                 // Check for second-level folder: folder:subfolder:tab
                 if let Some((subfolder_name, leaf_name)) = split_folder_name(remainder) {
                     let sub_key = format!("{}:{}", folder_name, subfolder_name);
-                    let sub_index = if let Some(&idx) = folder_positions.get(&sub_key) {
-                        idx
-                    } else {
-                        let idx = children.len();
-                        children.push(TreeNode::Folder {
-                            name: subfolder_name.to_string(),
-                            children: Vec::new(),
-                            expanded: true,
-                        });
-                        folder_positions.insert(sub_key, idx);
-                        idx
-                    };
+                    let sub_index = ensure_folder_index(
+                        children,
+                        &mut folder_positions,
+                        sub_key,
+                        subfolder_name,
+                    );
                     if let Some(TreeNode::Folder {
                         children: sub_children,
                         ..
                     }) = children.get_mut(sub_index)
                     {
-                        let mut child_info = window.clone();
-                        child_info.name = leaf_name.to_string();
-                        sub_children.push(TreeNode::Window { info: child_info });
+                        push_window_leaf(sub_children, window, leaf_name);
                     }
                 } else {
-                    let mut child_info = window.clone();
-                    child_info.name = remainder.to_string();
-                    children.push(TreeNode::Window { info: child_info });
+                    push_window_leaf(children, window, remainder);
                 }
             }
         } else {
@@ -95,6 +79,32 @@ pub fn build_tree(windows: &[WindowInfo]) -> Vec<TreeNode> {
     }
 
     roots
+}
+
+fn ensure_folder_index(
+    nodes: &mut Vec<TreeNode>,
+    folder_positions: &mut HashMap<String, usize>,
+    key: String,
+    display_name: &str,
+) -> usize {
+    if let Some(&idx) = folder_positions.get(&key) {
+        idx
+    } else {
+        let idx = nodes.len();
+        nodes.push(TreeNode::Folder {
+            name: display_name.to_string(),
+            children: Vec::new(),
+            expanded: true,
+        });
+        folder_positions.insert(key, idx);
+        idx
+    }
+}
+
+fn push_window_leaf(nodes: &mut Vec<TreeNode>, window: &WindowInfo, leaf_name: &str) {
+    let mut child_info = window.clone();
+    child_info.name = leaf_name.to_string();
+    nodes.push(TreeNode::Window { info: child_info });
 }
 
 pub fn flatten(nodes: &[TreeNode]) -> Vec<FlatItem> {
