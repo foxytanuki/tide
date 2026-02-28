@@ -237,42 +237,7 @@ async fn main() -> Result<()> {
                 };
                 debug!(?tmux_event, "received tmux event");
 
-                let cmds = match tmux_event {
-                    TmuxEvent::WindowAdd(_) | TmuxEvent::WindowClose(_) => {
-                        update(&mut model, Msg::WindowChanged)
-                    }
-                    TmuxEvent::WindowRenamed(window_id, name) => {
-                        update(&mut model, Msg::WindowRenamed { window_id, name })
-                    }
-                    TmuxEvent::SessionWindowChanged(ref sid, window_id)
-                        if *sid == model.session_id =>
-                    {
-                        update(&mut model, Msg::WindowFocusChanged(window_id))
-                    }
-                    TmuxEvent::LayoutChange(window_id)
-                        if window_id == model.sidebar_window_id =>
-                    {
-                        vec![Cmd::EnsureSidebarWidth, Cmd::ValidateSidebarPanes]
-                    }
-                    TmuxEvent::LayoutChange(_) => Vec::new(),
-                    TmuxEvent::SessionWindowChanged(_, _) => Vec::new(),
-                    TmuxEvent::SessionChanged(_, _) => vec![Cmd::ListWindows],
-                    TmuxEvent::PaneOutput(pane_id) => {
-                        // Hot-path exception: update output counter directly
-                        // instead of going through Msg→update→Cmd cycle.
-                        // %output fires at very high frequency during streaming;
-                        // routing through TEA would create unnecessary overhead.
-                        // Skip sidebar pane's own output to avoid self-triggering.
-                        if pane_id != model.sidebar_pane_id {
-                            *model.ai_output_counts.entry(pane_id).or_insert(0) += 1;
-                        }
-                        Vec::new()
-                    }
-                    TmuxEvent::Error(err) => {
-                        model.error_message = Some(err);
-                        vec![Cmd::Render]
-                    }
-                };
+                let cmds = process_tmux_event(&mut model, tmux_event);
 
                 if !cmds.is_empty() && !execute_commands(&mut model, &mut tmux, &mut terminal, cmds).await {
                     break;
@@ -476,6 +441,39 @@ fn process_ui_event(model: &mut Model, evt: Event) -> Vec<Cmd> {
             _ => Vec::new(),
         },
         _ => Vec::new(),
+    }
+}
+
+fn process_tmux_event(model: &mut Model, tmux_event: TmuxEvent) -> Vec<Cmd> {
+    match tmux_event {
+        TmuxEvent::WindowAdd(_) | TmuxEvent::WindowClose(_) => update(model, Msg::WindowChanged),
+        TmuxEvent::WindowRenamed(window_id, name) => {
+            update(model, Msg::WindowRenamed { window_id, name })
+        }
+        TmuxEvent::SessionWindowChanged(ref sid, window_id) if *sid == model.session_id => {
+            update(model, Msg::WindowFocusChanged(window_id))
+        }
+        TmuxEvent::LayoutChange(window_id) if window_id == model.sidebar_window_id => {
+            vec![Cmd::EnsureSidebarWidth, Cmd::ValidateSidebarPanes]
+        }
+        TmuxEvent::LayoutChange(_) => Vec::new(),
+        TmuxEvent::SessionWindowChanged(_, _) => Vec::new(),
+        TmuxEvent::SessionChanged(_, _) => vec![Cmd::ListWindows],
+        TmuxEvent::PaneOutput(pane_id) => {
+            // Hot-path exception: update output counter directly
+            // instead of going through Msg→update→Cmd cycle.
+            // %output fires at very high frequency during streaming;
+            // routing through TEA would create unnecessary overhead.
+            // Skip sidebar pane's own output to avoid self-triggering.
+            if pane_id != model.sidebar_pane_id {
+                *model.ai_output_counts.entry(pane_id).or_insert(0) += 1;
+            }
+            Vec::new()
+        }
+        TmuxEvent::Error(err) => {
+            model.error_message = Some(err);
+            vec![Cmd::Render]
+        }
     }
 }
 
