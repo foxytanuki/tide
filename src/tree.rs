@@ -60,19 +60,18 @@ pub fn build_tree(windows: &[WindowInfo]) -> Vec<TreeNode> {
                 // Check for second-level folder: folder:subfolder:tab
                 if let Some((subfolder_name, leaf_name)) = split_folder_name(remainder) {
                     let sub_key = format!("{}:{}", folder_name, subfolder_name);
-                    let sub_index =
-                        if let Some(&idx) = folder_positions.get(&sub_key) {
-                            idx
-                        } else {
-                            let idx = children.len();
-                            children.push(TreeNode::Folder {
-                                name: subfolder_name.to_string(),
-                                children: Vec::new(),
-                                expanded: true,
-                            });
-                            folder_positions.insert(sub_key, idx);
-                            idx
-                        };
+                    let sub_index = if let Some(&idx) = folder_positions.get(&sub_key) {
+                        idx
+                    } else {
+                        let idx = children.len();
+                        children.push(TreeNode::Folder {
+                            name: subfolder_name.to_string(),
+                            children: Vec::new(),
+                            expanded: true,
+                        });
+                        folder_positions.insert(sub_key, idx);
+                        idx
+                    };
                     if let Some(TreeNode::Folder {
                         children: sub_children,
                         ..
@@ -444,10 +443,7 @@ mod tests {
 
     #[test]
     fn expand_to_window_by_id_expands_path() {
-        let mut tree = build_tree(&[
-            w("@1", 1, "proj:edit"),
-            w("@2", 2, "solo"),
-        ]);
+        let mut tree = build_tree(&[w("@1", 1, "proj:edit"), w("@2", 2, "solo")]);
 
         assert!(expand_to_window_by_id(tree.as_mut_slice(), "@1"));
 
@@ -474,9 +470,7 @@ mod tests {
         assert_eq!(tree.len(), 2); // folder "proj" + window "solo"
 
         match &tree[0] {
-            TreeNode::Folder {
-                name, children, ..
-            } => {
+            TreeNode::Folder { name, children, .. } => {
                 assert_eq!(name, "proj");
                 assert_eq!(children.len(), 2); // subfolder "sub" + window "main"
 
@@ -531,10 +525,7 @@ mod tests {
 
     #[test]
     fn find_window_in_nested_folder() {
-        let tree = build_tree(&[
-            w("@1", 1, "proj:sub:edit"),
-            w("@2", 2, "solo"),
-        ]);
+        let tree = build_tree(&[w("@1", 1, "proj:sub:edit"), w("@2", 2, "solo")]);
         let flat = flatten(&tree);
 
         assert_eq!(find_window_flat_index_by_id(&flat, &tree, "@1"), Some(2));
@@ -542,10 +533,7 @@ mod tests {
 
     #[test]
     fn expand_to_window_in_nested_folder() {
-        let mut tree = build_tree(&[
-            w("@1", 1, "proj:sub:edit"),
-            w("@2", 2, "solo"),
-        ]);
+        let mut tree = build_tree(&[w("@1", 1, "proj:sub:edit"), w("@2", 2, "solo")]);
 
         // Collapse both levels
         if let TreeNode::Folder {

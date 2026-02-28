@@ -140,7 +140,8 @@ async fn choose_leftmost_pane_in_window<T: TmuxApi>(
 
         match &best {
             Some((best_left, best_top, _))
-                if pane_left > *best_left || (pane_left == *best_left && pane_top >= *best_top) => {}
+                if pane_left > *best_left || (pane_left == *best_left && pane_top >= *best_top) => {
+            }
             _ => best = Some((pane_left, pane_top, pane_id.to_string())),
         }
     }
@@ -199,17 +200,15 @@ pub async fn execute_commands<T: TmuxApi>(
 
                 // Query phase: find join target
                 // Always target the leftmost pane so sidebar stays at far left.
-                let target_leftmost = choose_leftmost_pane_in_window(
-                    tmux,
-                    &target_window_id,
-                    &model.sidebar_pane_id,
-                )
-                .await;
+                let target_leftmost =
+                    choose_leftmost_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id)
+                        .await;
                 let target_home =
                     choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id)
                         .await;
                 let join_target = if target_leftmost.is_empty() {
-                    model.error_message = Some("preview: could not resolve leftmost pane".to_string());
+                    model.error_message =
+                        Some("preview: could not resolve leftmost pane".to_string());
                     queue.push_front(Cmd::Render);
                     continue;
                 } else {
@@ -225,9 +224,7 @@ pub async fn execute_commands<T: TmuxApi>(
                 // -l 30 sets sidebar width at join time to avoid intermediate resize.
                 let batch = format!(
                     "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
-                    model.sidebar_pane_id, join_target,
-                    target_window_id,
-                    model.sidebar_pane_id,
+                    model.sidebar_pane_id, join_target, target_window_id, model.sidebar_pane_id,
                 );
 
                 if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
@@ -297,12 +294,9 @@ pub async fn execute_commands<T: TmuxApi>(
                     let leaving_window = model.sidebar_window_id.clone();
 
                     // Always target the leftmost pane so sidebar stays at far left.
-                    let orig_leftmost = choose_leftmost_pane_in_window(
-                        tmux,
-                        &orig_window,
-                        &model.sidebar_pane_id,
-                    )
-                    .await;
+                    let orig_leftmost =
+                        choose_leftmost_pane_in_window(tmux, &orig_window, &model.sidebar_pane_id)
+                            .await;
 
                     // Batch: join sidebar back + switch + focus
                     if orig_leftmost.is_empty() {
@@ -316,7 +310,9 @@ pub async fn execute_commands<T: TmuxApi>(
                         model.sidebar_pane_id, orig_leftmost, orig_window, model.sidebar_pane_id,
                     );
 
-                    let restored = if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
+                    let restored = if let Err(err) =
+                        send_batch_with_reconcile(model, tmux, &batch).await
+                    {
                         warn!(%err, "restore batch failed, trying fallback");
                         // Fallback: retry join to leftmost pane (re-query, because pane IDs may have changed).
                         let fallback_leftmost = choose_leftmost_pane_in_window(
@@ -329,16 +325,18 @@ pub async fn execute_commands<T: TmuxApi>(
                             warn!("restore fallback: no leftmost pane available");
                             false
                         } else {
-                        let fallback = format!(
+                            let fallback = format!(
                             "join-pane -dfhb -l 30 -s {} -t {} ; select-window -t {} ; select-pane -t {}",
                             model.sidebar_pane_id, fallback_leftmost, orig_window, model.sidebar_pane_id,
                         );
-                        if let Err(err) = send_batch_with_reconcile(model, tmux, &fallback).await {
-                            warn!(%err, "restore fallback batch also failed");
-                            false
-                        } else {
-                            true
-                        }
+                            if let Err(err) =
+                                send_batch_with_reconcile(model, tmux, &fallback).await
+                            {
+                                warn!(%err, "restore fallback batch also failed");
+                                false
+                            } else {
+                                true
+                            }
                         }
                     } else {
                         true
@@ -465,10 +463,7 @@ pub async fn execute_commands<T: TmuxApi>(
                     model.error_message = Some(format!("rename-window: {err}"));
                     queue.push_front(Cmd::Render);
                 } else {
-                    if let Err(err) = tmux
-                        .send_command(&disable_rename)
-                        .await
-                    {
+                    if let Err(err) = tmux.send_command(&disable_rename).await {
                         warn!(
                             %id,
                             %err,
@@ -488,7 +483,10 @@ pub async fn execute_commands<T: TmuxApi>(
                             if model.close_restore_attempted {
                                 // Circuit breaker: already tried restore once, don't loop
                                 model.close_restore_attempted = false;
-                                warn!(id, "close-after-restore failed, refusing to close sidebar window");
+                                warn!(
+                                    id,
+                                    "close-after-restore failed, refusing to close sidebar window"
+                                );
                                 model.error_message =
                                     Some("cannot close: sidebar stuck in window".to_string());
                                 queue.push_front(Cmd::Render);
@@ -503,7 +501,10 @@ pub async fn execute_commands<T: TmuxApi>(
                         PreviewState::Home => {
                             if model.close_restore_attempted {
                                 model.close_restore_attempted = false;
-                                warn!(id, "close-after-evacuate failed, refusing to close sidebar window");
+                                warn!(
+                                    id,
+                                    "close-after-evacuate failed, refusing to close sidebar window"
+                                );
                                 model.error_message =
                                     Some("cannot close: sidebar stuck in window".to_string());
                                 queue.push_front(Cmd::Render);
@@ -514,12 +515,13 @@ pub async fn execute_commands<T: TmuxApi>(
                                 model.close_restore_attempted = true;
                                 debug!(id, other = %other_id, "evacuating sidebar before close");
                                 queue.push_front(Cmd::CloseWindow { id });
-                                queue.push_front(Cmd::FollowToWindow { window_id: other_id });
+                                queue.push_front(Cmd::FollowToWindow {
+                                    window_id: other_id,
+                                });
                                 continue;
                             } else {
                                 warn!(id, "no other window to evacuate sidebar to");
-                                model.error_message =
-                                    Some("cannot close last window".to_string());
+                                model.error_message = Some("cannot close last window".to_string());
                                 queue.push_front(Cmd::Render);
                                 continue;
                             }
@@ -554,17 +556,15 @@ pub async fn execute_commands<T: TmuxApi>(
 
                 // Query phase
                 // Always target the leftmost pane so sidebar stays at far left.
-                let target_leftmost = choose_leftmost_pane_in_window(
-                    tmux,
-                    &target_window_id,
-                    &model.sidebar_pane_id,
-                )
-                .await;
+                let target_leftmost =
+                    choose_leftmost_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id)
+                        .await;
                 let target_home =
                     choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar_pane_id)
                         .await;
                 let join_target = if target_leftmost.is_empty() {
-                    model.error_message = Some("follow: could not resolve leftmost pane".to_string());
+                    model.error_message =
+                        Some("follow: could not resolve leftmost pane".to_string());
                     queue.push_front(Cmd::Render);
                     continue;
                 } else {
@@ -632,10 +632,7 @@ pub async fn execute_commands<T: TmuxApi>(
                 };
                 if needs_resize {
                     if let Err(err) = tmux
-                        .send_command(&format!(
-                            "resize-pane -t {} -x 30",
-                            model.sidebar_pane_id
-                        ))
+                        .send_command(&format!("resize-pane -t {} -x 30", model.sidebar_pane_id))
                         .await
                     {
                         warn!(%err, "ensure resize-pane failed");
@@ -764,10 +761,7 @@ pub async fn execute_commands<T: TmuxApi>(
             }
             Cmd::ResetAllBorders => {
                 for pane_id in model.highlighted_panes.drain() {
-                    let reset_cmd = format!(
-                        "set-option -p -t {} -u pane-border-format",
-                        pane_id
-                    );
+                    let reset_cmd = format!("set-option -p -t {} -u pane-border-format", pane_id);
                     let _ = tmux.send_command(&reset_cmd).await;
                     debug!(pane = %pane_id, "pane border format reset on cleanup");
                 }
@@ -1074,7 +1068,10 @@ fn classify_active_panes(
             );
         }
 
-        prev_cpu.insert(c.pane_id.clone(), (ai_pid, current_cpu, new_polls, new_bursts));
+        prev_cpu.insert(
+            c.pane_id.clone(),
+            (ai_pid, current_cpu, new_polls, new_bursts),
+        );
 
         if is_active {
             active_panes.insert(c.pane_id.clone());
@@ -1143,8 +1140,11 @@ fn read_cpu_ticks_tree(pid: u32) -> Option<u64> {
                 Ok(e) => e.file_name(),
                 Err(_) => continue,
             };
-            let children_path =
-                format!("/proc/{}/task/{}/children", current_pid, tid.to_string_lossy());
+            let children_path = format!(
+                "/proc/{}/task/{}/children",
+                current_pid,
+                tid.to_string_lossy()
+            );
             let children = match std::fs::read_to_string(&children_path) {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -1241,7 +1241,10 @@ mod tests {
         }];
         let mut prev = HashMap::new();
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
-        assert!(!panes.contains("%10"), "first-seen pane should be idle (baseline)");
+        assert!(
+            !panes.contains("%10"),
+            "first-seen pane should be idle (baseline)"
+        );
         assert!(prev.contains_key("%10"), "baseline should be recorded");
     }
 
@@ -1259,7 +1262,10 @@ mod tests {
         prev.insert("%10".to_string(), (99999u32, 50000u64, 0u16, 0u8));
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
-        assert!(!panes.contains("%10"), "CPU alone should never activate (output-primary)");
+        assert!(
+            !panes.contains("%10"),
+            "CPU alone should never activate (output-primary)"
+        );
     }
 
     #[test]
@@ -1276,7 +1282,10 @@ mod tests {
         counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
-        assert!(!panes.contains("%10"), "single burst should not activate first-seen pane");
+        assert!(
+            !panes.contains("%10"),
+            "single burst should not activate first-seen pane"
+        );
         assert!(counts.is_empty(), "counts should be reset after poll");
         let &(_, _, _, bursts) = prev.get("%10").unwrap();
         assert_eq!(bursts, 1, "should have recorded 1 consecutive burst");
@@ -1301,7 +1310,10 @@ mod tests {
         // Second burst — now activate
         counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
-        assert!(panes.contains("%10"), "consecutive bursts should activate pane");
+        assert!(
+            panes.contains("%10"),
+            "consecutive bursts should activate pane"
+        );
         let &(_, _, polls, _) = prev.get("%10").unwrap();
         assert_eq!(polls, 1, "polls should be 1 after activation");
     }
@@ -1321,7 +1333,10 @@ mod tests {
         counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
-        assert!(!panes.contains("%10"), "single burst should not activate idle pane");
+        assert!(
+            !panes.contains("%10"),
+            "single burst should not activate idle pane"
+        );
         let &(_, _, polls, bursts) = prev.get("%10").unwrap();
         assert_eq!(polls, 0, "should stay idle");
         assert_eq!(bursts, 1, "should record 1 consecutive burst");
@@ -1364,14 +1379,20 @@ mod tests {
         }];
         // Was active (polls >= 1), grace is about to expire
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS, 0u8));
+        prev.insert(
+            "%10".to_string(),
+            (99999u32, 50000u64, AI_CPU_GRACE_POLLS, 0u8),
+        );
 
         // Output burst on already-active pane should reset grace (no consecutive requirement)
         let mut counts = HashMap::new();
         counts.insert("%10".to_string(), MIN_OUTPUT_BURST + 10);
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
-        assert!(panes.contains("%10"), "output burst should reset grace timer");
+        assert!(
+            panes.contains("%10"),
+            "output burst should reset grace timer"
+        );
         let &(_, _, polls, _) = prev.get("%10").unwrap();
         assert_eq!(polls, 1, "polls should reset to 1");
     }
@@ -1391,10 +1412,16 @@ mod tests {
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
         // With fake PID, cpu_delta=0, so grace counts down (polls 1→2)
         // But still within grace period
-        assert!(panes.contains("%10"), "should stay active within grace period");
+        assert!(
+            panes.contains("%10"),
+            "should stay active within grace period"
+        );
 
         let &(_, _, polls, _) = prev.get("%10").unwrap();
-        assert_eq!(polls, 2, "polls counter should increment (no CPU activity from fake pid)");
+        assert_eq!(
+            polls, 2,
+            "polls counter should increment (no CPU activity from fake pid)"
+        );
     }
 
     #[test]
@@ -1406,10 +1433,16 @@ mod tests {
         }];
         // polls at grace limit — next poll should demote to idle
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS, 0u8));
+        prev.insert(
+            "%10".to_string(),
+            (99999u32, 50000u64, AI_CPU_GRACE_POLLS, 0u8),
+        );
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
-        assert!(!panes.contains("%10"), "should be idle after grace period expires");
+        assert!(
+            !panes.contains("%10"),
+            "should be idle after grace period expires"
+        );
     }
 
     #[test]
@@ -1424,7 +1457,10 @@ mod tests {
         prev.insert("%10".to_string(), (99999u32, 50000u64, 2u16, 0u8));
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
-        assert!(panes.contains("%10"), "should stay active during thinking (within grace)");
+        assert!(
+            panes.contains("%10"),
+            "should stay active during thinking (within grace)"
+        );
     }
 
     #[test]
@@ -1450,7 +1486,10 @@ mod tests {
         counts.insert("%10".to_string(), MIN_OUTPUT_BURST - 1);
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
-        assert!(!panes.contains("%10"), "low output count should not activate");
+        assert!(
+            !panes.contains("%10"),
+            "low output count should not activate"
+        );
     }
 
     #[test]
@@ -1462,22 +1501,34 @@ mod tests {
         }];
         // Grace fully expired (polls > GRACE)
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS + 1, 0u8));
+        prev.insert(
+            "%10".to_string(),
+            (99999u32, 50000u64, AI_CPU_GRACE_POLLS + 1, 0u8),
+        );
 
         // No streaming — should demote to idle
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
-        assert!(!panes.contains("%10"), "grace-expired pane should demote to idle");
+        assert!(
+            !panes.contains("%10"),
+            "grace-expired pane should demote to idle"
+        );
 
         // Single burst — starts counting but doesn't activate yet
         let mut counts = HashMap::new();
         counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
-        assert!(!panes.contains("%10"), "single burst after grace expiry should not reactivate");
+        assert!(
+            !panes.contains("%10"),
+            "single burst after grace expiry should not reactivate"
+        );
 
         // Second consecutive burst — now reactivate
         counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
-        assert!(panes.contains("%10"), "consecutive bursts should reactivate grace-expired pane");
+        assert!(
+            panes.contains("%10"),
+            "consecutive bursts should reactivate grace-expired pane"
+        );
     }
 
     #[test]
@@ -1496,10 +1547,16 @@ mod tests {
         counts.insert("%10".to_string(), 1u32);
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
-        assert!(panes.contains("%10"), "any output should sustain grace period");
+        assert!(
+            panes.contains("%10"),
+            "any output should sustain grace period"
+        );
 
         let &(_, _, polls, _) = prev.get("%10").unwrap();
-        assert_eq!(polls, 1, "polls should reset to 1 when output sustains grace");
+        assert_eq!(
+            polls, 1,
+            "polls should reset to 1 when output sustains grace"
+        );
     }
 
     #[test]
@@ -1511,10 +1568,16 @@ mod tests {
         }];
         // Start at grace limit — no output, no CPU → should expire
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, AI_CPU_GRACE_POLLS, 0u8));
+        prev.insert(
+            "%10".to_string(),
+            (99999u32, 50000u64, AI_CPU_GRACE_POLLS, 0u8),
+        );
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
-        assert!(!panes.contains("%10"), "no output + no CPU should let grace expire");
+        assert!(
+            !panes.contains("%10"),
+            "no output + no CPU should let grace expire"
+        );
     }
 
     #[test]
@@ -1524,7 +1587,10 @@ mod tests {
         // but we can verify it works on our own process
         let pid = std::process::id();
         let result = read_cpu_ticks(pid);
-        assert!(result.is_some(), "should be able to read own process CPU ticks");
+        assert!(
+            result.is_some(),
+            "should be able to read own process CPU ticks"
+        );
     }
 
     #[test]
@@ -1532,7 +1598,10 @@ mod tests {
         let pid = std::process::id();
         let single = read_cpu_ticks(pid).unwrap();
         let tree = read_cpu_ticks_tree(pid).unwrap();
-        assert!(tree >= single, "tree CPU ({tree}) should be >= single process CPU ({single})");
+        assert!(
+            tree >= single,
+            "tree CPU ({tree}) should be >= single process CPU ({single})"
+        );
     }
 
     #[test]

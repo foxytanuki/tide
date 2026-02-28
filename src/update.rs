@@ -200,7 +200,10 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             }
 
             for stale_id in stale_pending_ids {
-                debug!(id = stale_id.as_str(), "pending rename stale (missing) and cleared");
+                debug!(
+                    id = stale_id.as_str(),
+                    "pending rename stale (missing) and cleared"
+                );
                 model.pending_renames.remove(&stale_id);
                 if model.pending_rename_last_window_id.as_deref() == Some(stale_id.as_str()) {
                     model.pending_rename_last_window_id = None;
@@ -271,9 +274,9 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             }
             // Expire old entries
             let before_len = model.recently_finished_ai.len();
-            model
-                .recently_finished_ai
-                .retain(|_, finished_at| now.duration_since(*finished_at) < RECENTLY_FINISHED_TIMEOUT);
+            model.recently_finished_ai.retain(|_, finished_at| {
+                now.duration_since(*finished_at) < RECENTLY_FINISHED_TIMEOUT
+            });
             if model.recently_finished_ai.len() != before_len {
                 recently_changed = true;
             }
@@ -831,9 +834,7 @@ fn collect_window_names_inner(nodes: &[TreeNode], prefix: Option<&str>) -> Vec<S
                 };
                 names.push(name);
             }
-            TreeNode::Folder {
-                name, children, ..
-            } => {
+            TreeNode::Folder { name, children, .. } => {
                 let full_prefix = match prefix {
                     Some(p) => format!("{}:{}", p, name),
                     None => name.clone(),
@@ -877,8 +878,7 @@ fn determine_new_window_name(model: &Model) -> String {
                 let generated = next_tab_name(&existing, Some(folder));
                 debug!(
                     cursor = model.cursor(),
-                    generated,
-                    "new window name from pending rename context"
+                    generated, "new window name from pending rename context"
                 );
                 return generated;
             }
@@ -892,8 +892,7 @@ fn determine_new_window_name(model: &Model) -> String {
                 let generated = next_tab_name(&existing, Some(&folder_full));
                 debug!(
                     cursor = model.cursor(),
-                    generated,
-                    "new window name from folder"
+                    generated, "new window name from folder"
                 );
                 generated
             } else {
@@ -904,14 +903,12 @@ fn determine_new_window_name(model: &Model) -> String {
         FlatNodeKind::Window => {
             if let Some(parent_idx) = find_parent_folder(model.flat_items(), model.cursor()) {
                 if let Some(parent_item) = model.flat_items().get(parent_idx) {
-                    let parent_full =
-                        reconstruct_folder_full_name(model, &parent_item.path);
+                    let parent_full = reconstruct_folder_full_name(model, &parent_item.path);
                     if !parent_full.is_empty() {
                         let generated = next_tab_name(&existing, Some(&parent_full));
                         debug!(
                             cursor = model.cursor(),
-                            generated,
-                            "new window name from parent folder"
+                            generated, "new window name from parent folder"
                         );
                         return generated;
                     }
@@ -947,10 +944,7 @@ fn find_folder_by_path<'a>(tree: &'a [TreeNode], path: &str) -> Option<&'a TreeN
     for part in &parts {
         let mut found = false;
         for node in nodes {
-            if let TreeNode::Folder {
-                name, children, ..
-            } = node
-            {
+            if let TreeNode::Folder { name, children, .. } = node {
                 if name == part {
                     target = Some(node);
                     nodes = children;
@@ -980,9 +974,7 @@ fn collect_folder_children_recursive(
                 };
                 out.push((info.id.clone(), suffix));
             }
-            TreeNode::Folder {
-                name, children, ..
-            } => {
+            TreeNode::Folder { name, children, .. } => {
                 let new_prefix = match prefix {
                     Some(p) => format!("{}:{}", p, name),
                     None => name.clone(),
@@ -1122,10 +1114,7 @@ mod tests {
     #[test]
     fn new_window_on_folder_gets_prefix() {
         let mut model = test_model();
-        let windows = vec![
-            wi("@1", 1, "proj:edit"),
-            wi("@2", 2, "proj:term"),
-        ];
+        let windows = vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "proj:term")];
         update(&mut model, Msg::WindowListLoaded(windows));
         // expanded folder is skipped, cursor lands on first child
         assert_eq!(model.cursor(), 1);
@@ -1145,10 +1134,7 @@ mod tests {
     #[test]
     fn new_window_on_child_gets_prefix() {
         let mut model = test_model();
-        let windows = vec![
-            wi("@1", 1, "proj:edit"),
-            wi("@2", 2, "proj:term"),
-        ];
+        let windows = vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "proj:term")];
         update(&mut model, Msg::WindowListLoaded(windows));
         // move cursor to child window (index 1 = proj/edit)
         model.set_cursor(1);
@@ -1159,10 +1145,7 @@ mod tests {
     #[test]
     fn new_window_on_root_window_is_plain() {
         let mut model = test_model();
-        let windows = vec![
-            wi("@1", 1, "proj:edit"),
-            wi("@2", 2, "scratch"),
-        ];
+        let windows = vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "scratch")];
         update(&mut model, Msg::WindowListLoaded(windows));
         // flat: [0]=folder "proj", [1]=window "edit", [2]=window "scratch"
         model.set_cursor(2);
@@ -1187,10 +1170,7 @@ mod tests {
     #[test]
     fn new_window_name_uses_full_pending_nested_folder_path() {
         let mut model = test_model();
-        let windows = vec![
-            wi("@1", 1, "proj:sub:tab1"),
-            wi("@2", 2, "scratch"),
-        ];
+        let windows = vec![wi("@1", 1, "proj:sub:tab1"), wi("@2", 2, "scratch")];
         update(&mut model, Msg::WindowListLoaded(windows));
         // flat: [0]=proj [1]=sub [2]=tab1 [3]=scratch
         model.set_cursor(2);
@@ -1209,10 +1189,7 @@ mod tests {
     #[test]
     fn renaming_nested_window_to_same_name_is_noop() {
         let mut model = test_model();
-        let windows = vec![
-            wi("@1", 1, "proj:sub:edit"),
-            wi("@2", 2, "scratch"),
-        ];
+        let windows = vec![wi("@1", 1, "proj:sub:edit"), wi("@2", 2, "scratch")];
         update(&mut model, Msg::WindowListLoaded(windows));
         model.set_cursor(2);
         model.mode = Mode::Renaming {
@@ -1240,7 +1217,10 @@ mod tests {
         let first = update(&mut model, Msg::WindowFocusChanged("@target".to_string()));
         assert_ensure_only(&first);
         assert_eq!(model.ignore_window_changes, 1);
-        assert_eq!(model.pending_internal_focus_window.as_deref(), Some("@target"));
+        assert_eq!(
+            model.pending_internal_focus_window.as_deref(),
+            Some("@target")
+        );
 
         let second = update(&mut model, Msg::WindowFocusChanged("@target".to_string()));
         assert_ensure_only(&second);
@@ -1269,16 +1249,16 @@ mod tests {
         update(&mut model, Msg::WindowListLoaded(after));
 
         assert_eq!(model.cursor(), 2);
-        assert_eq!(model.selected_window_info().map(|w| w.id.as_str()), Some("@2"));
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@2")
+        );
     }
 
     #[test]
     fn window_list_loaded_preserves_renaming_mode_when_target_exists() {
         let mut model = test_model();
-        let before = vec![
-            wi("@1", 1, "dev"),
-            wi("@2", 2, "scratch"),
-        ];
+        let before = vec![wi("@1", 1, "dev"), wi("@2", 2, "scratch")];
         update(&mut model, Msg::WindowListLoaded(before));
 
         // Cursor can drift for any reason (e.g. async refresh timing), so keep a stale cursor.
@@ -1287,13 +1267,13 @@ mod tests {
             window_id: "@1".to_string(),
         };
 
-        let after = vec![
-            wi("@1", 1, "new:new"),
-            wi("@2", 2, "scratch"),
-        ];
+        let after = vec![wi("@1", 1, "new:new"), wi("@2", 2, "scratch")];
         update(&mut model, Msg::WindowListLoaded(after));
 
-        assert_eq!(model.selected_window_info().map(|w| w.id.as_str()), Some("@1"));
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@1")
+        );
         assert_eq!(model.cursor(), 1);
         // Renaming mode preserved: target window @1 still exists
         assert!(matches!(model.mode, Mode::Renaming { .. }));
@@ -1302,10 +1282,7 @@ mod tests {
     #[test]
     fn window_list_loaded_cancels_renaming_mode_when_target_gone() {
         let mut model = test_model();
-        let before = vec![
-            wi("@1", 1, "dev"),
-            wi("@2", 2, "scratch"),
-        ];
+        let before = vec![wi("@1", 1, "dev"), wi("@2", 2, "scratch")];
         update(&mut model, Msg::WindowListLoaded(before));
 
         model.mode = Mode::Renaming {
@@ -1313,9 +1290,7 @@ mod tests {
         };
 
         // @1 is gone from the new list
-        let after = vec![
-            wi("@2", 2, "scratch"),
-        ];
+        let after = vec![wi("@2", 2, "scratch")];
         update(&mut model, Msg::WindowListLoaded(after));
 
         assert_eq!(model.mode, Mode::Normal);
@@ -1324,10 +1299,7 @@ mod tests {
     #[test]
     fn window_list_loaded_prefers_pending_rename_id_over_cursor() {
         let mut model = test_model();
-        let before = vec![
-            wi("@1", 1, "dev"),
-            wi("@2", 2, "scratch"),
-        ];
+        let before = vec![wi("@1", 1, "dev"), wi("@2", 2, "scratch")];
         update(&mut model, Msg::WindowListLoaded(before));
         model.set_cursor(2);
         model.pending_renames.insert(
@@ -1339,13 +1311,13 @@ mod tests {
         );
         model.pending_rename_last_window_id = Some("@1".to_string());
 
-        let after = vec![
-            wi("@1", 1, "new:new"),
-            wi("@2", 2, "scratch"),
-        ];
+        let after = vec![wi("@1", 1, "new:new"), wi("@2", 2, "scratch")];
         update(&mut model, Msg::WindowListLoaded(after));
 
-        assert_eq!(model.selected_window_info().map(|w| w.id.as_str()), Some("@1"));
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@1")
+        );
         assert_eq!(model.cursor(), 1);
         assert!(model.pending_renames.contains_key("@1"));
     }
@@ -1353,10 +1325,7 @@ mod tests {
     #[test]
     fn new_window_name_uses_pending_rename_folder_when_context_collapses() {
         let mut model = test_model();
-        let windows = vec![
-            wi("@1", 1, "new:old"),
-            wi("@2", 2, "dev"),
-        ];
+        let windows = vec![wi("@1", 1, "new:old"), wi("@2", 2, "dev")];
         update(&mut model, Msg::WindowListLoaded(windows));
         model.set_cursor(1);
         model.pending_renames.insert(
@@ -1374,10 +1343,7 @@ mod tests {
     #[test]
     fn window_list_loaded_keeps_pending_rename_if_target_missing_once() {
         let mut model = test_model();
-        let initial = vec![
-            wi("@1", 1, "new:new"),
-            wi("@2", 2, "dev"),
-        ];
+        let initial = vec![wi("@1", 1, "new:new"), wi("@2", 2, "dev")];
         update(&mut model, Msg::WindowListLoaded(initial));
         model.pending_renames.insert(
             "@1".to_string(),
@@ -1420,10 +1386,7 @@ mod tests {
     #[test]
     fn window_list_loaded_keeps_pending_rename_when_target_name_stable() {
         let mut model = test_model();
-        let initial = vec![
-            wi("@1", 1, "new:new"),
-            wi("@2", 2, "dev"),
-        ];
+        let initial = vec![wi("@1", 1, "new:new"), wi("@2", 2, "dev")];
         update(&mut model, Msg::WindowListLoaded(initial));
         model.pending_renames.insert(
             "@1".to_string(),
@@ -1433,10 +1396,7 @@ mod tests {
             },
         );
 
-        let stable = vec![
-            wi("@1", 1, "new:new"),
-            wi("@2", 2, "dev"),
-        ];
+        let stable = vec![wi("@1", 1, "new:new"), wi("@2", 2, "dev")];
         update(&mut model, Msg::WindowListLoaded(stable));
 
         assert!(model.pending_renames.contains_key("@1"));

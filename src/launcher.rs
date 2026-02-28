@@ -121,14 +121,20 @@ fn ensure_session_exists(session: &str) -> Result<()> {
     // Disable automatic window renaming for the initial window
     let _ = std::process::Command::new("tmux")
         .args([
-            "set-window-option", "-t", &session_target,
-            "automatic-rename", "off",
+            "set-window-option",
+            "-t",
+            &session_target,
+            "automatic-rename",
+            "off",
         ])
         .status();
     let _ = std::process::Command::new("tmux")
         .args([
-            "set-window-option", "-t", &session_target,
-            "allow-rename", "off",
+            "set-window-option",
+            "-t",
+            &session_target,
+            "allow-rename",
+            "off",
         ])
         .status();
     Ok(())

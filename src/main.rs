@@ -83,7 +83,12 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, DisableMouseCapture, CursorShow, LeaveAlternateScreen);
+        let _ = execute!(
+            stdout,
+            DisableMouseCapture,
+            CursorShow,
+            LeaveAlternateScreen
+        );
     }
 }
 
@@ -363,8 +368,8 @@ async fn main() -> Result<()> {
 }
 
 async fn detect_sidebar_context(tmux: &mut TmuxControl) -> Result<(String, String, String)> {
-    let sidebar_pane_id = env::var("TMUX_PANE")
-        .context("TMUX_PANE not set; tide must run inside a tmux pane")?;
+    let sidebar_pane_id =
+        env::var("TMUX_PANE").context("TMUX_PANE not set; tide must run inside a tmux pane")?;
     if sidebar_pane_id.is_empty() {
         anyhow::bail!("TMUX_PANE is empty");
     }

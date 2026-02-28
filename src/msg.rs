@@ -11,7 +11,10 @@ pub enum Msg {
 
     // tmux events (from control mode)
     WindowChanged,
-    WindowRenamed { window_id: String, name: String },
+    WindowRenamed {
+        window_id: String,
+        name: String,
+    },
     WindowListLoaded(Vec<WindowInfo>),
     WindowFocusChanged(String), // window_id
 
@@ -28,7 +31,9 @@ pub enum Msg {
     CloseWindow,
 
     // Mouse events
-    MouseClick { row: u16 },
+    MouseClick {
+        row: u16,
+    },
     MouseScrollUp,
     MouseScrollDown,
 

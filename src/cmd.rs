@@ -1,13 +1,24 @@
 #[derive(Debug, Clone)]
 pub enum Cmd {
     // Preview: swap target window's pane into right slot
-    PreviewWindow { id: String },
+    PreviewWindow {
+        id: String,
+    },
     RestorePreview,
     FocusRightPane,
-    NewWindow { name: String },
-    RenameWindow { id: String, name: String },
-    CloseWindow { id: String },
-    FollowToWindow { window_id: String },
+    NewWindow {
+        name: String,
+    },
+    RenameWindow {
+        id: String,
+        name: String,
+    },
+    CloseWindow {
+        id: String,
+    },
+    FollowToWindow {
+        window_id: String,
+    },
     EnsureSidebarWidth,
     ListWindows,
     /// Check if sidebar window still has content panes; evacuate if not.

@@ -87,9 +87,7 @@ impl TmuxControl {
                             );
                         }
                         match master_clone.read(&mut err_buf) {
-                            Ok(n) => {
-                                String::from_utf8_lossy(&err_buf[..n]).trim().to_string()
-                            }
+                            Ok(n) => String::from_utf8_lossy(&err_buf[..n]).trim().to_string(),
                             Err(_) => String::new(),
                         }
                     }
@@ -148,11 +146,10 @@ impl TmuxControl {
             .context("failed to spawn tmux reader thread")?;
 
         let (event_tx, event_rx) = mpsc::channel::<super::TmuxEvent>(256);
-        let waiters: Arc<Mutex<WaiterState>> =
-            Arc::new(Mutex::new(WaiterState {
-                queue: VecDeque::new(),
-                skip_responses: 0,
-            }));
+        let waiters: Arc<Mutex<WaiterState>> = Arc::new(Mutex::new(WaiterState {
+            queue: VecDeque::new(),
+            skip_responses: 0,
+        }));
 
         let waiters_for_task = Arc::clone(&waiters);
         let reader_task = tokio::spawn(async move {

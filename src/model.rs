@@ -146,7 +146,11 @@ impl Model {
         self.cursor = idx;
     }
 
-    pub fn replace_tree_preserve_selection(&mut self, new_tree: Vec<TreeNode>, selected_window_id: Option<&str>) {
+    pub fn replace_tree_preserve_selection(
+        &mut self,
+        new_tree: Vec<TreeNode>,
+        selected_window_id: Option<&str>,
+    ) {
         self.tree = new_tree;
         if let Some(window_id) = selected_window_id {
             expand_to_window_by_id(&mut self.tree, window_id);
@@ -264,7 +268,10 @@ mod tests {
         ];
         let first_tree = build_tree(&first);
         model.replace_tree_preserve_selection(first_tree, Some("@2"));
-        assert_eq!(model.selected_window_info().map(|w| w.id.as_str()), Some("@2"));
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@2")
+        );
         assert_eq!(model.cursor(), 2);
 
         let mut second_tree = build_tree(&[
@@ -278,7 +285,10 @@ mod tests {
 
         model.replace_tree_preserve_selection(second_tree, Some("@2"));
 
-        assert_eq!(model.selected_window_info().map(|w| w.id.as_str()), Some("@2"));
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@2")
+        );
         assert_eq!(model.cursor(), 2);
         assert!(matches!(
             model.flat_items()[model.cursor()].kind,
