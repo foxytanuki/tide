@@ -701,54 +701,7 @@ fn handle_renaming_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
         return cmds;
     }
     match event.code {
-        KeyCode::Enter => {
-            let mode = model.mode.clone();
-            if let Mode::Renaming { window_id } = mode {
-                let new_name = model.input_buffer.trim().to_string();
-                if new_name.is_empty() {
-                    return vec![Cmd::Render];
-                }
-                // Short-circuit if name is unchanged — avoid unnecessary
-                // tmux traffic and pending-rename tracking.
-                // Compare against the full tmux name (folder:child for foldered
-                // windows), not just the leaf name stored in info.name.
-                let already_named = model.flat_items().iter().enumerate().any(|(idx, item)| {
-                    if let Ok(TreeNode::Window { info }) = get_node(model.tree(), &item.path) {
-                        if info.id != window_id {
-                            return false;
-                        }
-                        let full_name = reconstruct_full_name(model, idx, &info.name);
-                        full_name == new_name
-                    } else {
-                        false
-                    }
-                });
-                if already_named {
-                    model.mode = Mode::Normal;
-                    clear_input(model);
-                    return vec![Cmd::Render];
-                }
-                model.mode = Mode::Normal;
-                model.pending_renames.insert(
-                    window_id.clone(),
-                    PendingRename {
-                        target_name: new_name.clone(),
-                        observed_count: 0,
-                    },
-                );
-                model.pending_rename_last_window_id = Some(window_id.clone());
-                clear_input(model);
-                vec![
-                    Cmd::RenameWindow {
-                        id: window_id,
-                        name: new_name,
-                    },
-                    Cmd::Render,
-                ]
-            } else {
-                vec![]
-            }
-        }
+        KeyCode::Enter => handle_renaming_enter(model),
         KeyCode::Esc => exit_to_normal_mode(model),
         _ => vec![],
     }
@@ -762,16 +715,7 @@ fn handle_creating_project_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
         return cmds;
     }
     match event.code {
-        KeyCode::Enter => {
-            let name = model.input_buffer.trim().to_string();
-            if name.is_empty() {
-                return vec![Cmd::Render];
-            }
-            model.mode = Mode::Normal;
-            clear_input(model);
-            let window_name = format!("{}:tab1", name);
-            vec![Cmd::NewWindow { name: window_name }]
-        }
+        KeyCode::Enter => handle_creating_project_enter(model),
         KeyCode::Esc => exit_to_normal_mode(model),
         _ => vec![],
     }
@@ -785,41 +729,7 @@ fn handle_renaming_folder_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
         return cmds;
     }
     match event.code {
-        KeyCode::Enter => {
-            let mode = model.mode.clone();
-            if let Mode::RenamingFolder { folder_name } = mode {
-                let new_name = model.input_buffer.trim().to_string();
-                if new_name.is_empty() || new_name == folder_name {
-                    model.mode = Mode::Normal;
-                    clear_input(model);
-                    return vec![Cmd::Render];
-                }
-                model.mode = Mode::Normal;
-                clear_input(model);
-
-                let children = collect_folder_children(model.tree(), &folder_name);
-                let mut cmds = Vec::new();
-                for (window_id, child_name) in &children {
-                    let full_name = format!("{}:{}", new_name, child_name);
-                    model.pending_renames.insert(
-                        window_id.clone(),
-                        PendingRename {
-                            target_name: full_name.clone(),
-                            observed_count: 0,
-                        },
-                    );
-                    model.pending_rename_last_window_id = Some(window_id.clone());
-                    cmds.push(Cmd::RenameWindow {
-                        id: window_id.clone(),
-                        name: full_name,
-                    });
-                }
-                cmds.push(Cmd::Render);
-                cmds
-            } else {
-                vec![]
-            }
-        }
+        KeyCode::Enter => handle_renaming_folder_enter(model),
         KeyCode::Esc => exit_to_normal_mode(model),
         _ => vec![],
     }
@@ -844,6 +754,98 @@ fn handle_confirm_close_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
             vec![Cmd::Render]
         }
         _ => vec![],
+    }
+}
+
+fn handle_renaming_enter(model: &mut Model) -> Vec<Cmd> {
+    let mode = model.mode.clone();
+    if let Mode::Renaming { window_id } = mode {
+        let new_name = model.input_buffer.trim().to_string();
+        if new_name.is_empty() {
+            return vec![Cmd::Render];
+        }
+        // Short-circuit if name is unchanged — avoid unnecessary
+        // tmux traffic and pending-rename tracking.
+        // Compare against the full tmux name (folder:child for foldered
+        // windows), not just the leaf name stored in info.name.
+        let already_named = model.flat_items().iter().enumerate().any(|(idx, item)| {
+            if let Ok(TreeNode::Window { info }) = get_node(model.tree(), &item.path) {
+                if info.id != window_id {
+                    return false;
+                }
+                let full_name = reconstruct_full_name(model, idx, &info.name);
+                full_name == new_name
+            } else {
+                false
+            }
+        });
+        if already_named {
+            return exit_to_normal_mode(model);
+        }
+        model.mode = Mode::Normal;
+        model.pending_renames.insert(
+            window_id.clone(),
+            PendingRename {
+                target_name: new_name.clone(),
+                observed_count: 0,
+            },
+        );
+        model.pending_rename_last_window_id = Some(window_id.clone());
+        clear_input(model);
+        vec![
+            Cmd::RenameWindow {
+                id: window_id,
+                name: new_name,
+            },
+            Cmd::Render,
+        ]
+    } else {
+        vec![]
+    }
+}
+
+fn handle_creating_project_enter(model: &mut Model) -> Vec<Cmd> {
+    let name = model.input_buffer.trim().to_string();
+    if name.is_empty() {
+        return vec![Cmd::Render];
+    }
+    model.mode = Mode::Normal;
+    clear_input(model);
+    let window_name = format!("{}:tab1", name);
+    vec![Cmd::NewWindow { name: window_name }]
+}
+
+fn handle_renaming_folder_enter(model: &mut Model) -> Vec<Cmd> {
+    let mode = model.mode.clone();
+    if let Mode::RenamingFolder { folder_name } = mode {
+        let new_name = model.input_buffer.trim().to_string();
+        if new_name.is_empty() || new_name == folder_name {
+            return exit_to_normal_mode(model);
+        }
+        model.mode = Mode::Normal;
+        clear_input(model);
+
+        let children = collect_folder_children(model.tree(), &folder_name);
+        let mut cmds = Vec::new();
+        for (window_id, child_name) in &children {
+            let full_name = format!("{}:{}", new_name, child_name);
+            model.pending_renames.insert(
+                window_id.clone(),
+                PendingRename {
+                    target_name: full_name.clone(),
+                    observed_count: 0,
+                },
+            );
+            model.pending_rename_last_window_id = Some(window_id.clone());
+            cmds.push(Cmd::RenameWindow {
+                id: window_id.clone(),
+                name: full_name,
+            });
+        }
+        cmds.push(Cmd::Render);
+        cmds
+    } else {
+        vec![]
     }
 }
 
