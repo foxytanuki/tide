@@ -6,6 +6,7 @@ use tokio::process::Command;
 pub const DEFAULT_SESSION_NAME: &str = "tide";
 const SIDEBAR_WIDTH_CHARS: &str = "30";
 const INITIAL_WINDOW_NAME: &str = "general:tab1";
+const FALLBACK_SESSION_NAME: &str = "main";
 
 /// Determine the target session name from CLI arg, falling back to default.
 pub fn target_session_name() -> String {
@@ -63,7 +64,7 @@ fn launch_from_outside_tmux(session: &str, inner_cmd: &str) -> Result<()> {
 
 pub async fn detect_session_name() -> String {
     if env::var("TMUX").is_err() {
-        return "main".to_string();
+        return FALLBACK_SESSION_NAME.to_string();
     }
 
     match Command::new("tmux")
@@ -74,12 +75,12 @@ pub async fn detect_session_name() -> String {
         Ok(out) if out.status.success() => {
             let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if s.is_empty() {
-                "main".to_string()
+                FALLBACK_SESSION_NAME.to_string()
             } else {
                 s
             }
         }
-        _ => "main".to_string(),
+        _ => FALLBACK_SESSION_NAME.to_string(),
     }
 }
 
