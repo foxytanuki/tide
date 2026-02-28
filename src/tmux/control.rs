@@ -317,10 +317,16 @@ fn read_nonblocking_pty_output(pty_master: &std::fs::File) -> Result<String> {
     use std::os::unix::io::AsRawFd;
 
     let mut err_buf = [0u8; 1024];
-    let mut master_clone = pty_master.try_clone().context("dup pty master for error read")?;
+    let mut master_clone = pty_master
+        .try_clone()
+        .context("dup pty master for error read")?;
     unsafe {
         let flags = libc::fcntl(master_clone.as_raw_fd(), libc::F_GETFL);
-        libc::fcntl(master_clone.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        libc::fcntl(
+            master_clone.as_raw_fd(),
+            libc::F_SETFL,
+            flags | libc::O_NONBLOCK,
+        );
     }
     let msg = match master_clone.read(&mut err_buf) {
         Ok(n) => String::from_utf8_lossy(&err_buf[..n]).trim().to_string(),

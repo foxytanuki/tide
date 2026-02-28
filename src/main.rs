@@ -454,7 +454,9 @@ fn apply_preview_debounce(
     // but the expensive tmux pane-swap waits until input settles.
     if let Some(id) = extract_deferred_preview(cmds) {
         *pending_preview = Some(id);
-        sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(PREVIEW_DEBOUNCE_MS));
+        sleep
+            .as_mut()
+            .reset(tokio::time::Instant::now() + Duration::from_millis(PREVIEW_DEBOUNCE_MS));
     } else if !cmds.is_empty() {
         // Non-cursor action cancels any pending deferred preview.
         *pending_preview = None;
