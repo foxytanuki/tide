@@ -186,52 +186,34 @@ async fn main() -> Result<()> {
             biased;
 
             maybe_ui = ui_rx.recv() => {
-                let Some(evt) = maybe_ui else {
-                    warn!("ui channel closed");
-                    break;
-                };
-
-                let mut cmds = process_ui_batch(&mut model, &mut ui_rx, evt);
-                apply_preview_debounce(
-                    &mut cmds,
+                if !handle_ui_tick(
+                    &mut model,
+                    &mut tmux,
+                    &mut terminal,
+                    &mut ui_rx,
+                    maybe_ui,
                     &mut pending_preview,
                     preview_sleep.as_mut(),
-                );
-
-                if !cmds.is_empty() && !execute_commands(&mut model, &mut tmux, &mut terminal, cmds).await {
+                ).await {
                     break;
                 }
             }
 
             // Debounced preview: fires after cursor movement settles
             () = &mut preview_sleep, if pending_preview.is_some() => {
-                if let Some(id) = pending_preview.take() {
-                    let cmds = vec![Cmd::PreviewWindow { id }];
-                    if !execute_commands(&mut model, &mut tmux, &mut terminal, cmds).await {
-                        break;
-                    }
+                if !handle_preview_tick(&mut model, &mut tmux, &mut terminal, &mut pending_preview).await {
+                    break;
                 }
             }
 
             maybe_tmux = tmux.event_stream().recv() => {
-                let Some(tmux_event) = maybe_tmux else {
-                    warn!("tmux event stream closed");
-                    model.error_message = Some("tmux event stream closed".to_string());
-                    let _ = terminal.draw(|f| render(&model, f));
-                    break;
-                };
-                debug!(?tmux_event, "received tmux event");
-
-                let cmds = process_tmux_event(&mut model, tmux_event);
-
-                if !cmds.is_empty() && !execute_commands(&mut model, &mut tmux, &mut terminal, cmds).await {
+                if !handle_tmux_tick(&mut model, &mut tmux, &mut terminal, maybe_tmux).await {
                     break;
                 }
             }
 
             _ = ai_poll_interval.tick() => {
-                let cmds = vec![Cmd::PollAiProcesses];
-                if !execute_commands(&mut model, &mut tmux, &mut terminal, cmds).await {
+                if !handle_ai_poll_tick(&mut model, &mut tmux, &mut terminal).await {
                     break;
                 }
             }
@@ -443,6 +425,75 @@ fn process_ui_batch(
 
     // Coalesce: keep only the last PreviewWindow, deduplicate Renders.
     coalesce_commands(cmds)
+}
+
+async fn handle_ui_tick(
+    model: &mut Model,
+    tmux: &mut TmuxControl,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ui_rx: &mut mpsc::UnboundedReceiver<Event>,
+    maybe_ui: Option<Event>,
+    pending_preview: &mut Option<String>,
+    preview_sleep: std::pin::Pin<&mut tokio::time::Sleep>,
+) -> bool {
+    let Some(evt) = maybe_ui else {
+        warn!("ui channel closed");
+        return false;
+    };
+
+    let mut cmds = process_ui_batch(model, ui_rx, evt);
+    apply_preview_debounce(&mut cmds, pending_preview, preview_sleep);
+    execute_if_any(model, tmux, terminal, cmds).await
+}
+
+async fn handle_preview_tick(
+    model: &mut Model,
+    tmux: &mut TmuxControl,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    pending_preview: &mut Option<String>,
+) -> bool {
+    if let Some(id) = pending_preview.take() {
+        return execute_commands(model, tmux, terminal, vec![Cmd::PreviewWindow { id }]).await;
+    }
+    true
+}
+
+async fn handle_tmux_tick(
+    model: &mut Model,
+    tmux: &mut TmuxControl,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    maybe_tmux: Option<TmuxEvent>,
+) -> bool {
+    let Some(tmux_event) = maybe_tmux else {
+        warn!("tmux event stream closed");
+        model.error_message = Some("tmux event stream closed".to_string());
+        let _ = terminal.draw(|f| render(model, f));
+        return false;
+    };
+    debug!(?tmux_event, "received tmux event");
+    let cmds = process_tmux_event(model, tmux_event);
+    execute_if_any(model, tmux, terminal, cmds).await
+}
+
+async fn handle_ai_poll_tick(
+    model: &mut Model,
+    tmux: &mut TmuxControl,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> bool {
+    execute_commands(model, tmux, terminal, vec![Cmd::PollAiProcesses]).await
+}
+
+async fn execute_if_any(
+    model: &mut Model,
+    tmux: &mut TmuxControl,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    cmds: Vec<Cmd>,
+) -> bool {
+    if cmds.is_empty() {
+        true
+    } else {
+        execute_commands(model, tmux, terminal, cmds).await
+    }
 }
 
 fn apply_preview_debounce(
