@@ -191,27 +191,12 @@ async fn main() -> Result<()> {
                     break;
                 };
 
-                let mut cmds = process_ui_event(&mut model, evt);
-
-                // Drain all pending UI events to batch rapid input (key repeat)
-                while let Ok(evt) = ui_rx.try_recv() {
-                    cmds.extend(process_ui_event(&mut model, evt));
-                }
-
-                // Coalesce: keep only the last PreviewWindow, deduplicate Renders
-                let mut cmds = coalesce_commands(cmds);
-
-                // Defer preview with debounce — sidebar renders immediately
-                // but the expensive tmux pane-swap waits until input settles.
-                if let Some(id) = extract_deferred_preview(&mut cmds) {
-                    pending_preview = Some(id);
-                    preview_sleep.as_mut().reset(
-                        tokio::time::Instant::now() + Duration::from_millis(PREVIEW_DEBOUNCE_MS),
-                    );
-                } else if !cmds.is_empty() {
-                    // Non-cursor action cancels any pending deferred preview
-                    pending_preview = None;
-                }
+                let mut cmds = process_ui_batch(&mut model, &mut ui_rx, evt);
+                apply_preview_debounce(
+                    &mut cmds,
+                    &mut pending_preview,
+                    preview_sleep.as_mut(),
+                );
 
                 if !cmds.is_empty() && !execute_commands(&mut model, &mut tmux, &mut terminal, cmds).await {
                     break;
@@ -441,6 +426,38 @@ fn process_ui_event(model: &mut Model, evt: Event) -> Vec<Cmd> {
             _ => Vec::new(),
         },
         _ => Vec::new(),
+    }
+}
+
+fn process_ui_batch(
+    model: &mut Model,
+    ui_rx: &mut mpsc::UnboundedReceiver<Event>,
+    first_evt: Event,
+) -> Vec<Cmd> {
+    let mut cmds = process_ui_event(model, first_evt);
+
+    // Drain all pending UI events to batch rapid input (key repeat).
+    while let Ok(evt) = ui_rx.try_recv() {
+        cmds.extend(process_ui_event(model, evt));
+    }
+
+    // Coalesce: keep only the last PreviewWindow, deduplicate Renders.
+    coalesce_commands(cmds)
+}
+
+fn apply_preview_debounce(
+    cmds: &mut Vec<Cmd>,
+    pending_preview: &mut Option<String>,
+    mut sleep: std::pin::Pin<&mut tokio::time::Sleep>,
+) {
+    // Defer preview with debounce — sidebar renders immediately
+    // but the expensive tmux pane-swap waits until input settles.
+    if let Some(id) = extract_deferred_preview(cmds) {
+        *pending_preview = Some(id);
+        sleep.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(PREVIEW_DEBOUNCE_MS));
+    } else if !cmds.is_empty() {
+        // Non-cursor action cancels any pending deferred preview.
+        *pending_preview = None;
     }
 }
 
