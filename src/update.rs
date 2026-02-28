@@ -673,23 +673,7 @@ fn handle_renaming_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
                         if info.id != window_id {
                             return false;
                         }
-                        let full_name = if let Some(parent_idx) =
-                            find_parent_folder(model.flat_items(), idx)
-                        {
-                            if let Some(parent_item) = model.flat_items().get(parent_idx) {
-                                if let Ok(TreeNode::Folder { name, .. }) =
-                                    get_node(model.tree(), &parent_item.path)
-                                {
-                                    format!("{}:{}", name, info.name)
-                                } else {
-                                    info.name.clone()
-                                }
-                            } else {
-                                info.name.clone()
-                            }
-                        } else {
-                            info.name.clone()
-                        };
+                        let full_name = reconstruct_full_name(model, idx, &info.name);
                         full_name == new_name
                     } else {
                         false
@@ -850,7 +834,11 @@ fn collect_window_names_inner(nodes: &[TreeNode], prefix: Option<&str>) -> Vec<S
             TreeNode::Folder {
                 name, children, ..
             } => {
-                names.extend(collect_window_names_inner(children, Some(name)));
+                let full_prefix = match prefix {
+                    Some(p) => format!("{}:{}", p, name),
+                    None => name.clone(),
+                };
+                names.extend(collect_window_names_inner(children, Some(&full_prefix)));
             }
         }
     }
@@ -885,7 +873,7 @@ fn determine_new_window_name(model: &Model) -> String {
 
     if let Some(selected) = model.selected_window_info() {
         if let Some(pending) = model.pending_renames.get(selected.id.as_str()) {
-            if let Some((folder, _)) = pending.target_name.split_once(':') {
+            if let Some((folder, _)) = pending.target_name.rsplit_once(':') {
                 let generated = next_tab_name(&existing, Some(folder));
                 debug!(
                     cursor = model.cursor(),
@@ -1180,6 +1168,67 @@ mod tests {
         model.set_cursor(2);
         let cmds = update(&mut model, Msg::NewWindow);
         assert_new_window_name(&cmds, "tab1");
+    }
+
+    #[test]
+    fn collect_window_names_preserves_nested_folder_paths() {
+        let windows = vec![
+            wi("@1", 1, "proj:sub:edit"),
+            wi("@2", 2, "proj:sub:term"),
+            wi("@3", 3, "scratch"),
+        ];
+        let tree = build_tree(&windows);
+        let names = collect_window_names(&tree);
+        assert!(names.iter().any(|n| n == "proj:sub:edit"));
+        assert!(names.iter().any(|n| n == "proj:sub:term"));
+        assert!(names.iter().any(|n| n == "scratch"));
+    }
+
+    #[test]
+    fn new_window_name_uses_full_pending_nested_folder_path() {
+        let mut model = test_model();
+        let windows = vec![
+            wi("@1", 1, "proj:sub:tab1"),
+            wi("@2", 2, "scratch"),
+        ];
+        update(&mut model, Msg::WindowListLoaded(windows));
+        // flat: [0]=proj [1]=sub [2]=tab1 [3]=scratch
+        model.set_cursor(2);
+        model.pending_renames.insert(
+            "@1".to_string(),
+            PendingRename {
+                target_name: "proj:sub:renamed".to_string(),
+                observed_count: 0,
+            },
+        );
+
+        let cmds = update(&mut model, Msg::NewWindow);
+        assert_new_window_name(&cmds, "proj:sub:tab2");
+    }
+
+    #[test]
+    fn renaming_nested_window_to_same_name_is_noop() {
+        let mut model = test_model();
+        let windows = vec![
+            wi("@1", 1, "proj:sub:edit"),
+            wi("@2", 2, "scratch"),
+        ];
+        update(&mut model, Msg::WindowListLoaded(windows));
+        model.set_cursor(2);
+        model.mode = Mode::Renaming {
+            window_id: "@1".to_string(),
+        };
+        model.input_buffer = "proj:sub:edit".to_string();
+        model.input_cursor = model.input_buffer.chars().count();
+
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert_eq!(model.mode, Mode::Normal);
+        assert!(model.pending_renames.is_empty());
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::Render));
     }
 
     #[test]
