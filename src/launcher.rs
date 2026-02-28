@@ -142,7 +142,7 @@ fn split_sidebar_in_session(session: &str, inner_cmd: &str, detached: bool) -> R
         cmd.arg("-d");
     }
     let status = cmd
-        .args(["-hb", "-l", "30", "--", "sh", "-c", inner_cmd])
+        .args(["-fhb", "-l", "30", "--", "sh", "-c", inner_cmd])
         .status()?;
     if status.success() {
         Ok(())
