@@ -4,6 +4,8 @@ use anyhow::Result;
 use tokio::process::Command;
 
 pub const DEFAULT_SESSION_NAME: &str = "tide";
+const SIDEBAR_WIDTH_CHARS: &str = "30";
+const INITIAL_WINDOW_NAME: &str = "general:tab1";
 
 /// Determine the target session name from CLI arg, falling back to default.
 pub fn target_session_name() -> String {
@@ -32,23 +34,31 @@ pub async fn launch_if_needed() -> Result<()> {
     let inner_cmd = build_sidebar_inner_cmd();
 
     if env::var("TMUX").is_ok() {
-        let current_session = detect_session_name().await;
-        ensure_session_exists(&session)?;
-
-        if current_session != session {
-            split_sidebar_in_session(&session, &inner_cmd, true)?;
-            switch_client_to_session(&session)?;
-            std::process::exit(0);
-        }
-
-        split_sidebar_in_session(&session, &inner_cmd, false)?;
-        std::process::exit(0);
+        return launch_from_inside_tmux(&session, &inner_cmd).await;
     } else {
-        ensure_session_exists(&session)?;
-        split_sidebar_in_session(&session, &inner_cmd, true)?;
-        attach_to_session(&session)?;
+        launch_from_outside_tmux(&session, &inner_cmd)
+    }
+}
+
+async fn launch_from_inside_tmux(session: &str, inner_cmd: &str) -> Result<()> {
+    let current_session = detect_session_name().await;
+    ensure_session_exists(session)?;
+
+    if current_session != session {
+        split_sidebar_in_session(session, inner_cmd, true)?;
+        switch_client_to_session(session)?;
         std::process::exit(0);
     }
+
+    split_sidebar_in_session(session, inner_cmd, false)?;
+    std::process::exit(0);
+}
+
+fn launch_from_outside_tmux(session: &str, inner_cmd: &str) -> Result<()> {
+    ensure_session_exists(session)?;
+    split_sidebar_in_session(session, inner_cmd, true)?;
+    attach_to_session(session)?;
+    std::process::exit(0);
 }
 
 pub async fn detect_session_name() -> String {
@@ -108,9 +118,15 @@ fn ensure_session_exists(session: &str) -> Result<()> {
     if already {
         return Ok(());
     }
-    let initial_window = "general:tab1";
     let status = std::process::Command::new("tmux")
-        .args(["new-session", "-d", "-s", session, "-n", initial_window])
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-n",
+            INITIAL_WINDOW_NAME,
+        ])
         .env_remove("TMUX")
         .status()?;
     if !status.success() {
@@ -148,7 +164,15 @@ fn split_sidebar_in_session(session: &str, inner_cmd: &str, detached: bool) -> R
         cmd.arg("-d");
     }
     let status = cmd
-        .args(["-fhb", "-l", "30", "--", "sh", "-c", inner_cmd])
+        .args([
+            "-fhb",
+            "-l",
+            SIDEBAR_WIDTH_CHARS,
+            "--",
+            "sh",
+            "-c",
+            inner_cmd,
+        ])
         .status()?;
     if status.success() {
         Ok(())

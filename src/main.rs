@@ -35,6 +35,10 @@ use crate::tmux::{TmuxControl, TmuxEvent};
 use crate::update::update;
 use crate::view::render;
 
+const AI_POLL_INTERVAL_MS: u64 = 500;
+const PREVIEW_DEBOUNCE_MS: u64 = 50;
+const INPUT_POLL_MS: u64 = 100;
+
 fn init_logging() {
     use std::sync::Mutex;
     use tracing_subscriber::EnvFilter;
@@ -110,24 +114,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    debug!("connecting to tmux control mode");
-    let mut tmux = match TmuxControl::new(&session_name).await {
-        Ok(t) => {
-            info!("tmux control connected");
-            t
-        }
-        Err(err) => {
-            error!(%err, "tmux control failed");
-            return Err(err);
-        }
-    };
-
-    // Exclude control client from window sizing calculations.
-    // "ignore-size" tells tmux not to use this client for window-size
-    // decisions (tmux 3.4+). We avoid "no-output" because it also
-    // suppresses %output events needed for AI activity detection.
-    // Falls back silently on older tmux versions.
-    let _ = tmux.send_command("refresh-client -f ignore-size").await;
+    let mut tmux = connect_tmux_control(&session_name).await?;
 
     let (sidebar_pane_id, sidebar_window_id, home_pane_id) =
         detect_sidebar_context(&mut tmux).await?;
@@ -148,45 +135,13 @@ async fn main() -> Result<()> {
     );
     model.terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
 
-    // Save existing prefix+f binding before overwriting
-    let prev_f_binding = tmux
-        .send_command("list-keys -T prefix")
-        .await
-        .ok()
-        .and_then(|output| {
-            output
-                .lines()
-                .find(|line| {
-                    line.split_whitespace()
-                        .skip_while(|&w| w != "prefix")
-                        .nth(1)
-                        == Some("f")
-                })
-                .map(|s| s.trim().to_string())
-        });
-
-    // Bind prefix+f to jump back to sidebar pane
-    let _ = tmux
-        .send_command(&format!("bind-key f select-pane -t {}", sidebar_pane_id))
-        .await;
+    let prev_f_binding = capture_prefix_f_binding(&mut tmux).await;
+    bind_prefix_f_to_sidebar(&mut tmux, &sidebar_pane_id).await;
 
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<Event>();
     spawn_input_thread(ui_tx);
 
-    debug!("loading initial window list");
-    let startup_cmds = match tmux.list_windows().await {
-        Ok(windows) => {
-            info!(count = windows.len(), "loaded windows");
-            update(&mut model, Msg::WindowListLoaded(windows))
-        }
-        Err(err) => {
-            error!(%err, "initial list_windows failed");
-            model.error_message = Some(format!("initial list_windows failed: {err}"));
-            vec![Cmd::Render]
-        }
-    };
-
-    if !execute_commands(&mut model, &mut tmux, &mut terminal, startup_cmds).await {
+    if !run_startup_render(&mut model, &mut tmux, &mut terminal).await {
         info!("startup commands requested quit");
         tmux.shutdown().await;
         return Ok(());
@@ -204,9 +159,7 @@ async fn main() -> Result<()> {
         .send_command(&format!("select-pane -t {}", sidebar_pane_id))
         .await;
 
-    // Initial AI process poll (detect immediately without waiting for first tick)
-    let initial_poll = vec![Cmd::PollAiProcesses];
-    if !execute_commands(&mut model, &mut tmux, &mut terminal, initial_poll).await {
+    if !run_initial_ai_poll(&mut model, &mut tmux, &mut terminal).await {
         info!("initial AI poll requested quit");
         tmux.shutdown().await;
         return Ok(());
@@ -214,7 +167,7 @@ async fn main() -> Result<()> {
 
     info!("entering main loop");
 
-    let mut ai_poll_interval = tokio::time::interval(Duration::from_millis(500));
+    let mut ai_poll_interval = tokio::time::interval(Duration::from_millis(AI_POLL_INTERVAL_MS));
     ai_poll_interval.reset(); // skip immediate first tick (we already polled above)
 
     let mut pending_preview: Option<String> = None;
@@ -253,7 +206,7 @@ async fn main() -> Result<()> {
                 if let Some(id) = extract_deferred_preview(&mut cmds) {
                     pending_preview = Some(id);
                     preview_sleep.as_mut().reset(
-                        tokio::time::Instant::now() + Duration::from_millis(50),
+                        tokio::time::Instant::now() + Duration::from_millis(PREVIEW_DEBOUNCE_MS),
                     );
                 } else if !cmds.is_empty() {
                     // Non-cursor action cancels any pending deferred preview
@@ -341,12 +294,7 @@ async fn main() -> Result<()> {
     let cleanup_cmds = vec![Cmd::RestorePreview, Cmd::ResetAllBorders];
     let _ = execute_commands(&mut model, &mut tmux, &mut terminal, cleanup_cmds).await;
 
-    // Restore previous prefix+f binding (or unbind if none existed)
-    if let Some(ref binding) = prev_f_binding {
-        let _ = tmux.send_command(binding).await;
-    } else {
-        let _ = tmux.send_command("unbind-key f").await;
-    }
+    restore_prefix_f_binding(&mut tmux, prev_f_binding.as_deref()).await;
     tmux.shutdown().await;
 
     if restart {
@@ -404,9 +352,91 @@ async fn detect_sidebar_context(tmux: &mut TmuxControl) -> Result<(String, Strin
     Ok((sidebar_pane_id, sidebar_window_id, home_pane_id))
 }
 
+async fn connect_tmux_control(session_name: &str) -> Result<TmuxControl> {
+    debug!("connecting to tmux control mode");
+    let mut tmux = match TmuxControl::new(session_name).await {
+        Ok(t) => {
+            info!("tmux control connected");
+            t
+        }
+        Err(err) => {
+            error!(%err, "tmux control failed");
+            return Err(err);
+        }
+    };
+
+    // Exclude control client from window sizing calculations.
+    // "ignore-size" tells tmux not to use this client for window-size
+    // decisions (tmux 3.4+). We avoid "no-output" because it also
+    // suppresses %output events needed for AI activity detection.
+    // Falls back silently on older tmux versions.
+    let _ = tmux.send_command("refresh-client -f ignore-size").await;
+    Ok(tmux)
+}
+
+async fn capture_prefix_f_binding(tmux: &mut TmuxControl) -> Option<String> {
+    tmux.send_command("list-keys -T prefix")
+        .await
+        .ok()
+        .and_then(|output| {
+            output
+                .lines()
+                .find(|line| {
+                    line.split_whitespace()
+                        .skip_while(|&w| w != "prefix")
+                        .nth(1)
+                        == Some("f")
+                })
+                .map(|s| s.trim().to_string())
+        })
+}
+
+async fn bind_prefix_f_to_sidebar(tmux: &mut TmuxControl, sidebar_pane_id: &str) {
+    let _ = tmux
+        .send_command(&format!("bind-key f select-pane -t {}", sidebar_pane_id))
+        .await;
+}
+
+async fn restore_prefix_f_binding(tmux: &mut TmuxControl, binding: Option<&str>) {
+    if let Some(binding) = binding {
+        let _ = tmux.send_command(binding).await;
+    } else {
+        let _ = tmux.send_command("unbind-key f").await;
+    }
+}
+
+async fn run_startup_render(
+    model: &mut Model,
+    tmux: &mut TmuxControl,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> bool {
+    debug!("loading initial window list");
+    let startup_cmds = match tmux.list_windows().await {
+        Ok(windows) => {
+            info!(count = windows.len(), "loaded windows");
+            update(model, Msg::WindowListLoaded(windows))
+        }
+        Err(err) => {
+            error!(%err, "initial list_windows failed");
+            model.error_message = Some(format!("initial list_windows failed: {err}"));
+            vec![Cmd::Render]
+        }
+    };
+    execute_commands(model, tmux, terminal, startup_cmds).await
+}
+
+async fn run_initial_ai_poll(
+    model: &mut Model,
+    tmux: &mut TmuxControl,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> bool {
+    // Initial AI process poll (detect immediately without waiting for first tick).
+    execute_commands(model, tmux, terminal, vec![Cmd::PollAiProcesses]).await
+}
+
 fn spawn_input_thread(tx: mpsc::UnboundedSender<Event>) {
     std::thread::spawn(move || loop {
-        match event::poll(Duration::from_millis(100)) {
+        match event::poll(Duration::from_millis(INPUT_POLL_MS)) {
             Ok(true) => match event::read() {
                 Ok(ev) => {
                     if tx.send(ev).is_err() {

@@ -784,7 +784,10 @@ async fn poll_ai_processes<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue: &
                 &mut model.ai_cpu_tracker,
                 &mut model.ai_output_counts,
             );
-            enqueue_follow_up(queue, update(model, Msg::AiProcessPollResult { panes, windows }));
+            enqueue_follow_up(
+                queue,
+                update(model, Msg::AiProcessPollResult { panes, windows }),
+            );
         }
         Err(err) => {
             debug!(%err, "ai process poll failed");
