@@ -133,26 +133,8 @@ fn ensure_session_exists(session: &str) -> Result<()> {
         anyhow::bail!("failed to create tmux session '{}'", session);
     }
     let session_target = exact_session_window_target(session);
-
-    // Disable automatic window renaming for the initial window
-    let _ = std::process::Command::new("tmux")
-        .args([
-            "set-window-option",
-            "-t",
-            &session_target,
-            "automatic-rename",
-            "off",
-        ])
-        .status();
-    let _ = std::process::Command::new("tmux")
-        .args([
-            "set-window-option",
-            "-t",
-            &session_target,
-            "allow-rename",
-            "off",
-        ])
-        .status();
+    // Disable automatic window renaming for the initial window.
+    disable_window_rename_options(&session_target);
     Ok(())
 }
 
@@ -202,5 +184,26 @@ fn attach_to_session(session: &str) -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!("failed to attach to session '{}'", session);
+    }
+}
+
+fn disable_window_rename_options(target: &str) {
+    let _ = set_window_option(target, "automatic-rename", "off");
+    let _ = set_window_option(target, "allow-rename", "off");
+}
+
+fn set_window_option(target: &str, option: &str, value: &str) -> Result<()> {
+    let status = std::process::Command::new("tmux")
+        .args(["set-window-option", "-t", target, option, value])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "failed to set window option '{}'='{}' for target '{}'",
+            option,
+            value,
+            target
+        )
     }
 }
