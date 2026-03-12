@@ -46,7 +46,8 @@ async fn launch_from_inside_tmux(session: &str, inner_cmd: &str) -> Result<()> {
     ensure_session_exists(session)?;
 
     if current_session != session {
-        split_sidebar_in_session(session, inner_cmd, true)?;
+        let sidebar_pane = split_sidebar_in_session(session, inner_cmd, true)?;
+        select_pane(&sidebar_pane)?;
         switch_client_to_session(session)?;
         std::process::exit(0);
     }
@@ -57,7 +58,8 @@ async fn launch_from_inside_tmux(session: &str, inner_cmd: &str) -> Result<()> {
 
 fn launch_from_outside_tmux(session: &str, inner_cmd: &str) -> Result<()> {
     ensure_session_exists(session)?;
-    split_sidebar_in_session(session, inner_cmd, true)?;
+    let sidebar_pane = split_sidebar_in_session(session, inner_cmd, true)?;
+    select_pane(&sidebar_pane)?;
     attach_to_session(session)?;
     std::process::exit(0);
 }
@@ -130,28 +132,44 @@ fn ensure_session_exists(session: &str) -> Result<()> {
     Ok(())
 }
 
-fn split_sidebar_in_session(session: &str, inner_cmd: &str, detached: bool) -> Result<()> {
+fn split_sidebar_in_session(session: &str, inner_cmd: &str, detached: bool) -> Result<String> {
     let session_target = exact_session_window_target(session);
     let mut cmd = std::process::Command::new("tmux");
     cmd.arg("split-window").arg("-t").arg(&session_target);
     if detached {
         cmd.arg("-d");
     }
-    let status = cmd
+    let output = cmd
         .args([
             "-fhb",
             "-l",
             SIDEBAR_WIDTH_CHARS,
+            "-P",
+            "-F",
+            "#{pane_id}",
             "--",
             "sh",
             "-c",
             inner_cmd,
         ])
-        .status()?;
+        .output()?;
+    if output.status.success() {
+        let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if pane_id.is_empty() {
+            anyhow::bail!("split sidebar returned empty pane id for session '{}'", session);
+        }
+        Ok(pane_id)
+    } else {
+        anyhow::bail!("failed to split sidebar in session '{}'", session);
+    }
+}
+
+fn select_pane(pane_id: &str) -> Result<()> {
+    let status = tmux_status(&["select-pane", "-t", pane_id])?;
     if status.success() {
         Ok(())
     } else {
-        anyhow::bail!("failed to split sidebar in session '{}'", session);
+        anyhow::bail!("failed to select pane '{}'", pane_id);
     }
 }
 
