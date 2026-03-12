@@ -137,7 +137,10 @@ fn render_tree_item(
     match badge {
         AiBadge::Active if width > 1 => {
             let truncated = truncate(&content, width.saturating_sub(2));
-            let text_width = truncated.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
+            let text_width = truncated
+                .chars()
+                .map(|c| c.width().unwrap_or(0))
+                .sum::<usize>();
             let padding = width.saturating_sub(text_width).saturating_sub(1);
             let line = Line::from(vec![
                 Span::styled(truncated, style),
@@ -148,7 +151,10 @@ fn render_tree_item(
         }
         AiBadge::Finished if width > 1 => {
             let truncated = truncate(&content, width.saturating_sub(2));
-            let text_width = truncated.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
+            let text_width = truncated
+                .chars()
+                .map(|c| c.width().unwrap_or(0))
+                .sum::<usize>();
             let padding = width.saturating_sub(text_width).saturating_sub(1);
             let line = Line::from(vec![
                 Span::styled(truncated, style),
@@ -211,7 +217,7 @@ fn build_footer_text(model: &Model, width: usize) -> String {
     }
 
     match &model.mode {
-        Mode::Normal => truncate("[r]ename [x]close [c]new [C]proj [R]estart", width),
+        Mode::Normal => build_normal_footer_text(width),
         Mode::Renaming { .. } | Mode::RenamingFolder { .. } => {
             let line1 = truncate(&format!("Rename: {}", model.input_buffer), width);
             let line2 = truncate("[enter] ok [esc] cancel", width);
@@ -224,6 +230,43 @@ fn build_footer_text(model: &Model, width: usize) -> String {
         }
         Mode::ConfirmClose { .. } => truncate("Close window? [y/n]", width),
     }
+}
+
+fn build_normal_footer_text(width: usize) -> String {
+    let actions = ["[r]ename", "[x]close", "[c]new", "[C]proj", "[R]estart"];
+    fit_footer_actions(&actions, width)
+}
+
+fn fit_footer_actions(actions: &[&str], width: usize) -> String {
+    if width == 0 || actions.is_empty() {
+        return String::new();
+    }
+
+    let mut shown = Vec::new();
+    let mut used = 0;
+
+    for action in actions {
+        let sep = usize::from(!shown.is_empty());
+        let action_width = display_width(action);
+        if used + sep + action_width > width {
+            break;
+        }
+        if sep == 1 {
+            used += 1;
+        }
+        shown.push(*action);
+        used += action_width;
+    }
+
+    if shown.is_empty() {
+        return truncate(actions[0], width);
+    }
+
+    let mut result = shown.join(" ");
+    if shown.len() < actions.len() && display_width(&result) + 2 <= width {
+        result.push_str(" …");
+    }
+    result
 }
 
 /// Returns the branch character for a window node based on whether it's the last
@@ -300,4 +343,34 @@ fn truncate(input: &str, max_cols: usize) -> String {
         cols += w;
     }
     result
+}
+
+fn display_width(input: &str) -> usize {
+    input.chars().map(|ch| ch.width().unwrap_or(0)).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_normal_footer_text, fit_footer_actions};
+
+    #[test]
+    fn normal_footer_prioritizes_primary_actions_on_narrow_width() {
+        assert_eq!(build_normal_footer_text(25), "[r]ename [x]close [c]new");
+    }
+
+    #[test]
+    fn normal_footer_shows_overflow_marker_when_it_fits() {
+        assert_eq!(
+            fit_footer_actions(&["[r]ename", "[x]close", "[c]new"], 20),
+            "[r]ename [x]close …"
+        );
+    }
+
+    #[test]
+    fn normal_footer_shows_all_actions_when_width_allows() {
+        assert_eq!(
+            build_normal_footer_text(64),
+            "[r]ename [x]close [c]new [C]proj [R]estart"
+        );
+    }
 }
