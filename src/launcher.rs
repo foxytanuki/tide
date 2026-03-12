@@ -5,6 +5,14 @@ use tokio::process::Command;
 
 pub const TIDE_SESSION_NAME: &str = "tide";
 
+fn exact_session_window_target(session: &str) -> String {
+    format!("={session}:")
+}
+
+fn exact_session_target(session: &str) -> String {
+    format!("={session}")
+}
+
 /// If we're not already in the sidebar process, spawn sidebar in tide session and exit.
 /// Returns `Ok(())` if we should continue as the sidebar process.
 pub async fn launch_if_needed() -> Result<()> {
@@ -99,16 +107,18 @@ fn ensure_session_exists(session: &str) -> Result<()> {
     if !status.success() {
         anyhow::bail!("failed to create tmux session '{}'", session);
     }
+    let session_target = exact_session_window_target(session);
+
     // Disable automatic window renaming for the initial window
     let _ = std::process::Command::new("tmux")
         .args([
-            "set-window-option", "-t", session,
+            "set-window-option", "-t", &session_target,
             "automatic-rename", "off",
         ])
         .status();
     let _ = std::process::Command::new("tmux")
         .args([
-            "set-window-option", "-t", session,
+            "set-window-option", "-t", &session_target,
             "allow-rename", "off",
         ])
         .status();
@@ -116,8 +126,9 @@ fn ensure_session_exists(session: &str) -> Result<()> {
 }
 
 fn split_sidebar_in_session(session: &str, inner_cmd: &str, detached: bool) -> Result<()> {
+    let session_target = exact_session_window_target(session);
     let mut cmd = std::process::Command::new("tmux");
-    cmd.arg("split-window").arg("-t").arg(session);
+    cmd.arg("split-window").arg("-t").arg(&session_target);
     if detached {
         cmd.arg("-d");
     }
@@ -132,8 +143,9 @@ fn split_sidebar_in_session(session: &str, inner_cmd: &str, detached: bool) -> R
 }
 
 fn switch_client_to_session(session: &str) -> Result<()> {
+    let session_target = exact_session_target(session);
     let status = std::process::Command::new("tmux")
-        .args(["switch-client", "-t", session])
+        .args(["switch-client", "-t", &session_target])
         .status()?;
     if status.success() {
         Ok(())
@@ -143,8 +155,9 @@ fn switch_client_to_session(session: &str) -> Result<()> {
 }
 
 fn attach_to_session(session: &str) -> Result<()> {
+    let session_target = exact_session_target(session);
     let status = std::process::Command::new("tmux")
-        .args(["attach-session", "-t", session])
+        .args(["attach-session", "-t", &session_target])
         .status()?;
     if status.success() {
         Ok(())

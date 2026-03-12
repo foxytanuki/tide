@@ -6,6 +6,7 @@ tmux session manager with a sidebar-style TUI. Manages windows as a tree (folder
 
 ```bash
 cargo install --path .
+mise run install
 ```
 
 ## Usage

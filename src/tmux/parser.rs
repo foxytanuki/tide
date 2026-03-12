@@ -17,7 +17,20 @@ pub(crate) enum ControlMarker {
     ErrorEnd,
 }
 
+fn strip_control_wrappers(line: &str) -> &str {
+    let line = line
+        .strip_prefix("\u{1b}P1000p")
+        .or_else(|| line.strip_prefix("\u{0090}1000p"))
+        .unwrap_or(line);
+
+    line.strip_suffix("\u{1b}\\")
+        .or_else(|| line.strip_suffix('\u{009c}'))
+        .unwrap_or(line)
+}
+
 pub(crate) fn parse_control_marker(line: &str) -> Option<ControlMarker> {
+    let line = strip_control_wrappers(line);
+
     if line.starts_with("%begin ") {
         return Some(ControlMarker::Begin);
     }
@@ -31,6 +44,8 @@ pub(crate) fn parse_control_marker(line: &str) -> Option<ControlMarker> {
 }
 
 pub fn parse_line(line: &str) -> Option<TmuxEvent> {
+    let line = strip_control_wrappers(line);
+
     if !line.starts_with('%') {
         return None;
     }
@@ -145,7 +160,15 @@ mod tests {
             Some(ControlMarker::Begin)
         );
         assert_eq!(
+            parse_control_marker("\u{1b}P1000p%begin 1234567890 42 0"),
+            Some(ControlMarker::Begin)
+        );
+        assert_eq!(
             parse_control_marker("%end 1234567890 42 0"),
+            Some(ControlMarker::End)
+        );
+        assert_eq!(
+            parse_control_marker("%end 1234567890 42 0\u{1b}\\"),
             Some(ControlMarker::End)
         );
         assert_eq!(
@@ -201,6 +224,17 @@ mod tests {
         assert_eq!(
             parse_line("%extended-output %3 500 : some data here"),
             Some(TmuxEvent::PaneOutput("%3".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_wrapped_control_events() {
+        assert_eq!(
+            parse_line("\u{1b}P1000p%session-changed $1 tide\u{1b}\\"),
+            Some(TmuxEvent::SessionChanged(
+                "$1".to_string(),
+                "tide".to_string()
+            ))
         );
     }
 }
