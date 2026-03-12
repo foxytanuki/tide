@@ -116,8 +116,7 @@ async fn main() -> Result<()> {
 
     let mut tmux = connect_tmux_control(&session_name).await?;
 
-    let (sidebar_pane_id, sidebar_window_id, home_pane_id) =
-        detect_sidebar_context(&mut tmux).await?;
+    let (sidebar_pane_id, sidebar_window_id, home_pane_id) = detect_sidebar_context().await?;
 
     let session_id = tmux
         .send_command("display-message -p '#{session_id}'")
@@ -247,7 +246,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn detect_sidebar_context(tmux: &mut TmuxControl) -> Result<(String, String, String)> {
+async fn detect_sidebar_context() -> Result<(String, String, String)> {
     let sidebar_pane_id =
         env::var("TMUX_PANE").context("TMUX_PANE not set; tide must run inside a tmux pane")?;
     if sidebar_pane_id.is_empty() {
@@ -255,25 +254,26 @@ async fn detect_sidebar_context(tmux: &mut TmuxControl) -> Result<(String, Strin
     }
     debug!(sidebar_pane_id, "detected sidebar pane");
 
-    let sidebar_window_id = tmux
-        .send_command(&format!(
-            "display-message -t {sidebar_pane_id} -p '#{{window_id}}'"
-        ))
+    let sidebar_window_id = tokio::process::Command::new("tmux")
+        .args(["display-message", "-t", &sidebar_pane_id, "-p", "#{window_id}"])
+        .output()
         .await
-        .map(|s| s.trim().to_string())
         .context("failed to detect sidebar window id")?;
+    let sidebar_window_id = String::from_utf8_lossy(&sidebar_window_id.stdout)
+        .trim()
+        .to_string();
     if sidebar_window_id.is_empty() {
         anyhow::bail!("detected empty sidebar window id");
     }
+
     debug!(sidebar_window_id, "detected sidebar window");
 
-    let pane_list = tmux
-        .send_command(&format!(
-            "list-panes -t {sidebar_window_id} -F '#{{pane_id}}'"
-        ))
+    let pane_list = tokio::process::Command::new("tmux")
+        .args(["list-panes", "-t", &sidebar_window_id, "-F", "#{pane_id}"])
+        .output()
         .await
         .context("failed to list panes in sidebar window")?;
-    let home_pane_id = pane_list
+    let home_pane_id = String::from_utf8_lossy(&pane_list.stdout)
         .lines()
         .map(|l| l.trim())
         .find(|l| !l.is_empty() && *l != sidebar_pane_id)
