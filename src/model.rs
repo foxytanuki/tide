@@ -19,41 +19,25 @@ pub struct Model {
     pub restart_requested: bool,
     pub error_message: Option<String>,
     pub info_message: Option<String>,
-    // Preview state
-    pub sidebar_pane_id: String,
+    pub sidebar: SidebarState,
+    pub renames: RenameState,
+    pub ai: AiState,
+    /// Terminal size for mouse hit-testing (width, height).
+    pub terminal_size: (u16, u16),
+}
+
+pub struct SidebarState {
+    pub pane_id: String,
     pub home_pane_id: String,
-    pub sidebar_window_id: String,
+    pub window_id: String,
     pub preview: PreviewState,
     /// Number of internal window-focus notifications to suppress.
     pub ignore_window_changes: u8,
     /// Window ID expected while suppression is active.
     pub pending_internal_focus_window: Option<String>,
-    /// Windows tracked for rename stabilization.
-    pub pending_renames: HashMap<String, PendingRename>,
-    /// Most recent pending-rename target, used to keep selection stable.
-    pub pending_rename_last_window_id: Option<String>,
-    /// Pane IDs currently running AI processes (actively working).
-    pub ai_panes: HashSet<String>,
-    /// Window IDs derived from ai_panes (for sidebar indicator).
-    pub ai_windows: HashSet<String>,
-    /// Pane IDs currently highlighted with AI background.
-    pub highlighted_panes: HashSet<String>,
-    /// AI process CPU tracking for activity detection.
-    /// Maps pane_id → (ai_pid, last_cpu_ticks, polls_since_active, consecutive_bursts).
-    pub ai_cpu_tracker: HashMap<String, (u32, u64, u16, u8)>,
-    /// Count of %output events per pane since last poll (for streaming detection).
-    /// Reset to 0 after each classify_active_panes call.
-    pub ai_output_counts: HashMap<String, u32>,
-    /// Polls to skip %output counts after window switch (pane redraw noise).
-    pub ai_output_suppress: u8,
-    /// Terminal size for mouse hit-testing (width, height).
-    pub terminal_size: (u16, u16),
     /// Circuit breaker: true after attempting RestorePreview before CloseWindow.
     /// Prevents infinite requeue loop if RestorePreview fails persistently.
     pub close_restore_attempted: bool,
-    /// Window IDs where AI recently finished, with completion timestamp.
-    /// Used to show fading badge: ○ (new moon) → disappear after timeout.
-    pub recently_finished_ai: HashMap<String, Instant>,
     /// Saved "without sidebar" window layouts for pane width restoration.
     /// Maps window_id → (terminal_width_at_save, layout_string).
     pub pane_layouts: HashMap<String, (u16, String)>,
@@ -61,6 +45,33 @@ pub struct Model {
     /// Set on cursor movement, cleared when preview actually executes.
     /// Used by view to show the active marker on the correct window during debounce.
     pub pending_preview_id: Option<String>,
+}
+
+pub struct RenameState {
+    /// Windows tracked for rename stabilization.
+    pub pending: HashMap<String, PendingRename>,
+    /// Most recent pending-rename target, used to keep selection stable.
+    pub last_window_id: Option<String>,
+}
+
+pub struct AiState {
+    /// Pane IDs currently running AI processes (actively working).
+    pub panes: HashSet<String>,
+    /// Window IDs derived from ai_panes (for sidebar indicator).
+    pub windows: HashSet<String>,
+    /// Pane IDs currently highlighted with AI background.
+    pub highlighted_panes: HashSet<String>,
+    /// AI process CPU tracking for activity detection.
+    /// Maps pane_id → (ai_pid, last_cpu_ticks, polls_since_active, consecutive_bursts).
+    pub cpu_tracker: HashMap<String, (u32, u64, u16, u8)>,
+    /// Count of %output events per pane since last poll (for streaming detection).
+    /// Reset to 0 after each classify_active_panes call.
+    pub output_counts: HashMap<String, u32>,
+    /// Polls to skip %output counts after window switch (pane redraw noise).
+    pub output_suppress: u8,
+    /// Window IDs where AI recently finished, with completion timestamp.
+    /// Used to show fading badge: ○ (new moon) → disappear after timeout.
+    pub recently_finished: HashMap<String, Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,25 +119,31 @@ impl Model {
             restart_requested: false,
             error_message: None,
             info_message: None,
-            sidebar_pane_id,
-            home_pane_id,
-            sidebar_window_id,
-            preview: PreviewState::Home,
-            ignore_window_changes: 0,
-            pending_internal_focus_window: None,
-            pending_renames: HashMap::new(),
-            pending_rename_last_window_id: None,
-            ai_panes: HashSet::new(),
-            ai_windows: HashSet::new(),
-            highlighted_panes: HashSet::new(),
-            ai_cpu_tracker: HashMap::new(),
-            ai_output_counts: HashMap::new(),
-            ai_output_suppress: 0,
+            sidebar: SidebarState {
+                pane_id: sidebar_pane_id,
+                home_pane_id,
+                window_id: sidebar_window_id,
+                preview: PreviewState::Home,
+                ignore_window_changes: 0,
+                pending_internal_focus_window: None,
+                close_restore_attempted: false,
+                pane_layouts: HashMap::new(),
+                pending_preview_id: None,
+            },
+            renames: RenameState {
+                pending: HashMap::new(),
+                last_window_id: None,
+            },
+            ai: AiState {
+                panes: HashSet::new(),
+                windows: HashSet::new(),
+                highlighted_panes: HashSet::new(),
+                cpu_tracker: HashMap::new(),
+                output_counts: HashMap::new(),
+                output_suppress: 0,
+                recently_finished: HashMap::new(),
+            },
             terminal_size: (80, 24),
-            close_restore_attempted: false,
-            recently_finished_ai: HashMap::new(),
-            pane_layouts: HashMap::new(),
-            pending_preview_id: None,
         }
     }
 

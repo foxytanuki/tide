@@ -28,9 +28,10 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::cmd::Cmd;
-use crate::execute::execute_commands;
+use crate::execute::{execute_commands, AppTerminal};
 use crate::model::Model;
 use crate::msg::Msg;
+use crate::tmux::commands;
 use crate::tmux::{TmuxControl, TmuxEvent};
 use crate::update::update;
 use crate::view::render;
@@ -96,6 +97,154 @@ impl Drop for TerminalGuard {
     }
 }
 
+struct App {
+    model: Model,
+    tmux: TmuxControl,
+    terminal: AppTerminal,
+    ui_rx: mpsc::UnboundedReceiver<Event>,
+    pending_preview: Option<String>,
+}
+
+impl App {
+    async fn bootstrap(session_name: String) -> Result<(Self, Option<String>)> {
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, CursorHide)?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+
+        let mut tmux = connect_tmux_control(&session_name).await?;
+        let (sidebar_pane_id, sidebar_window_id, home_pane_id) = detect_sidebar_context().await?;
+
+        let session_id = tmux
+            .send_command("display-message -p '#{session_id}'")
+            .await
+            .map(|s| s.trim().to_string())
+            .context("failed to detect session id")?;
+        debug!(session_id, "detected session id");
+
+        let mut model = Model::new(
+            session_name,
+            session_id,
+            sidebar_pane_id.clone(),
+            home_pane_id,
+            sidebar_window_id,
+        );
+        model.terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
+
+        let prev_f_binding = capture_prefix_f_binding(&mut tmux).await;
+        bind_prefix_f_to_sidebar(&mut tmux, &sidebar_pane_id).await;
+
+        let (ui_tx, ui_rx) = mpsc::unbounded_channel::<Event>();
+        spawn_input_thread(ui_tx);
+
+        Ok((
+            Self {
+                model,
+                tmux,
+                terminal,
+                ui_rx,
+                pending_preview: None,
+            },
+            prev_f_binding,
+        ))
+    }
+
+    async fn run(&mut self) -> bool {
+        if !run_startup_render(&mut self.model, &mut self.tmux, &mut self.terminal).await {
+            info!("startup commands requested quit");
+            return false;
+        }
+
+        if env::var("TIDE_RESTARTED").is_ok() {
+            env::remove_var("TIDE_RESTARTED");
+            self.model.info_message = Some("restarted".to_string());
+            let _ = self.terminal.draw(|f| render(&self.model, f));
+        }
+
+        let _ = self
+            .tmux
+            .send_command(&commands::select_pane(&self.model.sidebar.pane_id))
+            .await;
+
+        if !run_initial_ai_poll(&mut self.model, &mut self.tmux, &mut self.terminal).await {
+            info!("initial AI poll requested quit");
+            return false;
+        }
+
+        info!("entering main loop");
+
+        let mut ai_poll_interval =
+            tokio::time::interval(Duration::from_millis(AI_POLL_INTERVAL_MS));
+        ai_poll_interval.reset();
+
+        let preview_sleep = tokio::time::sleep(Duration::from_secs(86400));
+        tokio::pin!(preview_sleep);
+
+        loop {
+            if self.model.should_quit {
+                debug!("should_quit is true, exiting");
+                break;
+            }
+
+            tokio::select! {
+                biased;
+
+                maybe_ui = self.ui_rx.recv() => {
+                    if !handle_ui_tick(
+                        &mut self.model,
+                        &mut self.tmux,
+                        &mut self.terminal,
+                        &mut self.ui_rx,
+                        maybe_ui,
+                        &mut self.pending_preview,
+                        preview_sleep.as_mut(),
+                    ).await {
+                        break;
+                    }
+                }
+
+                () = &mut preview_sleep, if self.pending_preview.is_some() => {
+                    if !handle_preview_tick(
+                        &mut self.model,
+                        &mut self.tmux,
+                        &mut self.terminal,
+                        &mut self.pending_preview,
+                    ).await {
+                        break;
+                    }
+                }
+
+                maybe_tmux = self.tmux.event_stream().recv() => {
+                    if !handle_tmux_tick(&mut self.model, &mut self.tmux, &mut self.terminal, maybe_tmux).await {
+                        break;
+                    }
+                }
+
+                _ = ai_poll_interval.tick() => {
+                    if !handle_ai_poll_tick(&mut self.model, &mut self.tmux, &mut self.terminal).await {
+                        break;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    async fn shutdown(&mut self, prev_f_binding: Option<&str>) {
+        let cleanup_cmds = vec![Cmd::RestorePreview, Cmd::ResetAllBorders];
+        let _ = execute_commands(
+            &mut self.model,
+            &mut self.tmux,
+            &mut self.terminal,
+            cleanup_cmds,
+        )
+        .await;
+        restore_prefix_f_binding(&mut self.tmux, prev_f_binding).await;
+        self.tmux.shutdown().await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     launcher::launch_if_needed().await?;
@@ -109,124 +258,10 @@ async fn main() -> Result<()> {
     enable_raw_mode()?;
     let _guard = TerminalGuard;
 
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, CursorHide)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let mut tmux = connect_tmux_control(&session_name).await?;
-
-    let (sidebar_pane_id, sidebar_window_id, home_pane_id) = detect_sidebar_context().await?;
-
-    let session_id = tmux
-        .send_command("display-message -p '#{session_id}'")
-        .await
-        .map(|s| s.trim().to_string())
-        .context("failed to detect session id")?;
-    debug!(session_id, "detected session id");
-
-    let mut model = Model::new(
-        session_name.clone(),
-        session_id,
-        sidebar_pane_id.clone(),
-        home_pane_id,
-        sidebar_window_id,
-    );
-    model.terminal_size = crossterm::terminal::size().unwrap_or((80, 24));
-
-    let prev_f_binding = capture_prefix_f_binding(&mut tmux).await;
-    bind_prefix_f_to_sidebar(&mut tmux, &sidebar_pane_id).await;
-
-    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<Event>();
-    spawn_input_thread(ui_tx);
-
-    if !run_startup_render(&mut model, &mut tmux, &mut terminal).await {
-        info!("startup commands requested quit");
-        tmux.shutdown().await;
-        return Ok(());
-    }
-
-    // Show restart notification
-    if env::var("TIDE_RESTARTED").is_ok() {
-        env::remove_var("TIDE_RESTARTED");
-        model.info_message = Some("restarted".to_string());
-        let _ = terminal.draw(|f| render(&model, f));
-    }
-
-    // Focus sidebar pane on startup
-    let _ = tmux
-        .send_command(&format!("select-pane -t {}", sidebar_pane_id))
-        .await;
-
-    if !run_initial_ai_poll(&mut model, &mut tmux, &mut terminal).await {
-        info!("initial AI poll requested quit");
-        tmux.shutdown().await;
-        return Ok(());
-    }
-
-    info!("entering main loop");
-
-    let mut ai_poll_interval = tokio::time::interval(Duration::from_millis(AI_POLL_INTERVAL_MS));
-    ai_poll_interval.reset(); // skip immediate first tick (we already polled above)
-
-    let mut pending_preview: Option<String> = None;
-    let preview_sleep = tokio::time::sleep(Duration::from_secs(86400));
-    tokio::pin!(preview_sleep);
-
-    loop {
-        if model.should_quit {
-            debug!("should_quit is true, exiting");
-            break;
-        }
-
-        tokio::select! {
-            // Prioritise user input over background tasks so keystrokes
-            // are never starved by AI poll or tmux event processing.
-            biased;
-
-            maybe_ui = ui_rx.recv() => {
-                if !handle_ui_tick(
-                    &mut model,
-                    &mut tmux,
-                    &mut terminal,
-                    &mut ui_rx,
-                    maybe_ui,
-                    &mut pending_preview,
-                    preview_sleep.as_mut(),
-                ).await {
-                    break;
-                }
-            }
-
-            // Debounced preview: fires after cursor movement settles
-            () = &mut preview_sleep, if pending_preview.is_some() => {
-                if !handle_preview_tick(&mut model, &mut tmux, &mut terminal, &mut pending_preview).await {
-                    break;
-                }
-            }
-
-            maybe_tmux = tmux.event_stream().recv() => {
-                if !handle_tmux_tick(&mut model, &mut tmux, &mut terminal, maybe_tmux).await {
-                    break;
-                }
-            }
-
-            _ = ai_poll_interval.tick() => {
-                if !handle_ai_poll_tick(&mut model, &mut tmux, &mut terminal).await {
-                    break;
-                }
-            }
-        }
-    }
-
-    let restart = model.restart_requested;
-
-    // Restore preview layout and clean up AI border highlights before shutdown
-    let cleanup_cmds = vec![Cmd::RestorePreview, Cmd::ResetAllBorders];
-    let _ = execute_commands(&mut model, &mut tmux, &mut terminal, cleanup_cmds).await;
-
-    restore_prefix_f_binding(&mut tmux, prev_f_binding.as_deref()).await;
-    tmux.shutdown().await;
+    let (mut app, prev_f_binding) = App::bootstrap(session_name.clone()).await?;
+    let _ = app.run().await;
+    let restart = app.model.restart_requested;
+    app.shutdown(prev_f_binding.as_deref()).await;
 
     if restart {
         info!("restarting tide via exec");
@@ -255,7 +290,13 @@ async fn detect_sidebar_context() -> Result<(String, String, String)> {
     debug!(sidebar_pane_id, "detected sidebar pane");
 
     let sidebar_window_id = tokio::process::Command::new("tmux")
-        .args(["display-message", "-t", &sidebar_pane_id, "-p", "#{window_id}"])
+        .args([
+            "display-message",
+            "-t",
+            &sidebar_pane_id,
+            "-p",
+            "#{window_id}",
+        ])
         .output()
         .await
         .context("failed to detect sidebar window id")?;
@@ -523,7 +564,7 @@ fn process_tmux_event(model: &mut Model, tmux_event: TmuxEvent) -> Vec<Cmd> {
         TmuxEvent::SessionWindowChanged(ref sid, window_id) if *sid == model.session_id => {
             update(model, Msg::WindowFocusChanged(window_id))
         }
-        TmuxEvent::LayoutChange(window_id) if window_id == model.sidebar_window_id => {
+        TmuxEvent::LayoutChange(window_id) if window_id == model.sidebar.window_id => {
             vec![Cmd::EnsureSidebarWidth, Cmd::ValidateSidebarPanes]
         }
         TmuxEvent::LayoutChange(_) => Vec::new(),
@@ -535,8 +576,8 @@ fn process_tmux_event(model: &mut Model, tmux_event: TmuxEvent) -> Vec<Cmd> {
             // %output fires at very high frequency during streaming;
             // routing through TEA would create unnecessary overhead.
             // Skip sidebar pane's own output to avoid self-triggering.
-            if pane_id != model.sidebar_pane_id {
-                *model.ai_output_counts.entry(pane_id).or_insert(0) += 1;
+            if pane_id != model.sidebar.pane_id {
+                *model.ai.output_counts.entry(pane_id).or_insert(0) += 1;
             }
             Vec::new()
         }

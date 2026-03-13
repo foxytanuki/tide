@@ -100,9 +100,9 @@ fn render_tree_item(
                 // Bubble up: show dot only when collapsed (expanded shows individual dots)
                 // Active takes priority over recently-finished
                 if !*expanded {
-                    if folder_has_ai_window(children, &model.ai_windows) {
+                    if folder_has_ai_window(children, &model.ai.windows) {
                         badge = AiBadge::Active;
-                    } else if folder_has_recently_finished(children, &model.recently_finished_ai) {
+                    } else if folder_has_recently_finished(children, &model.ai.recently_finished) {
                         badge = AiBadge::Finished;
                     }
                 }
@@ -110,18 +110,19 @@ fn render_tree_item(
             (FlatNodeKind::Window, TreeNode::Window { info }) => {
                 let branch = window_branch(model.tree(), &item.path);
                 let active_id = model
+                    .sidebar
                     .pending_preview_id
                     .as_deref()
-                    .unwrap_or(&model.sidebar_window_id);
+                    .unwrap_or(&model.sidebar.window_id);
                 if info.id == active_id {
                     content = format!("{}{} * {}", indent, branch, info.name);
                     style = style.fg(Color::Yellow);
                 } else {
                     content = format!("{}{} {}", indent, branch, info.name);
                 }
-                if model.ai_windows.contains(&info.id) {
+                if model.ai.windows.contains(&info.id) {
                     badge = AiBadge::Active;
-                } else if model.recently_finished_ai.contains_key(&info.id) {
+                } else if model.ai.recently_finished.contains_key(&info.id) {
                     badge = AiBadge::Finished;
                 }
             }

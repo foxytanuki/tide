@@ -156,7 +156,10 @@ fn split_sidebar_in_session(session: &str, inner_cmd: &str, detached: bool) -> R
     if output.status.success() {
         let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if pane_id.is_empty() {
-            anyhow::bail!("split sidebar returned empty pane id for session '{}'", session);
+            anyhow::bail!(
+                "split sidebar returned empty pane id for session '{}'",
+                session
+            );
         }
         Ok(pane_id)
     } else {
