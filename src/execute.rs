@@ -950,7 +950,14 @@ async fn choose_home_pane_in_window<T: TmuxApi>(
     first_non_sidebar
 }
 
-const AI_PROCESS_NAMES: &[&str] = &["claude", "codex", "gemini"];
+const AI_PROCESS_NAMES: &[&str] = &["claude", "codex", "gemini", "opencode"];
+
+fn is_ai_process_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    AI_PROCESS_NAMES
+        .iter()
+        .any(|ai_name| lower.contains(ai_name))
+}
 
 struct AiPaneCandidate {
     pane_id: String,
@@ -975,8 +982,7 @@ fn find_ai_pane_candidates(output: &str, sidebar_pane_id: &str) -> Vec<AiPaneCan
             continue;
         }
 
-        let lower = command.to_lowercase();
-        if !AI_PROCESS_NAMES.iter().any(|name| lower.contains(name)) {
+        if !is_ai_process_name(command) {
             continue;
         }
 
@@ -1155,8 +1161,7 @@ fn find_ai_child_pid(pane_pid: u32) -> Option<u32> {
         let child_pid: u32 = child_str.parse().ok()?;
         let comm_path = format!("/proc/{}/comm", child_pid);
         if let Ok(comm) = std::fs::read_to_string(&comm_path) {
-            let lower = comm.trim().to_lowercase();
-            if AI_PROCESS_NAMES.iter().any(|name| lower.contains(name)) {
+            if is_ai_process_name(comm.trim()) {
                 return Some(child_pid);
             }
         }
@@ -1276,14 +1281,23 @@ mod tests {
 
     #[test]
     fn find_ai_pane_candidates_filters_correctly() {
-        let output = "@1\t%10\tclaude\t1000\n@1\t%11\tzsh\t1001\n@2\t%20\tgemini\t1002\n@2\t%21\tcodex\t1003\n";
+        let output = "@1\t%10\tclaude\t1000\n@1\t%11\tzsh\t1001\n@2\t%20\tgemini\t1002\n@2\t%21\tcodex\t1003\n@3\t%30\topencode\t1004\n";
         let candidates = find_ai_pane_candidates(output, "%sidebar");
-        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates.len(), 4);
         assert_eq!(candidates[0].pane_id, "%10");
         assert_eq!(candidates[0].window_id, "@1");
         assert_eq!(candidates[1].pane_id, "%20");
         assert_eq!(candidates[1].window_id, "@2");
         assert_eq!(candidates[2].pane_id, "%21");
+        assert_eq!(candidates[3].pane_id, "%30");
+    }
+
+    #[test]
+    fn is_ai_process_name_matches_opencode_and_existing_tools() {
+        assert!(is_ai_process_name("opencode"));
+        assert!(is_ai_process_name("OpenCode"));
+        assert!(is_ai_process_name("claude-code"));
+        assert!(!is_ai_process_name("bash"));
     }
 
     #[test]
