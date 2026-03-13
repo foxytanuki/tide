@@ -84,6 +84,333 @@ async fn save_window_layout<T: TmuxApi>(model: &mut Model, tmux: &mut T, window_
     }
 }
 
+async fn save_window_layout_without_pane<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    window_id: &str,
+    pane_id: &str,
+) {
+    let Some(layout) = query_window_layout(tmux, window_id).await else {
+        return;
+    };
+    let Some(layout) = layout_without_pane(&layout, pane_id) else {
+        return;
+    };
+
+    let (term_w, _) = model.terminal_size;
+    model
+        .sidebar
+        .pane_layouts
+        .insert(window_id.to_string(), (term_w, layout));
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LayoutKind {
+    LeftRight,
+    TopBottom,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LayoutNode {
+    Pane {
+        sx: u32,
+        sy: u32,
+        xoff: u32,
+        yoff: u32,
+        pane_id: u32,
+    },
+    Split {
+        sx: u32,
+        sy: u32,
+        xoff: u32,
+        yoff: u32,
+        kind: LayoutKind,
+        children: Vec<LayoutNode>,
+    },
+}
+
+impl LayoutNode {
+    fn sx(&self) -> u32 {
+        match self {
+            Self::Pane { sx, .. } | Self::Split { sx, .. } => *sx,
+        }
+    }
+
+    fn sy(&self) -> u32 {
+        match self {
+            Self::Pane { sy, .. } | Self::Split { sy, .. } => *sy,
+        }
+    }
+
+    fn set_geometry(&mut self, sx: u32, sy: u32, xoff: u32, yoff: u32) {
+        match self {
+            Self::Pane {
+                sx: node_sx,
+                sy: node_sy,
+                xoff: node_xoff,
+                yoff: node_yoff,
+                ..
+            }
+            | Self::Split {
+                sx: node_sx,
+                sy: node_sy,
+                xoff: node_xoff,
+                yoff: node_yoff,
+                ..
+            } => {
+                *node_sx = sx;
+                *node_sy = sy;
+                *node_xoff = xoff;
+                *node_yoff = yoff;
+            }
+        }
+    }
+
+    fn write_body(&self, out: &mut String) {
+        match self {
+            Self::Pane {
+                sx,
+                sy,
+                xoff,
+                yoff,
+                pane_id,
+            } => {
+                out.push_str(&format!("{sx}x{sy},{xoff},{yoff},{pane_id}"));
+            }
+            Self::Split {
+                sx,
+                sy,
+                xoff,
+                yoff,
+                kind,
+                children,
+            } => {
+                let (open, close) = match kind {
+                    LayoutKind::LeftRight => ('{', '}'),
+                    LayoutKind::TopBottom => ('[', ']'),
+                };
+                out.push_str(&format!("{sx}x{sy},{xoff},{yoff}{open}"));
+                for (index, child) in children.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    child.write_body(out);
+                }
+                out.push(close);
+            }
+        }
+    }
+}
+
+fn tmux_layout_checksum(layout: &str) -> u16 {
+    let mut checksum = 0u16;
+    for byte in layout.bytes() {
+        checksum = (checksum >> 1) + ((checksum & 1) << 15);
+        checksum = checksum.wrapping_add(byte as u16);
+    }
+    checksum
+}
+
+fn parse_pane_number(pane_id: &str) -> Option<u32> {
+    pane_id.trim().strip_prefix('%')?.parse().ok()
+}
+
+fn parse_layout_number(layout: &str, index: &mut usize) -> Option<u32> {
+    let bytes = layout.as_bytes();
+    let start = *index;
+    while *index < bytes.len() && bytes[*index].is_ascii_digit() {
+        *index += 1;
+    }
+    if *index == start {
+        return None;
+    }
+    layout.get(start..*index)?.parse().ok()
+}
+
+fn parse_layout_node(layout: &str, index: &mut usize) -> Option<LayoutNode> {
+    let sx = parse_layout_number(layout, index)?;
+    if layout.as_bytes().get(*index)? != &b'x' {
+        return None;
+    }
+    *index += 1;
+    let sy = parse_layout_number(layout, index)?;
+    if layout.as_bytes().get(*index)? != &b',' {
+        return None;
+    }
+    *index += 1;
+    let xoff = parse_layout_number(layout, index)?;
+    if layout.as_bytes().get(*index)? != &b',' {
+        return None;
+    }
+    *index += 1;
+    let yoff = parse_layout_number(layout, index)?;
+
+    let mut pane_id = None;
+    if layout.as_bytes().get(*index) == Some(&b',') {
+        let saved_index = *index;
+        *index += 1;
+        if let Some(value) = parse_layout_number(layout, index) {
+            if layout.as_bytes().get(*index) == Some(&b'x') {
+                *index = saved_index;
+            } else {
+                pane_id = Some(value);
+            }
+        } else {
+            *index = saved_index;
+        }
+    }
+
+    match layout.as_bytes().get(*index).copied() {
+        Some(b'{') | Some(b'[') => {
+            let kind = if layout.as_bytes()[*index] == b'{' {
+                LayoutKind::LeftRight
+            } else {
+                LayoutKind::TopBottom
+            };
+            let close = if matches!(kind, LayoutKind::LeftRight) {
+                b'}'
+            } else {
+                b']'
+            };
+            *index += 1;
+            let mut children = Vec::new();
+            loop {
+                children.push(parse_layout_node(layout, index)?);
+                match layout.as_bytes().get(*index).copied() {
+                    Some(b',') => *index += 1,
+                    Some(ch) if ch == close => {
+                        *index += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            Some(LayoutNode::Split {
+                sx,
+                sy,
+                xoff,
+                yoff,
+                kind,
+                children,
+            })
+        }
+        _ => Some(LayoutNode::Pane {
+            sx,
+            sy,
+            xoff,
+            yoff,
+            pane_id: pane_id?,
+        }),
+    }
+}
+
+fn remove_pane_from_layout(node: LayoutNode, pane_id: u32) -> Option<LayoutNode> {
+    match node {
+        LayoutNode::Pane { pane_id: id, .. } if id == pane_id => None,
+        LayoutNode::Pane { .. } => Some(node),
+        LayoutNode::Split {
+            sx,
+            sy,
+            xoff,
+            yoff,
+            kind,
+            children,
+        } => {
+            let mut remaining = children
+                .into_iter()
+                .filter_map(|child| remove_pane_from_layout(child, pane_id))
+                .collect::<Vec<_>>();
+            match remaining.len() {
+                0 => None,
+                1 => remaining.pop(),
+                _ => Some(LayoutNode::Split {
+                    sx,
+                    sy,
+                    xoff,
+                    yoff,
+                    kind,
+                    children: remaining,
+                }),
+            }
+        }
+    }
+}
+
+fn resize_layout(node: &mut LayoutNode, sx: u32, sy: u32, xoff: u32, yoff: u32) {
+    node.set_geometry(sx, sy, xoff, yoff);
+
+    let LayoutNode::Split { kind, children, .. } = node else {
+        return;
+    };
+
+    let child_count = children.len() as u32;
+    if child_count == 0 {
+        return;
+    }
+
+    match kind {
+        LayoutKind::LeftRight => {
+            let content_sx = sx.saturating_sub(child_count.saturating_sub(1));
+            let old_total = children.iter().map(LayoutNode::sx).sum::<u32>().max(1);
+            let mut next_xoff = xoff;
+            let mut remaining_sx = content_sx;
+
+            for (index, child) in children.iter_mut().enumerate() {
+                let child_sx = if index + 1 == child_count as usize {
+                    remaining_sx
+                } else {
+                    let proposed =
+                        ((child.sx() as u64 * content_sx as u64) / old_total as u64).max(1) as u32;
+                    let max_allowed = remaining_sx.saturating_sub(child_count - index as u32 - 1);
+                    proposed.min(max_allowed)
+                };
+                resize_layout(child, child_sx, sy, next_xoff, yoff);
+                next_xoff = next_xoff.saturating_add(child_sx + 1);
+                remaining_sx = remaining_sx.saturating_sub(child_sx);
+            }
+        }
+        LayoutKind::TopBottom => {
+            let content_sy = sy.saturating_sub(child_count.saturating_sub(1));
+            let old_total = children.iter().map(LayoutNode::sy).sum::<u32>().max(1);
+            let mut next_yoff = yoff;
+            let mut remaining_sy = content_sy;
+
+            for (index, child) in children.iter_mut().enumerate() {
+                let child_sy = if index + 1 == child_count as usize {
+                    remaining_sy
+                } else {
+                    let proposed =
+                        ((child.sy() as u64 * content_sy as u64) / old_total as u64).max(1) as u32;
+                    let max_allowed = remaining_sy.saturating_sub(child_count - index as u32 - 1);
+                    proposed.min(max_allowed)
+                };
+                resize_layout(child, sx, child_sy, xoff, next_yoff);
+                next_yoff = next_yoff.saturating_add(child_sy + 1);
+                remaining_sy = remaining_sy.saturating_sub(child_sy);
+            }
+        }
+    }
+}
+
+fn layout_without_pane(layout: &str, pane_id: &str) -> Option<String> {
+    let pane_id = parse_pane_number(pane_id)?;
+    let (_, body) = layout.split_once(',')?;
+    let mut index = 0;
+    let root = parse_layout_node(body, &mut index)?;
+    if index != body.len() {
+        return None;
+    }
+
+    let root_sx = root.sx();
+    let root_sy = root.sy();
+    let mut trimmed = remove_pane_from_layout(root, pane_id)?;
+    resize_layout(&mut trimmed, root_sx, root_sy, 0, 0);
+
+    let mut out = String::new();
+    trimmed.write_body(&mut out);
+    Some(format!("{:04x},{}", tmux_layout_checksum(&out), out))
+}
+
 /// Restore a window's saved layout (fire-and-forget, errors are logged).
 /// Skips restoration if the terminal width changed since save.
 async fn restore_window_layout<T: TmuxApi>(model: &mut Model, tmux: &mut T, window_id: &str) {
@@ -224,6 +551,13 @@ async fn restore_or_seed_leaving_layout<T: TmuxApi>(
     }
 }
 
+async fn snapshot_leaving_window_layout<T: TmuxApi>(model: &mut Model, tmux: &mut T) -> String {
+    let leaving_window = model.sidebar.window_id.clone();
+    let sidebar_pane_id = model.sidebar.pane_id.clone();
+    save_window_layout_without_pane(model, tmux, &leaving_window, &sidebar_pane_id).await;
+    leaving_window
+}
+
 async fn handle_preview_window<T: TmuxApi>(
     model: &mut Model,
     tmux: &mut T,
@@ -283,7 +617,7 @@ async fn handle_preview_window<T: TmuxApi>(
 
     // Save target window's layout before sidebar joins (for future restoration).
     save_window_layout(model, tmux, &target_window_id).await;
-    let leaving_window = model.sidebar.window_id.clone();
+    let leaving_window = snapshot_leaving_window_layout(model, tmux).await;
 
     // Action phase: batch all visual tmux operations into a single
     // command so tmux processes them in one server tick (no flicker).
@@ -353,7 +687,7 @@ async fn handle_restore_preview<T: TmuxApi>(
 
         // Save orig_window's layout before sidebar re-joins it.
         save_window_layout(model, tmux, &orig_window).await;
-        let leaving_window = model.sidebar.window_id.clone();
+        let leaving_window = snapshot_leaving_window_layout(model, tmux).await;
 
         // Always target the leftmost pane so sidebar stays at far left.
         let orig_leftmost =
@@ -629,7 +963,7 @@ async fn handle_follow_to_window<T: TmuxApi>(
 
     // Save target window's layout before sidebar joins.
     save_window_layout(model, tmux, &target_window_id).await;
-    let leaving_window = model.sidebar.window_id.clone();
+    let leaving_window = snapshot_leaving_window_layout(model, tmux).await;
 
     // Action phase: batch join.
     let batch = join_batch_without_window_select(&model.sidebar.pane_id, &join_target);
@@ -1306,6 +1640,26 @@ mod tests {
         let candidates = find_ai_pane_candidates(output, "%sidebar");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].pane_id, "%10");
+    }
+
+    #[test]
+    fn layout_without_pane_restores_full_width_after_sidebar_removal() {
+        let layout = "1086,315x81,0,0{157x81,0,0,27,78x81,158,0,25,78x81,237,0,26}";
+        let trimmed = layout_without_pane(layout, "%27").expect("layout should trim sidebar");
+        assert_eq!(
+            trimmed.split_once(',').unwrap().1,
+            "315x81,0,0{157x81,0,0,25,157x81,158,0,26}"
+        );
+    }
+
+    #[test]
+    fn layout_without_pane_preserves_vertical_stack_inside_main_area() {
+        let layout = "9999,200x80,0,0{30x80,0,0,10,169x80,31,0[169x39,31,0,11,169x40,31,40,12]}";
+        let trimmed = layout_without_pane(layout, "%10").expect("layout should trim sidebar");
+        assert_eq!(
+            trimmed.split_once(',').unwrap().1,
+            "200x80,0,0[200x39,0,0,11,200x40,0,40,12]"
+        );
     }
 
     #[test]
