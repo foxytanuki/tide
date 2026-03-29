@@ -141,6 +141,27 @@ pub fn is_navigable_item(item: &FlatItem) -> bool {
     !(item.kind == FlatNodeKind::Folder && item.expanded)
 }
 
+pub fn visible_item_indices(flat: &[FlatItem]) -> Vec<usize> {
+    flat.iter()
+        .enumerate()
+        .filter_map(|(idx, item)| is_navigable_item(item).then_some(idx))
+        .collect()
+}
+
+pub fn visible_item_number(flat: &[FlatItem], index: usize) -> Option<usize> {
+    let item = flat.get(index)?;
+    if !is_navigable_item(item) {
+        return None;
+    }
+
+    Some(
+        flat.iter()
+            .take(index + 1)
+            .filter(|item| is_navigable_item(item))
+            .count(),
+    )
+}
+
 pub fn next_visible_item(flat: &[FlatItem], current: usize) -> Option<usize> {
     if current >= flat.len() {
         return None;

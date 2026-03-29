@@ -1,8 +1,8 @@
 use crate::cmd::Cmd;
 use crate::model::{Mode, Model};
 use crate::tree::{
-    find_parent_folder, get_node_mut, is_navigable_item, next_visible_item, prev_visible_item,
-    toggle_expand, FlatNodeKind, TreeNode, WindowInfo,
+    find_parent_folder, get_node_mut, next_visible_item, prev_visible_item, toggle_expand,
+    visible_item_indices, FlatNodeKind, TreeNode, WindowInfo,
 };
 
 use super::input::{clear_input, set_input};
@@ -54,11 +54,12 @@ pub(super) fn handle_cursor_down(model: &mut Model) -> Vec<Cmd> {
 }
 
 pub(super) fn handle_jump_to_index(model: &mut Model, n: usize) -> Vec<Cmd> {
-    let flat = model.flat_items();
-    let visible: Vec<usize> = (0..flat.len())
-        .filter(|&i| is_navigable_item(&flat[i]))
-        .collect();
-    if let Some(&target) = visible.get(n) {
+    if n == 0 {
+        return vec![];
+    }
+
+    let visible = visible_item_indices(model.flat_items());
+    if let Some(&target) = visible.get(n - 1) {
         model.set_cursor(target);
         preview_current_item(model)
     } else {

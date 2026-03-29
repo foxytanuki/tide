@@ -108,10 +108,11 @@ fn handle_normal_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
         KeyCode::Char('C') => update(model, Msg::NewProject),
         KeyCode::Char('R') => update(model, Msg::Restart),
         KeyCode::Char('q') => update(model, Msg::Quit),
-        KeyCode::Char(d @ '0'..='9') => {
+        KeyCode::Char(d @ '1'..='9') => {
             let n = d.to_digit(10).unwrap() as usize;
             update(model, Msg::JumpToVisibleIndex(n))
         }
+        KeyCode::Char('0') => vec![],
         _ => vec![],
     }
 }

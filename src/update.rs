@@ -605,7 +605,7 @@ mod tests {
     // --- JumpToVisibleIndex tests ---
 
     #[test]
-    fn jump_to_index_0_lands_on_first_navigable_item() {
+    fn jump_to_index_1_lands_on_first_navigable_item() {
         let mut model = test_model();
         // flat: [0]=root-a, [1]=scratch, [2]=root-b (all plain windows)
         let windows = vec![
@@ -615,6 +615,17 @@ mod tests {
         ];
         update(&mut model, Msg::WindowListLoaded(windows));
         model.set_cursor(2);
+
+        update(&mut model, Msg::JumpToVisibleIndex(1));
+        assert_eq!(model.cursor(), 0);
+    }
+
+    #[test]
+    fn jump_to_index_0_is_noop() {
+        let mut model = test_model();
+        let windows = vec![wi("@1", 1, "root-a"), wi("@2", 2, "scratch")];
+        update(&mut model, Msg::WindowListLoaded(windows));
+        model.set_cursor(0);
 
         update(&mut model, Msg::JumpToVisibleIndex(0));
         assert_eq!(model.cursor(), 0);
@@ -627,7 +638,6 @@ mod tests {
         update(&mut model, Msg::WindowListLoaded(windows));
         model.set_cursor(0);
 
-        // Only 2 visible items (indices 0 and 1); jumping to 9 should be a no-op
         update(&mut model, Msg::JumpToVisibleIndex(9));
         assert_eq!(model.cursor(), 0);
     }
@@ -643,12 +653,12 @@ mod tests {
         // cursor starts on flat[1] (first child) after load
         assert_eq!(model.cursor(), 1);
 
-        // Jump to visible index 0 → should still be flat[1] (first non-folder row)
-        update(&mut model, Msg::JumpToVisibleIndex(0));
+        // Jump to visible index 1 → should still be flat[1] (first non-folder row)
+        update(&mut model, Msg::JumpToVisibleIndex(1));
         assert_eq!(model.cursor(), 1);
 
-        // Jump to visible index 1 → flat[2]
-        update(&mut model, Msg::JumpToVisibleIndex(1));
+        // Jump to visible index 2 → flat[2]
+        update(&mut model, Msg::JumpToVisibleIndex(2));
         assert_eq!(model.cursor(), 2);
     }
 
@@ -667,10 +677,10 @@ mod tests {
 
         // flat: [0]=collapsed-folder "proj", [1]=window "scratch"
         // visible: [flat[0], flat[1]]
-        update(&mut model, Msg::JumpToVisibleIndex(0));
+        update(&mut model, Msg::JumpToVisibleIndex(1));
         assert_eq!(model.cursor(), 0); // collapsed folder is navigable
 
-        update(&mut model, Msg::JumpToVisibleIndex(1));
+        update(&mut model, Msg::JumpToVisibleIndex(2));
         assert_eq!(model.cursor(), 1);
     }
 

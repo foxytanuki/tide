@@ -639,7 +639,9 @@ mod tests {
 
     #[test]
     fn regular_tmux_commands_still_expect_response() {
-        assert!(command_expects_response("display-message -p '#{session_id}'"));
+        assert!(command_expects_response(
+            "display-message -p '#{session_id}'"
+        ));
     }
 
     #[test]

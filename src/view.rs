@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::model::{Mode, Model};
-use crate::tree::{get_node, FlatItem, FlatNodeKind, TreeNode};
+use crate::tree::{get_node, visible_item_number, FlatItem, FlatNodeKind, TreeNode};
 
 pub fn render(model: &Model, frame: &mut Frame) {
     let outer = Block::default()
@@ -92,7 +92,8 @@ fn render_tree_item(
                 },
             ) => {
                 let marker = if *expanded { "v" } else { ">" };
-                content = format!("{}{} {}", indent, marker, name);
+                let prefix = visible_prefix(model, index, &indent);
+                content = format!("{}{} {}", prefix, marker, name);
                 style = style.add_modifier(Modifier::BOLD);
                 if children.is_empty() {
                     style = style.fg(Color::DarkGray);
@@ -114,11 +115,20 @@ fn render_tree_item(
                     .pending_preview_id
                     .as_deref()
                     .unwrap_or(&model.sidebar.window_id);
+                let prefix = visible_prefix(model, index, &indent);
                 if info.id == active_id {
-                    content = format!("{}{} * {}", indent, branch, info.name);
+                    content = if branch == " " {
+                        format!("{prefix}* {}", info.name)
+                    } else {
+                        format!("{prefix}{branch} * {}", info.name)
+                    };
                     style = style.fg(Color::Yellow);
                 } else {
-                    content = format!("{}{} {}", indent, branch, info.name);
+                    content = if branch == " " {
+                        format!("{prefix}{}", info.name)
+                    } else {
+                        format!("{prefix}{branch} {}", info.name)
+                    };
                 }
                 if model.ai.windows.contains(&info.id) {
                     badge = AiBadge::Active;
@@ -169,6 +179,13 @@ fn render_tree_item(
             ListItem::new(line)
         }
         _ => ListItem::new(truncate(&content, width)).style(style),
+    }
+}
+
+fn visible_prefix(model: &Model, index: usize, indent: &str) -> String {
+    match visible_item_number(model.flat_items(), index) {
+        Some(n) => format!("{indent}{n}:"),
+        None => indent.to_string(),
     }
 }
 
