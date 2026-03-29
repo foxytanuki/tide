@@ -32,6 +32,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
     match msg {
         Msg::CursorUp => handle_cursor_up(model),
         Msg::CursorDown => handle_cursor_down(model),
+        Msg::JumpToVisibleIndex(n) => handle_jump_to_index(model, n),
         Msg::SelectItem => handle_select_item(model),
         Msg::CollapseOrParent => handle_collapse_or_parent(model),
         Msg::ToggleFolder => handle_toggle_folder(model),
@@ -599,5 +600,98 @@ mod tests {
             )
         }));
         assert!(matches!(cmds.last(), Some(Cmd::Render)));
+    }
+
+    // --- JumpToVisibleIndex tests ---
+
+    #[test]
+    fn jump_to_index_0_lands_on_first_navigable_item() {
+        let mut model = test_model();
+        // flat: [0]=root-a, [1]=scratch, [2]=root-b (all plain windows)
+        let windows = vec![
+            wi("@1", 1, "root-a"),
+            wi("@2", 2, "scratch"),
+            wi("@3", 3, "root-b"),
+        ];
+        update(&mut model, Msg::WindowListLoaded(windows));
+        model.set_cursor(2);
+
+        update(&mut model, Msg::JumpToVisibleIndex(0));
+        assert_eq!(model.cursor(), 0);
+    }
+
+    #[test]
+    fn jump_to_index_out_of_range_is_noop() {
+        let mut model = test_model();
+        let windows = vec![wi("@1", 1, "root-a"), wi("@2", 2, "scratch")];
+        update(&mut model, Msg::WindowListLoaded(windows));
+        model.set_cursor(0);
+
+        // Only 2 visible items (indices 0 and 1); jumping to 9 should be a no-op
+        update(&mut model, Msg::JumpToVisibleIndex(9));
+        assert_eq!(model.cursor(), 0);
+    }
+
+    #[test]
+    fn jump_skips_expanded_folder_header() {
+        let mut model = test_model();
+        // "proj:edit" and "proj:term" create an expanded folder at flat[0],
+        // with children at flat[1] and flat[2].
+        // visible list: [flat[1]=edit, flat[2]=term]  (flat[0] folder is expanded → skipped)
+        let windows = vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "proj:term")];
+        update(&mut model, Msg::WindowListLoaded(windows));
+        // cursor starts on flat[1] (first child) after load
+        assert_eq!(model.cursor(), 1);
+
+        // Jump to visible index 0 → should still be flat[1] (first non-folder row)
+        update(&mut model, Msg::JumpToVisibleIndex(0));
+        assert_eq!(model.cursor(), 1);
+
+        // Jump to visible index 1 → flat[2]
+        update(&mut model, Msg::JumpToVisibleIndex(1));
+        assert_eq!(model.cursor(), 2);
+    }
+
+    #[test]
+    fn jump_includes_collapsed_folder() {
+        let mut model = test_model();
+        let windows = vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "scratch")];
+        update(&mut model, Msg::WindowListLoaded(windows));
+        // Collapse the folder so flat[0] is a collapsed folder header
+        model.set_cursor(0);
+        model.mutate_tree(|tree| {
+            if let TreeNode::Folder { expanded, .. } = &mut tree[0] {
+                *expanded = false;
+            }
+        });
+
+        // flat: [0]=collapsed-folder "proj", [1]=window "scratch"
+        // visible: [flat[0], flat[1]]
+        update(&mut model, Msg::JumpToVisibleIndex(0));
+        assert_eq!(model.cursor(), 0); // collapsed folder is navigable
+
+        update(&mut model, Msg::JumpToVisibleIndex(1));
+        assert_eq!(model.cursor(), 1);
+    }
+
+    #[test]
+    fn jump_digit_key_does_not_trigger_in_rename_mode() {
+        let mut model = test_model();
+        let windows = vec![wi("@1", 1, "dev"), wi("@2", 2, "scratch")];
+        update(&mut model, Msg::WindowListLoaded(windows));
+        model.set_cursor(0);
+        model.mode = Mode::Renaming {
+            window_id: "@1".to_string(),
+        };
+        model.input_buffer.clear();
+        model.input_cursor = 0;
+
+        // Pressing '3' in rename mode should insert into input_buffer, not jump
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)),
+        );
+        assert_eq!(model.cursor(), 0); // cursor unchanged
+        assert_eq!(model.input_buffer, "3"); // character inserted into buffer
     }
 }

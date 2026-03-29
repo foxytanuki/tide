@@ -21,6 +21,7 @@ pub enum Msg {
     // UI events
     CursorUp,
     CursorDown,
+    JumpToVisibleIndex(usize),
     SelectItem,
     CollapseOrParent,
     ToggleFolder,

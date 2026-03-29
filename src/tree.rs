@@ -135,6 +135,12 @@ pub fn find_parent_folder(flat: &[FlatItem], current: usize) -> Option<usize> {
         .find(|&idx| flat[idx].depth == parent_depth && flat[idx].kind == FlatNodeKind::Folder)
 }
 
+/// Returns true if a flat item can be the cursor target (i.e. a navigable row).
+/// Expanded folder headers are skipped — the cursor moves directly to their children.
+pub fn is_navigable_item(item: &FlatItem) -> bool {
+    !(item.kind == FlatNodeKind::Folder && item.expanded)
+}
+
 pub fn next_visible_item(flat: &[FlatItem], current: usize) -> Option<usize> {
     if current >= flat.len() {
         return None;
@@ -143,7 +149,7 @@ pub fn next_visible_item(flat: &[FlatItem], current: usize) -> Option<usize> {
     let mut idx = current + 1;
     while idx < flat.len() {
         // Skip expanded folders — cursor goes straight to their children
-        if flat[idx].kind == FlatNodeKind::Folder && flat[idx].expanded {
+        if !is_navigable_item(&flat[idx]) {
             idx += 1;
             continue;
         }
@@ -160,7 +166,7 @@ pub fn prev_visible_item(flat: &[FlatItem], current: usize) -> Option<usize> {
     let mut idx = current - 1;
     loop {
         // Skip expanded folders
-        if flat[idx].kind == FlatNodeKind::Folder && flat[idx].expanded {
+        if !is_navigable_item(&flat[idx]) {
             if idx == 0 {
                 return None;
             }
