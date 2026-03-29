@@ -103,6 +103,10 @@ impl TmuxControl {
 
     pub async fn send_command(&mut self, cmd: &str) -> Result<String> {
         let cmd = validate_single_line_command(cmd)?;
+        if !command_expects_response(cmd) {
+            self.write_command_line(cmd).await?;
+            return Ok(String::new());
+        }
         let response_rx = self.enqueue_response_waiter().await;
         let result = self.send_and_wait_for_response(cmd, response_rx).await;
 
@@ -202,6 +206,10 @@ impl TmuxControl {
         }
         Err(anyhow!("timed out waiting for tmux response"))
     }
+}
+
+fn command_expects_response(cmd: &str) -> bool {
+    cmd != "refresh-client -f ignore-size"
 }
 
 fn validate_single_line_command(cmd: &str) -> Result<&str> {
@@ -623,6 +631,16 @@ fn parse_window_line(line: &str) -> Result<WindowInfo> {
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn refresh_client_ignore_size_does_not_expect_response() {
+        assert!(!command_expects_response("refresh-client -f ignore-size"));
+    }
+
+    #[test]
+    fn regular_tmux_commands_still_expect_response() {
+        assert!(command_expects_response("display-message -p '#{session_id}'"));
+    }
 
     #[test]
     fn pane_output_is_dropped_when_channel_full() {
