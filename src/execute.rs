@@ -508,6 +508,7 @@ pub async fn execute_commands<T: TmuxApi>(
             Cmd::ValidateSidebarPanes => validate_sidebar_panes(model, tmux, &mut queue).await,
             Cmd::ListWindows => handle_list_windows(model, tmux, &mut queue).await,
             Cmd::PollAiProcesses => poll_ai_processes(model, tmux, &mut queue).await,
+            Cmd::ApplyLayoutHelper => apply_layout_helper(model, tmux, &mut queue).await,
             Cmd::CheckBorder => check_border(model, tmux).await,
             Cmd::ResetAllBorders => reset_all_borders(model, tmux).await,
             Cmd::Render => render_model(model, terminal),
@@ -1023,6 +1024,149 @@ async fn ensure_sidebar_width<T: TmuxApi>(model: &Model, tmux: &mut T) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaneGeom {
+    left: u32,
+    top: u32,
+}
+
+fn parse_layout_pane_line(line: &str) -> Option<(String, PaneGeom)> {
+    let mut parts = line.trim().split('\t');
+    let pane_id = parts.next()?.to_string();
+    let left = parts.next()?.parse().ok()?;
+    let top = parts.next()?.parse().ok()?;
+    Some((pane_id, PaneGeom { left, top }))
+}
+
+fn serialize_layout(root: &LayoutNode) -> String {
+    let mut out = String::new();
+    root.write_body(&mut out);
+    format!("{:04x},{}", tmux_layout_checksum(&out), out)
+}
+
+fn query_layout_root(layout: &str) -> Option<LayoutNode> {
+    let (_, body) = layout.split_once(',')?;
+    let mut index = 0;
+    let root = parse_layout_node(body, &mut index)?;
+    if index != body.len() {
+        return None;
+    }
+    Some(root)
+}
+
+fn content_pane_ids(panes: &[(String, PaneGeom)], sidebar_pane_id: &str) -> Vec<String> {
+    let mut content: Vec<(String, PaneGeom)> = panes
+        .iter()
+        .filter(|(id, _)| id != sidebar_pane_id)
+        .map(|(id, geom)| (id.clone(), *geom))
+        .collect();
+    content.sort_by(|(a_id, a_geom), (b_id, b_geom)| {
+        (a_geom.left, a_geom.top, a_id).cmp(&(b_geom.left, b_geom.top, b_id))
+    });
+    content.into_iter().map(|(id, _)| id).collect()
+}
+
+fn build_split_window_cmd(target: &str, current_path: Option<&str>) -> String {
+    match current_path {
+        Some(path) if !path.is_empty() => {
+            format!("split-window -t {target} -h -c {}", quote_tmux(path))
+        }
+        _ => format!("split-window -t {target} -h"),
+    }
+}
+
+fn shell_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\\''"))
+}
+
+fn build_cd_send_keys_cmd(target: &str, current_path: &str) -> String {
+    let command = format!("cd -- {}", shell_quote(current_path));
+    format!("send-keys -t {target} {} C-m", quote_tmux(&command))
+}
+
+fn split_even(total: u32, parts: usize) -> Vec<u32> {
+    let parts = parts as u32;
+    let base = total / parts;
+    let remainder = total % parts;
+    (0..parts)
+        .map(|index| base + u32::from(index < remainder))
+        .collect()
+}
+
+fn build_sidebar_main_3x2_layout(
+    root_sx: u32,
+    root_sy: u32,
+    sidebar_pane_id: u32,
+    content_pane_ids: &[u32],
+) -> Option<String> {
+    if content_pane_ids.len() != 6 || root_sx < 36 || root_sy < 3 {
+        return None;
+    }
+
+    let sidebar_sx = SIDEBAR_WIDTH_CHARS as u32;
+    if root_sx <= sidebar_sx + 3 {
+        return None;
+    }
+
+    let main_sx = root_sx.saturating_sub(sidebar_sx + 1);
+    let column_widths = split_even(main_sx.saturating_sub(2), 3);
+    let row_heights = split_even(root_sy.saturating_sub(1), 2);
+
+    let mut next_xoff = sidebar_sx + 1;
+    let mut columns = Vec::new();
+    for (column_index, width) in column_widths.into_iter().enumerate() {
+        let mut next_yoff = 0;
+        let mut rows = Vec::new();
+        for (row_index, height) in row_heights.iter().copied().enumerate() {
+            let pane_id = content_pane_ids[column_index * 2 + row_index];
+            rows.push(LayoutNode::Pane {
+                sx: width,
+                sy: height,
+                xoff: next_xoff,
+                yoff: next_yoff,
+                pane_id,
+            });
+            next_yoff = next_yoff.saturating_add(height + 1);
+        }
+        columns.push(LayoutNode::Split {
+            sx: width,
+            sy: root_sy,
+            xoff: next_xoff,
+            yoff: 0,
+            kind: LayoutKind::TopBottom,
+            children: rows,
+        });
+        next_xoff = next_xoff.saturating_add(width + 1);
+    }
+
+    let root = LayoutNode::Split {
+        sx: root_sx,
+        sy: root_sy,
+        xoff: 0,
+        yoff: 0,
+        kind: LayoutKind::LeftRight,
+        children: vec![
+            LayoutNode::Pane {
+                sx: sidebar_sx,
+                sy: root_sy,
+                xoff: 0,
+                yoff: 0,
+                pane_id: sidebar_pane_id,
+            },
+            LayoutNode::Split {
+                sx: main_sx,
+                sy: root_sy,
+                xoff: sidebar_sx + 1,
+                yoff: 0,
+                kind: LayoutKind::LeftRight,
+                children: columns,
+            },
+        ],
+    };
+
+    Some(serialize_layout(&root))
+}
+
 async fn validate_sidebar_panes<T: TmuxApi>(
     model: &Model,
     tmux: &mut T,
@@ -1062,6 +1206,147 @@ async fn validate_sidebar_panes<T: TmuxApi>(
             }
         }
     }
+}
+
+async fn apply_layout_helper<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue: &mut VecDeque<Cmd>) {
+    let list_cmd = format!(
+        "list-panes -t {} -F '#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}'",
+        model.sidebar.window_id
+    );
+    let Ok(output) = tmux.send_command(&list_cmd).await else {
+        model.error_message = Some("layout helper: list-panes failed".to_string());
+        queue.push_front(Cmd::Render);
+        return;
+    };
+
+    let mut panes: Vec<(String, PaneGeom)> = output.lines().filter_map(parse_layout_pane_line).collect();
+    let initial_content_ids: HashSet<String> = content_pane_ids(&panes, &model.sidebar.pane_id)
+        .into_iter()
+        .collect();
+    let content_count = initial_content_ids.len();
+    if content_count == 0 {
+        model.error_message = Some("layout helper: no content pane".to_string());
+        queue.push_front(Cmd::Render);
+        return;
+    }
+    if content_count > 6 {
+        model.error_message = Some("layout helper: too many panes".to_string());
+        queue.push_front(Cmd::Render);
+        return;
+    }
+
+    let base_pane_id = content_pane_ids(&panes, &model.sidebar.pane_id)
+        .into_iter()
+        .next()
+        .expect("content_count > 0 ensures content pane exists");
+    let base_path_cmd = format!(
+        "display-message -p -t {} '#{{pane_current_path}}'",
+        base_pane_id
+    );
+    let base_current_path = tmux
+        .send_command(&base_path_cmd)
+        .await
+        .ok()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty());
+
+    let mut splits_needed = 6usize.saturating_sub(content_count);
+    while splits_needed > 0 {
+        let target = panes
+            .iter()
+            .filter(|(id, _)| id != &model.sidebar.pane_id)
+            .max_by_key(|(_, geom)| (geom.left, geom.top))
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| model.sidebar.pane_id.clone());
+        let split_cmd = build_split_window_cmd(&target, base_current_path.as_deref());
+        if let Err(err) = tmux.send_command(&split_cmd).await {
+            model.error_message = Some(format!("layout helper: {err}"));
+            queue.push_front(Cmd::Render);
+            return;
+        }
+        let Ok(refreshed) = tmux.send_command(&list_cmd).await else {
+            model.error_message = Some("layout helper: refresh failed".to_string());
+            queue.push_front(Cmd::Render);
+            return;
+        };
+        panes = refreshed
+            .lines()
+            .filter_map(parse_layout_pane_line)
+            .collect();
+        splits_needed -= 1;
+    }
+
+    let Some(layout) = query_window_layout(tmux, &model.sidebar.window_id).await else {
+        model.error_message = Some("layout helper: layout query failed".to_string());
+        queue.push_front(Cmd::Render);
+        return;
+    };
+
+    let Some(root) = query_layout_root(&layout) else {
+        model.error_message = Some("layout helper: layout parse failed".to_string());
+        queue.push_front(Cmd::Render);
+        return;
+    };
+
+    let content_ids = content_pane_ids(&panes, &model.sidebar.pane_id);
+    let Some(sidebar_pane_id) = parse_pane_number(&model.sidebar.pane_id) else {
+        model.error_message = Some("layout helper: invalid sidebar pane".to_string());
+        queue.push_front(Cmd::Render);
+        return;
+    };
+    let mut content_pane_numbers = Vec::with_capacity(content_ids.len());
+    for pane_id in &content_ids {
+        let Some(pane_number) = parse_pane_number(pane_id) else {
+            model.error_message = Some("layout helper: invalid pane id".to_string());
+            queue.push_front(Cmd::Render);
+            return;
+        };
+        content_pane_numbers.push(pane_number);
+    }
+    let Some(explicit_layout) = build_sidebar_main_3x2_layout(
+        root.sx(),
+        root.sy(),
+        sidebar_pane_id,
+        &content_pane_numbers,
+    ) else {
+        model.error_message = Some("layout helper: window too small".to_string());
+        queue.push_front(Cmd::Render);
+        return;
+    };
+
+    if let Err(err) = tmux
+        .send_command(&format!(
+            "select-layout -t {} {}",
+            model.sidebar.window_id,
+            quote_tmux(&explicit_layout)
+        ))
+        .await
+    {
+        model.error_message = Some(format!("layout helper: {err}"));
+        queue.push_front(Cmd::Render);
+        return;
+    }
+
+    let top = &content_ids[4];
+    let bottom = &content_ids[5];
+
+    if let Some(base_current_path) = base_current_path.as_deref() {
+        for pane_id in content_ids
+            .iter()
+            .filter(|pane_id| !initial_content_ids.contains(*pane_id) || *pane_id == top || *pane_id == bottom)
+        {
+            let _ = tmux
+                .send_command(&build_cd_send_keys_cmd(pane_id, base_current_path))
+                .await;
+        }
+    }
+
+    let _ = tmux.send_command(&format!("send-keys -t {top} lazygit C-m")).await;
+    let _ = tmux.send_command(&format!("send-keys -t {bottom} yazi C-m")).await;
+    let _ = tmux.send_command(&commands::resize_pane_width(&model.sidebar.pane_id, SIDEBAR_WIDTH_CHARS)).await;
+    model.info_message = Some("layout helper applied".to_string());
+    queue.push_front(Cmd::Render);
+    queue.push_front(Cmd::ListWindows);
 }
 
 async fn handle_list_windows<T: TmuxApi>(
@@ -1660,6 +1945,67 @@ mod tests {
             trimmed.split_once(',').unwrap().1,
             "200x80,0,0[200x39,0,0,11,200x40,0,40,12]"
         );
+    }
+
+    #[test]
+    fn parse_layout_pane_line_parses_geometry() {
+        let (pane_id, geom) = parse_layout_pane_line("%12\t120\t4").expect("valid line");
+        assert_eq!(pane_id, "%12");
+        assert_eq!(geom, PaneGeom { left: 120, top: 4 });
+    }
+
+    #[test]
+    fn content_pane_ids_excludes_sidebar_and_sorts_by_geometry() {
+        let panes = vec![
+            ("%sidebar".to_string(), PaneGeom { left: 0, top: 0 }),
+            ("%2".to_string(), PaneGeom { left: 10, top: 20 }),
+            ("%1".to_string(), PaneGeom { left: 10, top: 0 }),
+            ("%3".to_string(), PaneGeom { left: 5, top: 0 }),
+        ];
+        assert_eq!(
+            content_pane_ids(&panes, "%sidebar"),
+            vec!["%3".to_string(), "%1".to_string(), "%2".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_split_window_cmd_carries_current_path() {
+        assert_eq!(
+            build_split_window_cmd("%2", Some("/tmp/my dir")),
+            "split-window -t %2 -h -c \"/tmp/my dir\""
+        );
+        assert_eq!(build_split_window_cmd("%2", None), "split-window -t %2 -h");
+    }
+
+    #[test]
+    fn build_cd_send_keys_cmd_shell_quotes_path() {
+        let cmd = build_cd_send_keys_cmd("%2", "/tmp/it's here");
+        assert!(cmd.starts_with("send-keys -t %2 \"cd -- "));
+        assert!(cmd.contains("/tmp/it"));
+        assert!(cmd.contains("s here'"));
+        assert!(cmd.ends_with("\" C-m"));
+    }
+
+    #[test]
+    fn build_sidebar_main_3x2_layout_places_right_column_last_two_panes() {
+        let layout = build_sidebar_main_3x2_layout(120, 40, 1, &[2, 3, 4, 5, 6, 7])
+            .expect("layout should build");
+        let root = query_layout_root(&layout).expect("layout should parse");
+        let LayoutNode::Split { kind, children, .. } = root else {
+            panic!("expected root split");
+        };
+        assert_eq!(kind, LayoutKind::LeftRight);
+        assert_eq!(children.len(), 2);
+        match &children[1] {
+            LayoutNode::Split { children, .. } => match &children[2] {
+                LayoutNode::Split { children, .. } => {
+                    assert!(matches!(children[0], LayoutNode::Pane { pane_id: 6, .. }));
+                    assert!(matches!(children[1], LayoutNode::Pane { pane_id: 7, .. }));
+                }
+                _ => panic!("expected right column split"),
+            },
+            _ => panic!("expected main split"),
+        }
     }
 
     #[test]

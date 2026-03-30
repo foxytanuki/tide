@@ -48,6 +48,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         }
         Msg::RenameWindow => handle_rename_window(model),
         Msg::CloseWindow => handle_close_window(model),
+        Msg::ApplyLayoutHelper => vec![Cmd::ApplyLayoutHelper],
         Msg::WindowFocusChanged(window_id) => handle_window_focus_changed(model, window_id),
         Msg::WindowChanged => vec![Cmd::ListWindows],
         Msg::WindowRenamed { window_id, name } => handle_window_renamed(model, window_id, name),
@@ -703,5 +704,16 @@ mod tests {
         );
         assert_eq!(model.cursor(), 0); // cursor unchanged
         assert_eq!(model.input_buffer, "3"); // character inserted into buffer
+    }
+
+    #[test]
+    fn layout_helper_key_maps_to_command() {
+        let mut model = test_model();
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE)),
+        );
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::ApplyLayoutHelper));
     }
 }

@@ -105,6 +105,7 @@ fn handle_normal_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
         KeyCode::Char('r') => update(model, Msg::RenameWindow),
         KeyCode::Char('x') => update(model, Msg::CloseWindow),
         KeyCode::Char('c') => update(model, Msg::NewWindow),
+        KeyCode::Char('L') => update(model, Msg::ApplyLayoutHelper),
         KeyCode::Char('C') => update(model, Msg::NewProject),
         KeyCode::Char('R') => update(model, Msg::Restart),
         KeyCode::Char('q') => update(model, Msg::Quit),

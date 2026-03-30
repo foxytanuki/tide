@@ -255,7 +255,14 @@ fn build_footer_text(model: &Model, width: usize) -> String {
 }
 
 fn build_normal_footer_text(width: usize) -> String {
-    let actions = ["[r]ename", "[x]close", "[c]new", "[C]proj", "[R]estart"];
+    let actions = [
+        "[r]ename",
+        "[x]close",
+        "[c]new",
+        "[L]ayout",
+        "[C]proj",
+        "[R]estart",
+    ];
     fit_footer_actions(&actions, width)
 }
 
@@ -389,10 +396,15 @@ mod tests {
     }
 
     #[test]
+    fn normal_footer_includes_layout_action() {
+        assert!(build_normal_footer_text(64).contains("[L]ayout"));
+    }
+
+    #[test]
     fn normal_footer_shows_all_actions_when_width_allows() {
         assert_eq!(
             build_normal_footer_text(64),
-            "[r]ename [x]close [c]new [C]proj [R]estart"
+            "[r]ename [x]close [c]new [L]ayout [C]proj [R]estart"
         );
     }
 }

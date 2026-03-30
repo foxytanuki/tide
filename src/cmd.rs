@@ -21,6 +21,7 @@ pub enum Cmd {
     },
     EnsureSidebarWidth,
     ListWindows,
+    ApplyLayoutHelper,
     /// Check if sidebar window still has content panes; evacuate if not.
     ValidateSidebarPanes,
 

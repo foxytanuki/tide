@@ -30,6 +30,7 @@ pub enum Msg {
     NewProject,
     RenameWindow,
     CloseWindow,
+    ApplyLayoutHelper,
 
     // Mouse events
     MouseClick {
