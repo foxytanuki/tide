@@ -109,26 +109,17 @@ fn render_tree_item(
                 }
             }
             (FlatNodeKind::Window, TreeNode::Window { info }) => {
-                let branch = window_branch(model.tree(), &item.path);
                 let active_id = model
                     .sidebar
                     .pending_preview_id
                     .as_deref()
                     .unwrap_or(&model.sidebar.window_id);
-                let prefix = visible_prefix(model, index, &indent);
+                let prefix = window_prefix(model, index, &indent);
                 if info.id == active_id {
-                    content = if branch == " " {
-                        format!("{prefix}* {}", info.name)
-                    } else {
-                        format!("{prefix}{branch} * {}", info.name)
-                    };
+                    content = format!("{prefix}* {}", info.name);
                     style = style.fg(Color::Yellow);
                 } else {
-                    content = if branch == " " {
-                        format!("{prefix}{}", info.name)
-                    } else {
-                        format!("{prefix}{branch} {}", info.name)
-                    };
+                    content = format!("{prefix}{}", info.name);
                 }
                 if model.ai.windows.contains(&info.id) {
                     badge = AiBadge::Active;
@@ -186,6 +177,13 @@ fn visible_prefix(model: &Model, index: usize, indent: &str) -> String {
     match visible_item_number(model.flat_items(), index) {
         Some(n) => format!("{indent}{n}:"),
         None => indent.to_string(),
+    }
+}
+
+fn window_prefix(model: &Model, index: usize, indent: &str) -> String {
+    match visible_item_number(model.flat_items(), index) {
+        Some(n) => format!("{indent}|- {n}: "),
+        None => format!("{indent}|- "),
     }
 }
 
@@ -296,29 +294,6 @@ fn fit_footer_actions(actions: &[&str], width: usize) -> String {
         result.push_str(" …");
     }
     result
-}
-
-/// Returns the branch character for a window node based on whether it's the last
-/// child in its parent folder.
-fn window_branch(tree: &[TreeNode], path: &[usize]) -> &'static str {
-    if path.len() < 2 {
-        // Top-level window (depth 0) has no parent folder
-        return " ";
-    }
-
-    let parent_path = &path[..path.len() - 1];
-    let child_idx = path[path.len() - 1];
-
-    match get_node(tree, parent_path) {
-        Ok(TreeNode::Folder { children, .. }) => {
-            if child_idx + 1 == children.len() {
-                "└"
-            } else {
-                "├"
-            }
-        }
-        _ => "├",
-    }
 }
 
 /// Returns the prefix length before the input text for cursor positioning.
