@@ -1096,6 +1096,28 @@ fn build_cd_send_keys_cmd(target: &str, current_path: &str) -> String {
     format!("send-keys -t {target} {} C-m", quote_tmux(&command))
 }
 
+fn is_shell_command(current_command: &str) -> bool {
+    let command = current_command.trim();
+    if command.is_empty() {
+        return true;
+    }
+
+    matches!(
+        command,
+        "sh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "dash"
+            | "ash"
+            | "ksh"
+            | "csh"
+            | "tcsh"
+            | "nu"
+            | "pwsh"
+    )
+}
+
 fn split_even(total: u32, parts: usize) -> Vec<u32> {
     let parts = parts as u32;
     let base = total / parts;
@@ -1401,29 +1423,87 @@ async fn apply_layout_helper<T: TmuxApi>(
     let top = &content_ids[4];
     let bottom = &content_ids[5];
 
+    let helper_already_managed = model
+        .sidebar
+        .helper_managed_windows
+        .contains(&model.sidebar.window_id);
+    let top_is_new = !initial_content_ids.contains(top);
+    let bottom_is_new = !initial_content_ids.contains(bottom);
+    let needs_existing_pane_commands = !helper_already_managed && (!top_is_new || !bottom_is_new);
+    let pane_commands: HashMap<String, String> = if needs_existing_pane_commands {
+        let commands_cmd = format!(
+            "list-panes -t {} -F '#{{pane_id}}\t#{{pane_current_command}}'",
+            model.sidebar.window_id
+        );
+        tmux.send_command(&commands_cmd)
+            .await
+            .ok()
+            .map(|output| {
+                output
+                    .lines()
+                    .filter_map(|line| {
+                        let mut parts = line.trim().split('\t');
+                        Some((parts.next()?.to_string(), parts.next()?.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    let can_initialize_existing_pane = |pane_id: &String| {
+        pane_commands
+            .get(pane_id)
+            .is_some_and(|cmd| is_shell_command(cmd))
+    };
+
     if let Some(base_current_path) = base_current_path.as_deref() {
-        for pane_id in content_ids.iter().filter(|pane_id| {
-            !initial_content_ids.contains(*pane_id) || *pane_id == top || *pane_id == bottom
-        }) {
-            let _ = tmux
-                .send_command(&build_cd_send_keys_cmd(pane_id, base_current_path))
-                .await;
+        for pane_id in &content_ids {
+            let is_new = !initial_content_ids.contains(pane_id);
+            let is_helper_slot = pane_id == top || pane_id == bottom;
+            let should_send_cd = if is_new {
+                true
+            } else if !helper_already_managed && is_helper_slot {
+                can_initialize_existing_pane(pane_id)
+            } else {
+                false
+            };
+
+            if should_send_cd {
+                let _ = tmux
+                    .send_command(&build_cd_send_keys_cmd(pane_id, base_current_path))
+                    .await;
+            }
         }
     }
 
-    let _ = tmux
-        .send_command(&format!("send-keys -t {top} lazygit C-m"))
-        .await;
-    let _ = tmux
-        .send_command(&format!("send-keys -t {bottom} yazi C-m"))
-        .await;
+    if !helper_already_managed {
+        if top_is_new || can_initialize_existing_pane(top) {
+            let _ = tmux
+                .send_command(&format!("send-keys -t {top} lazygit C-m"))
+                .await;
+        }
+        if bottom_is_new || can_initialize_existing_pane(bottom) {
+            let _ = tmux
+                .send_command(&format!("send-keys -t {bottom} yazi C-m"))
+                .await;
+        }
+    }
     let _ = tmux
         .send_command(&commands::resize_pane_width(
             &model.sidebar.pane_id,
             SIDEBAR_WIDTH_CHARS,
         ))
         .await;
-    model.info_message = Some("layout helper applied".to_string());
+    model.info_message = Some(
+        if helper_already_managed {
+            "layout helper refreshed"
+        } else {
+            "layout helper applied"
+        }
+        .to_string(),
+    );
     model
         .sidebar
         .helper_managed_windows
@@ -2508,6 +2588,77 @@ mod tests {
         assert_eq!(tmux.commands.len(), 3);
         assert!(tmux.commands[1].contains("display-message -t %sidebar -p '#{window_id}'"));
         assert!(tmux.commands[2].contains("list-panes -t @new"));
+    }
+
+    #[tokio::test]
+    async fn apply_layout_helper_launches_helper_apps_on_first_apply() {
+        let mut model = test_model();
+        model.sidebar.pane_id = "%9".to_string();
+
+        let layout = build_sidebar_main_3x2_layout(120, 40, 9, &[2, 3, 4, 5, 6, 7])
+            .expect("layout should build");
+
+        let mut tmux = FakeTmux::new(vec![
+            Ok("%9\t0\t0\n%2\t31\t0\n%3\t50\t0\n%4\t69\t0\n%5\t31\t20\n%6\t50\t20\n%7\t69\t20\n".to_string()),
+            Ok("/work\n".to_string()),
+            Ok(format!("1234,{}", layout.split_once(',').unwrap().1)),
+            Ok(String::new()),
+            Ok("%2\tbash\n%3\tbash\n%4\tbash\n%5\tbash\n%6\tbash\n%7\tbash\n".to_string()),
+            Ok(String::new()),
+            Ok(String::new()),
+            Ok(String::new()),
+            Ok(String::new()),
+            Ok(String::new()),
+            Ok(String::new()),
+        ]);
+
+        let mut queue = VecDeque::new();
+        apply_layout_helper(&mut model, &mut tmux, &mut queue).await;
+
+        assert!(tmux
+            .commands
+            .iter()
+            .any(|cmd| cmd.contains("pane_current_command")));
+        assert!(tmux
+            .commands
+            .iter()
+            .any(|cmd| cmd == "send-keys -t %4 lazygit C-m"));
+        assert!(tmux
+            .commands
+            .iter()
+            .any(|cmd| cmd == "send-keys -t %7 yazi C-m"));
+        assert!(tmux.commands.iter().any(|cmd| cmd.starts_with("select-layout -t @old ")));
+        assert!(model.sidebar.helper_managed_windows.contains(&model.sidebar.window_id));
+        assert_eq!(model.info_message.as_deref(), Some("layout helper applied"));
+    }
+
+    #[tokio::test]
+    async fn apply_layout_helper_reapply_skips_launch_on_helper_managed_window() {
+        let mut model = test_model();
+        model.sidebar.pane_id = "%9".to_string();
+        model.sidebar.helper_managed_windows.insert("@old".to_string());
+
+        let layout = build_sidebar_main_3x2_layout(120, 40, 9, &[2, 3, 4, 5, 6, 7])
+            .expect("layout should build");
+
+        let mut tmux = FakeTmux::new(vec![
+            Ok("%9\t0\t0\n%2\t31\t0\n%3\t50\t0\n%4\t69\t0\n%5\t31\t20\n%6\t50\t20\n%7\t69\t20\n".to_string()),
+            Ok("/work\n".to_string()),
+            Ok(format!("1234,{}", layout.split_once(',').unwrap().1)),
+            Ok(String::new()),
+            Ok(String::new()),
+            Ok(String::new()),
+        ]);
+
+        let mut queue = VecDeque::new();
+        apply_layout_helper(&mut model, &mut tmux, &mut queue).await;
+
+        assert!(!tmux.commands.iter().any(|cmd| cmd.contains("pane_current_command")));
+        assert!(tmux.commands.iter().any(|cmd| cmd.starts_with("select-layout -t @old ")));
+        assert!(!tmux.commands.iter().any(|cmd| cmd.contains(" lazygit C-m")));
+        assert!(!tmux.commands.iter().any(|cmd| cmd.contains(" yazi C-m")));
+        assert!(!tmux.commands.iter().any(|cmd| cmd.contains("cd -- ")));
+        assert_eq!(model.info_message.as_deref(), Some("layout helper refreshed"));
     }
 
     #[tokio::test]
