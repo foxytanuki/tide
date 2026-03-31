@@ -104,6 +104,14 @@ async fn save_window_layout_without_pane<T: TmuxApi>(
         .insert(window_id.to_string(), (term_w, layout));
 }
 
+fn cleanup_helper_managed_windows(model: &mut Model, windows: &[WindowInfo]) {
+    let live: HashSet<&str> = windows.iter().map(|window| window.id.as_str()).collect();
+    model
+        .sidebar
+        .helper_managed_windows
+        .retain(|id| live.contains(id.as_str()));
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LayoutKind {
     LeftRight,
@@ -637,6 +645,7 @@ async fn handle_preview_window<T: TmuxApi>(
     // Restore leaving window's pane layout when we have an exact
     // "without sidebar" snapshot.
     restore_or_seed_leaving_layout(model, tmux, &leaving_window).await;
+    reapply_helper_layout_if_needed(model, tmux, &target_window_id).await;
 
     // Resolve home pane if needed (query after move).
     let new_home = if !target_home.is_empty() {
@@ -732,6 +741,7 @@ async fn handle_restore_preview<T: TmuxApi>(
         // Restore leaving window's pane layout after batch.
         if restored {
             restore_or_seed_leaving_layout(model, tmux, &leaving_window).await;
+            reapply_helper_layout_if_needed(model, tmux, &orig_window).await;
         }
 
         if restored {
@@ -927,6 +937,7 @@ async fn handle_close_window<T: TmuxApi>(
         queue.push_front(Cmd::Render);
     } else {
         model.sidebar.pane_layouts.remove(&id);
+        model.sidebar.helper_managed_windows.remove(&id);
         // Proactively refresh — don't rely solely on %window-close notification.
         queue.push_front(Cmd::ListWindows);
     }
@@ -979,6 +990,7 @@ async fn handle_follow_to_window<T: TmuxApi>(
 
     // Restore leaving window's pane layout.
     restore_or_seed_leaving_layout(model, tmux, &leaving_window).await;
+    reapply_helper_layout_if_needed(model, tmux, &target_window_id).await;
 
     // Resolve home pane.
     let new_home = if !target_home.is_empty() {
@@ -1167,6 +1179,63 @@ fn build_sidebar_main_3x2_layout(
     Some(serialize_layout(&root))
 }
 
+async fn reapply_helper_layout_if_needed<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    window_id: &str,
+) {
+    if !model.sidebar.helper_managed_windows.contains(window_id) {
+        return;
+    }
+
+    let list_cmd = format!(
+        "list-panes -t {} -F '#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}'",
+        window_id
+    );
+    let Ok(output) = tmux.send_command(&list_cmd).await else {
+        return;
+    };
+
+    let panes: Vec<(String, PaneGeom)> =
+        output.lines().filter_map(parse_layout_pane_line).collect();
+    let content_ids = content_pane_ids(&panes, &model.sidebar.pane_id);
+    if content_ids.len() != 6 {
+        return;
+    }
+
+    let Some(layout) = query_window_layout(tmux, window_id).await else {
+        return;
+    };
+    let Some(root) = query_layout_root(&layout) else {
+        return;
+    };
+    let Some(sidebar_pane_id) = parse_pane_number(&model.sidebar.pane_id) else {
+        return;
+    };
+
+    let mut content_pane_numbers = Vec::with_capacity(content_ids.len());
+    for pane_id in &content_ids {
+        let Some(pane_number) = parse_pane_number(pane_id) else {
+            return;
+        };
+        content_pane_numbers.push(pane_number);
+    }
+
+    let Some(explicit_layout) =
+        build_sidebar_main_3x2_layout(root.sx(), root.sy(), sidebar_pane_id, &content_pane_numbers)
+    else {
+        return;
+    };
+
+    let _ = tmux
+        .send_command(&format!(
+            "select-layout -t {} {}",
+            window_id,
+            quote_tmux(&explicit_layout)
+        ))
+        .await;
+}
+
 async fn validate_sidebar_panes<T: TmuxApi>(
     model: &Model,
     tmux: &mut T,
@@ -1208,7 +1277,11 @@ async fn validate_sidebar_panes<T: TmuxApi>(
     }
 }
 
-async fn apply_layout_helper<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue: &mut VecDeque<Cmd>) {
+async fn apply_layout_helper<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    queue: &mut VecDeque<Cmd>,
+) {
     let list_cmd = format!(
         "list-panes -t {} -F '#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}'",
         model.sidebar.window_id
@@ -1219,7 +1292,8 @@ async fn apply_layout_helper<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue:
         return;
     };
 
-    let mut panes: Vec<(String, PaneGeom)> = output.lines().filter_map(parse_layout_pane_line).collect();
+    let mut panes: Vec<(String, PaneGeom)> =
+        output.lines().filter_map(parse_layout_pane_line).collect();
     let initial_content_ids: HashSet<String> = content_pane_ids(&panes, &model.sidebar.pane_id)
         .into_iter()
         .collect();
@@ -1303,12 +1377,9 @@ async fn apply_layout_helper<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue:
         };
         content_pane_numbers.push(pane_number);
     }
-    let Some(explicit_layout) = build_sidebar_main_3x2_layout(
-        root.sx(),
-        root.sy(),
-        sidebar_pane_id,
-        &content_pane_numbers,
-    ) else {
+    let Some(explicit_layout) =
+        build_sidebar_main_3x2_layout(root.sx(), root.sy(), sidebar_pane_id, &content_pane_numbers)
+    else {
         model.error_message = Some("layout helper: window too small".to_string());
         queue.push_front(Cmd::Render);
         return;
@@ -1331,20 +1402,32 @@ async fn apply_layout_helper<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue:
     let bottom = &content_ids[5];
 
     if let Some(base_current_path) = base_current_path.as_deref() {
-        for pane_id in content_ids
-            .iter()
-            .filter(|pane_id| !initial_content_ids.contains(*pane_id) || *pane_id == top || *pane_id == bottom)
-        {
+        for pane_id in content_ids.iter().filter(|pane_id| {
+            !initial_content_ids.contains(*pane_id) || *pane_id == top || *pane_id == bottom
+        }) {
             let _ = tmux
                 .send_command(&build_cd_send_keys_cmd(pane_id, base_current_path))
                 .await;
         }
     }
 
-    let _ = tmux.send_command(&format!("send-keys -t {top} lazygit C-m")).await;
-    let _ = tmux.send_command(&format!("send-keys -t {bottom} yazi C-m")).await;
-    let _ = tmux.send_command(&commands::resize_pane_width(&model.sidebar.pane_id, SIDEBAR_WIDTH_CHARS)).await;
+    let _ = tmux
+        .send_command(&format!("send-keys -t {top} lazygit C-m"))
+        .await;
+    let _ = tmux
+        .send_command(&format!("send-keys -t {bottom} yazi C-m"))
+        .await;
+    let _ = tmux
+        .send_command(&commands::resize_pane_width(
+            &model.sidebar.pane_id,
+            SIDEBAR_WIDTH_CHARS,
+        ))
+        .await;
     model.info_message = Some("layout helper applied".to_string());
+    model
+        .sidebar
+        .helper_managed_windows
+        .insert(model.sidebar.window_id.clone());
     queue.push_front(Cmd::Render);
     queue.push_front(Cmd::ListWindows);
 }
@@ -1369,6 +1452,7 @@ async fn handle_list_windows<T: TmuxApi>(
                 .sidebar
                 .pane_layouts
                 .retain(|id, _| windows.iter().any(|w| w.id == *id));
+            cleanup_helper_managed_windows(model, &windows);
             enqueue_follow_up(queue, update(model, Msg::WindowListLoaded(windows)));
         }
         Err(err) => {
@@ -2424,5 +2508,84 @@ mod tests {
         assert_eq!(tmux.commands.len(), 3);
         assert!(tmux.commands[1].contains("display-message -t %sidebar -p '#{window_id}'"));
         assert!(tmux.commands[2].contains("list-panes -t @new"));
+    }
+
+    #[tokio::test]
+    async fn reapply_helper_layout_runs_for_helper_managed_windows() {
+        let mut model = test_model();
+        model.sidebar.pane_id = "%9".to_string();
+        model
+            .sidebar
+            .helper_managed_windows
+            .insert("@1".to_string());
+
+        let layout = build_sidebar_main_3x2_layout(120, 40, 9, &[2, 3, 4, 5, 6, 7])
+            .expect("layout should build");
+
+        let mut tmux = FakeTmux::new(vec![
+            Ok(
+                "%9\t0\t0\n%2\t31\t0\n%3\t50\t0\n%4\t69\t0\n%5\t31\t20\n%6\t50\t20\n%7\t69\t20\n"
+                    .to_string(),
+            ),
+            Ok(format!("1234,{}", layout.split_once(',').unwrap().1)),
+            Ok(String::new()),
+        ]);
+
+        reapply_helper_layout_if_needed(&mut model, &mut tmux, "@1").await;
+
+        assert_eq!(tmux.commands.len(), 3);
+        assert!(tmux.commands[0].starts_with("list-panes -t @1"));
+        assert!(tmux.commands[2].starts_with("select-layout -t @1 "));
+    }
+
+    #[tokio::test]
+    async fn reapply_helper_layout_skips_non_applicable_windows() {
+        let mut model = test_model();
+        model
+            .sidebar
+            .helper_managed_windows
+            .insert("@1".to_string());
+
+        let mut tmux = FakeTmux::new(vec![Ok(
+            "%sidebar\t0\t0\n%1\t31\t0\n%2\t50\t0\n%3\t69\t0\n%4\t31\t20\n".to_string(),
+        )]);
+
+        reapply_helper_layout_if_needed(&mut model, &mut tmux, "@1").await;
+
+        assert_eq!(tmux.commands.len(), 1);
+        assert!(tmux.commands[0].starts_with("list-panes -t @1"));
+    }
+
+    #[tokio::test]
+    async fn follow_to_window_reapplies_helper_layout_for_helper_managed_windows() {
+        let mut model = test_model();
+        model.sidebar.pane_id = "%9".to_string();
+        model.sidebar.helper_managed_windows.insert("@new".to_string());
+
+        let mut queue = VecDeque::new();
+        let explicit_layout = build_sidebar_main_3x2_layout(120, 40, 9, &[2, 3, 4, 5, 6, 7])
+            .expect("layout should build");
+
+        let mut tmux = FakeTmux::new(vec![
+            Ok("%2\t0\t0\n%3\t39\t0\n%4\t78\t0\n%5\t0\t20\n%6\t39\t20\n%7\t78\t20\n".to_string()),
+            Ok("%2\t1\n%3\t0\n%4\t0\n%5\t0\n%6\t0\n%7\t0\n".to_string()),
+            Ok("aaaa,119x40,0,0{39x40,0,0[39x19,0,0,2,39x20,0,20,5],38x40,40,0[38x19,40,0,3,38x20,40,20,6],39x40,79,0[39x19,79,0,4,39x20,79,20,7]}".to_string()),
+            Ok("9999,200x80,0,0{30x80,0,0,9,169x80,31,0[169x39,31,0,11,169x40,31,40,12]}".to_string()),
+            Ok(String::new()),
+            Ok(String::new()),
+            Ok("%9\t0\t0\n%2\t31\t0\n%5\t31\t20\n%3\t61\t0\n%6\t61\t20\n%4\t91\t0\n%7\t91\t20\n".to_string()),
+            Ok(format!("1234,{}", explicit_layout.split_once(',').unwrap().1)),
+            Ok(String::new()),
+        ]);
+
+        handle_follow_to_window(&mut model, &mut tmux, &mut queue, "@new".to_string()).await;
+
+        assert_eq!(model.sidebar.window_id, "@new");
+        assert_eq!(model.sidebar.home_pane_id, "%2");
+        assert!(matches!(queue.front(), Some(Cmd::CheckBorder)));
+        assert!(tmux
+            .commands
+            .iter()
+            .any(|cmd| cmd.starts_with("select-layout -t @new ")));
     }
 }
