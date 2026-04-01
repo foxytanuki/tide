@@ -46,6 +46,8 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
             model.mode = Mode::CreatingProject;
             vec![Cmd::Render]
         }
+        Msg::MoveItem => handle_move_item(model),
+        Msg::MoveProject => handle_move_project(model),
         Msg::RenameWindow => handle_rename_window(model),
         Msg::CloseWindow => handle_close_window(model),
         Msg::ApplyLayoutHelper => vec![Cmd::ApplyLayoutHelper],
@@ -133,7 +135,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PendingRename, PreviewState};
+    use crate::model::{MoveSubject, PendingRename, PreviewState, SelectionTarget};
     use crate::tree::{build_tree, TreeNode, WindowInfo};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -721,6 +723,156 @@ mod tests {
         );
         assert_eq!(model.cursor(), 0); // cursor unchanged
         assert_eq!(model.input_buffer, "3"); // character inserted into buffer
+    }
+
+    #[test]
+    fn move_item_key_enters_move_mode() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "proj:term")]),
+        );
+
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+        );
+
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::Render));
+        assert!(matches!(
+            model.mode,
+            Mode::Moving {
+                subject: MoveSubject::Item(SelectionTarget::Window(ref id))
+            } if id == "@1"
+        ));
+    }
+
+    #[test]
+    fn move_item_enter_reorders_within_project_scope() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                wi("@1", 1, "proj:edit"),
+                wi("@2", 2, "scratch"),
+                wi("@3", 3, "proj:term"),
+            ]),
+        );
+
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+        );
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
+        );
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert_eq!(model.mode, Mode::Normal);
+        assert_eq!(
+            model.reorder.pending_selection,
+            Some(SelectionTarget::Window("@1".to_string()))
+        );
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            Cmd::ReorderWindows { order, selection } => {
+                assert_eq!(
+                    order,
+                    &vec!["@3".to_string(), "@1".to_string(), "@2".to_string()]
+                );
+                assert_eq!(selection, &SelectionTarget::Window("@1".to_string()));
+            }
+            other => panic!("expected ReorderWindows, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn move_project_key_from_child_targets_root_project() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                wi("@1", 1, "proj:edit"),
+                wi("@2", 2, "scratch"),
+                wi("@3", 3, "proj:term"),
+                wi("@4", 4, "other:main"),
+            ]),
+        );
+
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT)),
+        );
+        assert!(matches!(
+            model.mode,
+            Mode::Moving {
+                subject: MoveSubject::Project { ref folder_name }
+            } if folder_name == "proj"
+        ));
+
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
+        );
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert_eq!(
+            model.reorder.pending_selection,
+            Some(SelectionTarget::Folder("proj".to_string()))
+        );
+        match &cmds[0] {
+            Cmd::ReorderWindows { order, selection } => {
+                assert_eq!(
+                    order,
+                    &vec![
+                        "@2".to_string(),
+                        "@1".to_string(),
+                        "@3".to_string(),
+                        "@4".to_string()
+                    ]
+                );
+                assert_eq!(selection, &SelectionTarget::Folder("proj".to_string()));
+            }
+            other => panic!("expected ReorderWindows, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn move_enter_rejects_out_of_range_position() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "proj:term")]),
+        );
+
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+        );
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)),
+        );
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::Render));
+        assert!(matches!(model.mode, Mode::Moving { .. }));
+        assert_eq!(
+            model.error_message.as_deref(),
+            Some("move: invalid destination")
+        );
     }
 
     #[test]

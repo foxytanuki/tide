@@ -28,6 +28,8 @@ pub enum Msg {
     Escape,
     NewWindow,
     NewProject,
+    MoveItem,
+    MoveProject,
     RenameWindow,
     CloseWindow,
     ApplyLayoutHelper,

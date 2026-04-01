@@ -6,7 +6,7 @@ use crate::msg::Msg;
 use crate::tree::{get_node, TreeNode};
 
 use super::naming::{collect_folder_children, reconstruct_full_name};
-use super::navigation::exit_to_normal_mode;
+use super::navigation::{exit_to_normal_mode, handle_move_enter};
 use super::update;
 
 pub(super) fn handle_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
@@ -15,6 +15,7 @@ pub(super) fn handle_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
         Mode::Renaming { .. } => handle_renaming_key(model, event),
         Mode::RenamingFolder { .. } => handle_renaming_folder_key(model, event),
         Mode::CreatingProject => handle_creating_project_key(model, event),
+        Mode::Moving { .. } => handle_moving_key(model, event),
         Mode::ConfirmClose { .. } => handle_confirm_close_key(model, event),
     }
 }
@@ -105,7 +106,9 @@ fn handle_normal_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
         KeyCode::Char('r') => update(model, Msg::RenameWindow),
         KeyCode::Char('x') => update(model, Msg::CloseWindow),
         KeyCode::Char('c') => update(model, Msg::NewWindow),
+        KeyCode::Char('m') => update(model, Msg::MoveItem),
         KeyCode::Char('L') => update(model, Msg::ApplyLayoutHelper),
+        KeyCode::Char('M') => update(model, Msg::MoveProject),
         KeyCode::Char('C') => update(model, Msg::NewProject),
         KeyCode::Char('R') => update(model, Msg::Restart),
         KeyCode::Char('q') => update(model, Msg::Quit),
@@ -178,6 +181,20 @@ fn handle_confirm_close_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
             model.mode = Mode::Normal;
             vec![Cmd::Render]
         }
+        _ => vec![],
+    }
+}
+
+fn handle_moving_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
+    if !is_plain_key(&event) {
+        return vec![];
+    }
+    if let Some(cmds) = handle_input_key(model, event.code) {
+        return cmds;
+    }
+    match event.code {
+        KeyCode::Enter => handle_move_enter(model),
+        KeyCode::Esc => exit_to_normal_mode(model),
         _ => vec![],
     }
 }

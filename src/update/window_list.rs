@@ -1,7 +1,7 @@
 use tracing::debug;
 
 use crate::cmd::Cmd;
-use crate::model::{Mode, Model, PreviewState};
+use crate::model::{Mode, Model, PreviewState, SelectionTarget};
 use crate::tree::{build_tree, WindowInfo};
 
 use super::naming::{collect_folder_expanded, restore_folder_expanded};
@@ -73,28 +73,34 @@ pub(super) fn handle_window_list_loaded(
     mut windows: Vec<WindowInfo>,
 ) -> Vec<Cmd> {
     let expanded_state = collect_folder_expanded(model.tree());
-    let mut selected_window_id = derive_selected_window_id(model);
+    let mut selected_target = derive_selected_target(model);
 
-    let selected_exists = selected_window_id
-        .as_deref()
-        .is_some_and(|id| windows.iter().any(|w| w.id == *id));
+    let selected_exists = match selected_target.as_ref() {
+        Some(SelectionTarget::Window(id)) => windows.iter().any(|w| w.id == *id),
+        Some(SelectionTarget::Folder(folder)) => {
+            let folder_prefix = format!("{folder}:");
+            windows.iter().any(|w| w.name.starts_with(&folder_prefix))
+        }
+        None => false,
+    };
     debug!(
         pending_count = model.renames.pending.len(),
         pending_last = model.renames.last_window_id.as_deref(),
         mode = ?model.mode,
-        selected = selected_window_id.as_deref(),
+        selected = ?selected_target,
         exists = selected_exists,
         cursor = model.cursor(),
         "window list loaded"
     );
 
-    bump_last_pending_if_missing(model, &windows, &mut selected_window_id);
+    bump_last_pending_if_missing(model, &windows, &mut selected_target);
     windows.sort_by_key(|window| window.index);
 
     let mut new_tree = build_tree(&windows);
     restore_folder_expanded(&mut new_tree, &expanded_state);
-    let selected_ref = selected_window_id.as_deref();
+    let selected_ref = selected_target.as_ref();
     model.replace_tree_preserve_selection(new_tree, selected_ref);
+    model.reorder.pending_selection = None;
 
     let (mut followup_cmds, stale_pending_ids) = reconcile_pending_renames(model, &windows);
     clear_stale_pending_renames(model, stale_pending_ids);
@@ -102,7 +108,7 @@ pub(super) fn handle_window_list_loaded(
 
     debug!(
         cursor = model.cursor(),
-        selected = selected_ref,
+        selected = ?selected_ref,
         "window list selection restored"
     );
 
@@ -111,38 +117,50 @@ pub(super) fn handle_window_list_loaded(
     followup_cmds
 }
 
-fn derive_selected_window_id(model: &Model) -> Option<String> {
+fn derive_selected_target(model: &Model) -> Option<SelectionTarget> {
     model
-        .renames
-        .last_window_id
-        .as_ref()
-        .filter(|id| model.renames.pending.contains_key(*id))
-        .cloned()
+        .reorder
+        .pending_selection
+        .clone()
+        .or_else(|| {
+            model
+                .renames
+                .last_window_id
+                .as_ref()
+                .filter(|id| model.renames.pending.contains_key(*id))
+                .cloned()
+                .map(SelectionTarget::Window)
+        })
         .or_else(|| match &model.mode {
-            Mode::Renaming { window_id } => Some(window_id.clone()),
-            _ => model.selected_window_info().map(|info| info.id.clone()),
+            Mode::Renaming { window_id } => Some(SelectionTarget::Window(window_id.clone())),
+            _ => model.selected_selection_target(),
         })
 }
 
 fn bump_last_pending_if_missing(
     model: &mut Model,
     windows: &[WindowInfo],
-    selected_window_id: &mut Option<String>,
+    selected_target: &mut Option<SelectionTarget>,
 ) {
-    if let Some(last_id) = model.renames.last_window_id.clone() {
-        let last_exists = windows.iter().any(|w| w.id == last_id);
-        if !last_exists {
-            if let Some(pending) = model.renames.pending.get_mut(&last_id) {
-                pending.observed_count = pending.observed_count.saturating_add(1);
-                debug!(
-                    id = last_id.as_str(),
-                    observed = pending.observed_count,
-                    "latest pending rename target missing from window list"
-                );
+    model
+        .renames
+        .last_window_id
+        .clone()
+        .into_iter()
+        .for_each(|last_id| {
+            let last_exists = windows.iter().any(|w| w.id == last_id);
+            if !last_exists {
+                if let Some(pending) = model.renames.pending.get_mut(&last_id) {
+                    pending.observed_count = pending.observed_count.saturating_add(1);
+                    debug!(
+                        id = last_id.as_str(),
+                        observed = pending.observed_count,
+                        "latest pending rename target missing from window list"
+                    );
+                }
+                *selected_target = None;
             }
-            *selected_window_id = None;
-        }
-    }
+        });
 }
 
 fn reconcile_pending_renames(model: &mut Model, windows: &[WindowInfo]) -> (Vec<Cmd>, Vec<String>) {

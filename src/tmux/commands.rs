@@ -29,6 +29,10 @@ pub fn rename_window(window_id: &str, name: &str) -> String {
     format!("rename-window -t {window_id} {}", quote_tmux(name))
 }
 
+pub fn swap_window(source_window_id: &str, target_window_id: &str) -> String {
+    format!("swap-window -s {source_window_id} -t {target_window_id}")
+}
+
 pub fn kill_window(window_id: &str) -> String {
     format!("kill-window -t {window_id}")
 }

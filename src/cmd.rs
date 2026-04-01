@@ -1,3 +1,5 @@
+use crate::model::SelectionTarget;
+
 #[derive(Debug, Clone)]
 pub enum Cmd {
     // Preview: swap target window's pane into right slot
@@ -12,6 +14,10 @@ pub enum Cmd {
     RenameWindow {
         id: String,
         name: String,
+    },
+    ReorderWindows {
+        order: Vec<String>,
+        selection: SelectionTarget,
     },
     CloseWindow {
         id: String,
