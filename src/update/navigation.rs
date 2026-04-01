@@ -1,8 +1,9 @@
 use crate::cmd::Cmd;
-use crate::model::{Mode, Model};
+use crate::model::{Mode, Model, MoveSubject, SelectionTarget};
 use crate::tree::{
-    find_parent_folder, get_node_mut, next_visible_item, prev_visible_item, toggle_expand,
-    visible_item_indices, FlatNodeKind, TreeNode, WindowInfo,
+    find_folder_flat_index_by_path, find_parent_folder, find_window_flat_index_by_id, get_node_mut,
+    move_node_to_position, next_visible_item, prev_visible_item, toggle_expand,
+    visible_item_indices, window_ids_in_order, FlatNodeKind, TreeNode, WindowInfo,
 };
 
 use super::input::{clear_input, set_input};
@@ -27,12 +28,125 @@ pub(super) fn clear_mode_if_missing_target(model: &mut Model, windows: &[WindowI
             let folder_prefix = format!("{folder_name}:");
             windows.iter().all(|w| !w.name.starts_with(&folder_prefix))
         }
+        Mode::Moving { subject } => match subject {
+            MoveSubject::Item(SelectionTarget::Window(window_id)) => {
+                !windows.iter().any(|w| w.id == *window_id)
+            }
+            MoveSubject::Item(SelectionTarget::Folder(folder_name))
+            | MoveSubject::Project { folder_name } => {
+                let folder_prefix = format!("{folder_name}:");
+                windows.iter().all(|w| !w.name.starts_with(&folder_prefix))
+            }
+        },
         Mode::Normal | Mode::CreatingProject => false,
     };
 
     if should_reset {
         reset_to_normal_mode(model);
     }
+}
+
+pub(super) fn handle_move_item(model: &mut Model) -> Vec<Cmd> {
+    let subject = match model.selected_selection_target() {
+        Some(target) => MoveSubject::Item(target),
+        None => return vec![],
+    };
+    clear_input(model);
+    model.mode = Mode::Moving { subject };
+    vec![Cmd::Render]
+}
+
+pub(super) fn handle_move_project(model: &mut Model) -> Vec<Cmd> {
+    let item = match model.flat_items().get(model.cursor()) {
+        Some(item) => item.clone(),
+        None => return vec![],
+    };
+
+    let folder_name = match item.kind {
+        FlatNodeKind::Folder => reconstruct_folder_full_name(model, &item.path),
+        FlatNodeKind::Window => {
+            let info = match model.selected_window_info() {
+                Some(info) => info,
+                None => return vec![],
+            };
+            let full_name = reconstruct_full_name(model, model.cursor(), &info.name);
+            match full_name.split_once(':') {
+                Some((folder, _)) => folder.to_string(),
+                None => return vec![],
+            }
+        }
+    };
+
+    let root_folder = folder_name
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    if root_folder.is_empty() {
+        return vec![];
+    }
+
+    clear_input(model);
+    model.mode = Mode::Moving {
+        subject: MoveSubject::Project {
+            folder_name: root_folder,
+        },
+    };
+    vec![Cmd::Render]
+}
+
+pub(super) fn handle_move_enter(model: &mut Model) -> Vec<Cmd> {
+    let subject = match model.mode.clone() {
+        Mode::Moving { subject } => subject,
+        _ => return vec![],
+    };
+
+    let raw = model.input_buffer.trim();
+    let Ok(position) = raw.parse::<usize>() else {
+        model.error_message = Some("move: enter a valid number".to_string());
+        return vec![Cmd::Render];
+    };
+
+    let selection = match &subject {
+        MoveSubject::Item(target) => target.clone(),
+        MoveSubject::Project { folder_name } => SelectionTarget::Folder(folder_name.clone()),
+    };
+
+    let Some(order) = build_move_order(model, &subject, position) else {
+        model.error_message = Some("move: invalid destination".to_string());
+        return vec![Cmd::Render];
+    };
+
+    if order == window_ids_in_order(model.tree()) {
+        model.mode = Mode::Normal;
+        clear_input(model);
+        model.info_message = Some("move: already in that position".to_string());
+        return vec![Cmd::Render];
+    }
+
+    model.mode = Mode::Normal;
+    clear_input(model);
+    model.reorder.pending_selection = Some(selection.clone());
+    vec![Cmd::ReorderWindows { order, selection }]
+}
+
+fn build_move_order(model: &Model, subject: &MoveSubject, position: usize) -> Option<Vec<String>> {
+    let mut tree = model.tree().to_vec();
+    let path = match subject {
+        MoveSubject::Item(SelectionTarget::Window(window_id)) => {
+            let index = find_window_flat_index_by_id(model.flat_items(), model.tree(), window_id)?;
+            model.flat_items().get(index)?.path.clone()
+        }
+        MoveSubject::Item(SelectionTarget::Folder(folder_name))
+        | MoveSubject::Project { folder_name } => {
+            let index =
+                find_folder_flat_index_by_path(model.flat_items(), model.tree(), folder_name)?;
+            model.flat_items().get(index)?.path.clone()
+        }
+    };
+
+    move_node_to_position(&mut tree, &path, position).ok()?;
+    Some(window_ids_in_order(&tree))
 }
 
 pub(super) fn handle_cursor_up(model: &mut Model) -> Vec<Cmd> {

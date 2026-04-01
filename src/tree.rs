@@ -270,6 +270,90 @@ pub fn expand_to_window_by_id(nodes: &mut [TreeNode], window_id: &str) -> bool {
     false
 }
 
+pub fn move_node_to_position(
+    nodes: &mut Vec<TreeNode>,
+    path: &[usize],
+    position: usize,
+) -> Result<()> {
+    fn siblings_for_parent_path<'a>(
+        nodes: &'a mut Vec<TreeNode>,
+        parent_path: &[usize],
+    ) -> Result<&'a mut Vec<TreeNode>> {
+        if parent_path.is_empty() {
+            return Ok(nodes);
+        }
+
+        let node = get_node_mut(nodes.as_mut_slice(), parent_path)?;
+        match node {
+            TreeNode::Folder { children, .. } => Ok(children),
+            TreeNode::Window { .. } => Err(anyhow!("window node has no children")),
+        }
+    }
+
+    let (index, parent_path) = path
+        .split_last()
+        .ok_or_else(|| anyhow!("path cannot be empty"))?;
+    let siblings = siblings_for_parent_path(nodes, parent_path)?;
+
+    if *index >= siblings.len() {
+        return Err(anyhow!("index out of bounds: {}", index));
+    }
+    if position == 0 || position > siblings.len() {
+        return Err(anyhow!("position out of bounds: {}", position));
+    }
+
+    let target = position - 1;
+    if target == *index {
+        return Ok(());
+    }
+
+    let node = siblings.remove(*index);
+    siblings.insert(target, node);
+    Ok(())
+}
+
+pub fn folder_path_for_path(nodes: &[TreeNode], path: &[usize]) -> Result<String> {
+    let mut parts = Vec::new();
+    for depth in 0..path.len() {
+        let ancestor_path = &path[..=depth];
+        if let TreeNode::Folder { name, .. } = get_node(nodes, ancestor_path)? {
+            parts.push(name.clone());
+        }
+    }
+    Ok(parts.join(":"))
+}
+
+pub fn window_ids_in_order(nodes: &[TreeNode]) -> Vec<String> {
+    fn visit(nodes: &[TreeNode], out: &mut Vec<String>) {
+        for node in nodes {
+            match node {
+                TreeNode::Window { info } => out.push(info.id.clone()),
+                TreeNode::Folder { children, .. } => visit(children, out),
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    visit(nodes, &mut out);
+    out
+}
+
+pub fn find_folder_flat_index_by_path(
+    flat_items: &[FlatItem],
+    nodes: &[TreeNode],
+    folder_path: &str,
+) -> Option<usize> {
+    for (idx, item) in flat_items.iter().enumerate() {
+        if item.kind != FlatNodeKind::Folder {
+            continue;
+        }
+        if folder_path_for_path(nodes, &item.path).ok().as_deref() == Some(folder_path) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
 /// Return the flat index for a window id, if present in the current tree.
 pub fn find_window_flat_index_by_id(
     flat_items: &[FlatItem],
@@ -598,6 +682,33 @@ mod tests {
             }
             _ => panic!("expected folder"),
         }
+    }
+
+    #[test]
+    fn move_node_to_position_reorders_root_nodes() {
+        let mut tree = build_tree(&[
+            w("@1", 1, "proj:edit"),
+            w("@2", 2, "scratch"),
+            w("@3", 3, "proj:term"),
+            w("@4", 4, "other:main"),
+        ]);
+
+        move_node_to_position(&mut tree, &[1], 1).unwrap();
+
+        assert_eq!(window_ids_in_order(&tree), vec!["@2", "@1", "@3", "@4"]);
+    }
+
+    #[test]
+    fn move_node_to_position_reorders_nested_nodes() {
+        let mut tree = build_tree(&[
+            w("@1", 1, "proj:edit"),
+            w("@2", 2, "scratch"),
+            w("@3", 3, "proj:term"),
+        ]);
+
+        move_node_to_position(&mut tree, &[0, 0], 2).unwrap();
+
+        assert_eq!(window_ids_in_order(&tree), vec!["@3", "@1", "@2"]);
     }
 
     fn window_name(node: &TreeNode) -> &str {

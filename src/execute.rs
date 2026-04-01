@@ -8,7 +8,7 @@ use ratatui::Terminal;
 use tracing::{debug, info, warn};
 
 use crate::cmd::Cmd;
-use crate::model::{Model, PendingRename, PreviewState};
+use crate::model::{Model, PendingRename, PreviewState, SelectionTarget};
 use crate::msg::Msg;
 use crate::tmux::commands;
 use crate::tmux::{quote_tmux, TmuxControl, WindowInfo};
@@ -508,6 +508,9 @@ pub async fn execute_commands<T: TmuxApi>(
             Cmd::RenameWindow { id, name } => {
                 handle_rename_window(model, tmux, &mut queue, id, name).await;
             }
+            Cmd::ReorderWindows { order, selection } => {
+                handle_reorder_windows(model, tmux, &mut queue, order, selection).await;
+            }
             Cmd::CloseWindow { id } => handle_close_window(model, tmux, &mut queue, id).await,
             Cmd::FollowToWindow {
                 window_id: target_window_id,
@@ -869,6 +872,77 @@ async fn handle_rename_window<T: TmuxApi>(
         }
         queue.push_front(Cmd::ListWindows);
     }
+}
+
+async fn handle_reorder_windows<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    queue: &mut VecDeque<Cmd>,
+    desired_order: Vec<String>,
+    selection: SelectionTarget,
+) {
+    debug!(count = desired_order.len(), target = ?selection, "reordering windows");
+
+    let mut current_windows = match tmux.list_windows().await {
+        Ok(windows) => windows,
+        Err(err) => {
+            warn!(%err, "reorder: list-windows failed");
+            model.reorder.pending_selection = None;
+            model.error_message = Some(format!("reorder: list-windows: {err}"));
+            queue.push_front(Cmd::Render);
+            return;
+        }
+    };
+    current_windows.sort_by_key(|window| window.index);
+    let current_ids: Vec<String> = current_windows.iter().map(|window| window.id.clone()).collect();
+
+    let mut desired_iter = desired_order.iter();
+    let desired_set: HashSet<&str> = desired_order.iter().map(String::as_str).collect();
+    let mut final_order = Vec::with_capacity(current_ids.len());
+    for current_id in &current_ids {
+        if desired_set.contains(current_id.as_str()) {
+            if let Some(next_id) = desired_iter.next() {
+                final_order.push(next_id.clone());
+            }
+        } else {
+            final_order.push(current_id.clone());
+        }
+    }
+
+    if final_order.len() != current_ids.len() || desired_iter.next().is_some() {
+        warn!(current = current_ids.len(), desired = desired_order.len(), "reorder: inconsistent window set");
+        model.reorder.pending_selection = None;
+        model.error_message = Some("reorder: window set changed".to_string());
+        queue.push_front(Cmd::Render);
+        return;
+    }
+
+    let mut working = current_ids.clone();
+    for idx in 0..final_order.len() {
+        if working[idx] == final_order[idx] {
+            continue;
+        }
+
+        let Some(found_idx) = working.iter().position(|id| id == &final_order[idx]) else {
+            warn!(wanted = %final_order[idx], "reorder: target window missing during swap");
+            model.reorder.pending_selection = None;
+            model.error_message = Some("reorder: target window missing".to_string());
+            queue.push_front(Cmd::Render);
+            return;
+        };
+
+        let cmd_str = commands::swap_window(&working[found_idx], &working[idx]);
+        if let Err(err) = tmux.send_command(&cmd_str).await {
+            warn!(%err, source = %working[found_idx], target = %working[idx], "swap-window failed");
+            model.reorder.pending_selection = None;
+            model.error_message = Some(format!("swap-window: {err}"));
+            queue.push_front(Cmd::Render);
+            return;
+        }
+        working.swap(idx, found_idx);
+    }
+
+    queue.push_front(Cmd::ListWindows);
 }
 
 async fn handle_close_window<T: TmuxApi>(
@@ -2020,6 +2094,7 @@ mod tests {
 
     struct FakeTmux {
         responses: VecDeque<Result<String, String>>,
+        window_lists: VecDeque<Result<Vec<WindowInfo>, String>>,
         commands: Vec<String>,
     }
 
@@ -2027,6 +2102,18 @@ mod tests {
         fn new(responses: Vec<Result<String, String>>) -> Self {
             Self {
                 responses: responses.into(),
+                window_lists: VecDeque::new(),
+                commands: Vec::new(),
+            }
+        }
+
+        fn with_window_lists(
+            responses: Vec<Result<String, String>>,
+            window_lists: Vec<Result<Vec<WindowInfo>, String>>,
+        ) -> Self {
+            Self {
+                responses: responses.into(),
+                window_lists: window_lists.into(),
                 commands: Vec::new(),
             }
         }
@@ -2040,6 +2127,15 @@ mod tests {
             "%home_old".to_string(),
             "@old".to_string(),
         )
+    }
+
+    fn wi(id: &str, index: usize, name: &str) -> WindowInfo {
+        WindowInfo {
+            id: id.to_string(),
+            index,
+            name: name.to_string(),
+            active: false,
+        }
     }
 
     impl TmuxApi for FakeTmux {
@@ -2058,7 +2154,11 @@ mod tests {
         fn list_windows<'a>(
             &'a mut self,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<WindowInfo>, String>> + Send + 'a>> {
-            Box::pin(async move { Err("not used in this test".to_string()) })
+            Box::pin(async move {
+                self.window_lists
+                    .pop_front()
+                    .unwrap_or_else(|| Err("not used in this test".to_string()))
+            })
         }
     }
 
@@ -2588,6 +2688,38 @@ mod tests {
         assert_eq!(tmux.commands.len(), 3);
         assert!(tmux.commands[1].contains("display-message -t %sidebar -p '#{window_id}'"));
         assert!(tmux.commands[2].contains("list-panes -t @new"));
+    }
+
+    #[tokio::test]
+    async fn reorder_windows_swaps_into_requested_order() {
+        let mut model = test_model();
+        let mut tmux = FakeTmux::with_window_lists(
+            vec![Ok(String::new()), Ok(String::new())],
+            vec![Ok(vec![
+                wi("@1", 1, "proj:edit"),
+                wi("@2", 2, "scratch"),
+                wi("@3", 3, "proj:term"),
+            ])],
+        );
+        let mut queue = VecDeque::new();
+
+        handle_reorder_windows(
+            &mut model,
+            &mut tmux,
+            &mut queue,
+            vec!["@3".to_string(), "@1".to_string(), "@2".to_string()],
+            SelectionTarget::Window("@1".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            tmux.commands,
+            vec![
+                "swap-window -s @3 -t @1",
+                "swap-window -s @1 -t @2",
+            ]
+        );
+        assert!(matches!(queue.front(), Some(Cmd::ListWindows)));
     }
 
     #[tokio::test]

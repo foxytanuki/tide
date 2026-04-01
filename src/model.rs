@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::tree::{
-    expand_to_window_by_id, find_window_flat_index_by_id, flatten, get_node, next_visible_item,
-    FlatItem, FlatNodeKind, TreeNode, WindowInfo,
+    expand_to_window_by_id, find_folder_flat_index_by_path, find_window_flat_index_by_id, flatten,
+    folder_path_for_path, get_node, next_visible_item, FlatItem, FlatNodeKind, TreeNode,
+    WindowInfo,
 };
 
 pub struct Model {
@@ -21,6 +22,7 @@ pub struct Model {
     pub info_message: Option<String>,
     pub sidebar: SidebarState,
     pub renames: RenameState,
+    pub reorder: ReorderState,
     pub ai: AiState,
     /// Terminal size for mouse hit-testing (width, height).
     pub terminal_size: (u16, u16),
@@ -56,6 +58,10 @@ pub struct RenameState {
     pub last_window_id: Option<String>,
 }
 
+pub struct ReorderState {
+    pub pending_selection: Option<SelectionTarget>,
+}
+
 pub struct AiState {
     /// Pane IDs currently running AI processes (actively working).
     pub panes: HashSet<String>,
@@ -82,7 +88,20 @@ pub enum Mode {
     Renaming { window_id: String },
     RenamingFolder { folder_name: String },
     CreatingProject,
+    Moving { subject: MoveSubject },
     ConfirmClose { window_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectionTarget {
+    Window(String),
+    Folder(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveSubject {
+    Item(SelectionTarget),
+    Project { folder_name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +156,9 @@ impl Model {
                 pending: HashMap::new(),
                 last_window_id: None,
             },
+            reorder: ReorderState {
+                pending_selection: None,
+            },
             ai: AiState {
                 panes: HashSet::new(),
                 windows: HashSet::new(),
@@ -169,18 +191,29 @@ impl Model {
     pub fn replace_tree_preserve_selection(
         &mut self,
         new_tree: Vec<TreeNode>,
-        selected_window_id: Option<&str>,
+        selected_target: Option<&SelectionTarget>,
     ) {
         self.tree = new_tree;
-        if let Some(window_id) = selected_window_id {
+        if let Some(SelectionTarget::Window(window_id)) = selected_target {
             expand_to_window_by_id(&mut self.tree, window_id);
         }
         self.rebuild_flat();
-        if let Some(window_id) = selected_window_id {
-            if let Some(index) =
-                find_window_flat_index_by_id(&self.flat_items, &self.tree, window_id)
-            {
-                self.cursor = index;
+        if let Some(target) = selected_target {
+            match target {
+                SelectionTarget::Window(window_id) => {
+                    if let Some(index) =
+                        find_window_flat_index_by_id(&self.flat_items, &self.tree, window_id)
+                    {
+                        self.cursor = index;
+                    }
+                }
+                SelectionTarget::Folder(folder_path) => {
+                    if let Some(index) =
+                        find_folder_flat_index_by_path(&self.flat_items, &self.tree, folder_path)
+                    {
+                        self.cursor = index;
+                    }
+                }
             }
         }
     }
@@ -229,6 +262,16 @@ impl Model {
         match self.selected_node()? {
             TreeNode::Window { info } => Some(info),
             TreeNode::Folder { .. } => None,
+        }
+    }
+
+    pub fn selected_selection_target(&self) -> Option<SelectionTarget> {
+        let item = self.flat_items.get(self.cursor)?;
+        match get_node(&self.tree, &item.path).ok()? {
+            TreeNode::Window { info } => Some(SelectionTarget::Window(info.id.clone())),
+            TreeNode::Folder { .. } => folder_path_for_path(&self.tree, &item.path)
+                .ok()
+                .map(SelectionTarget::Folder),
         }
     }
 
@@ -287,7 +330,10 @@ mod tests {
             window("@3", 3, "dev"),
         ];
         let first_tree = build_tree(&first);
-        model.replace_tree_preserve_selection(first_tree, Some("@2"));
+        model.replace_tree_preserve_selection(
+            first_tree,
+            Some(&SelectionTarget::Window("@2".to_string())),
+        );
         assert_eq!(
             model.selected_window_info().map(|w| w.id.as_str()),
             Some("@2")
@@ -303,7 +349,10 @@ mod tests {
             *expanded = false;
         }
 
-        model.replace_tree_preserve_selection(second_tree, Some("@2"));
+        model.replace_tree_preserve_selection(
+            second_tree,
+            Some(&SelectionTarget::Window("@2".to_string())),
+        );
 
         assert_eq!(
             model.selected_window_info().map(|w| w.id.as_str()),
