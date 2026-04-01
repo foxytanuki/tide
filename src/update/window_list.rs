@@ -68,7 +68,10 @@ pub(super) fn handle_window_renamed(
     }
 }
 
-pub(super) fn handle_window_list_loaded(model: &mut Model, windows: Vec<WindowInfo>) -> Vec<Cmd> {
+pub(super) fn handle_window_list_loaded(
+    model: &mut Model,
+    mut windows: Vec<WindowInfo>,
+) -> Vec<Cmd> {
     let expanded_state = collect_folder_expanded(model.tree());
     let mut selected_window_id = derive_selected_window_id(model);
 
@@ -86,6 +89,7 @@ pub(super) fn handle_window_list_loaded(model: &mut Model, windows: Vec<WindowIn
     );
 
     bump_last_pending_if_missing(model, &windows, &mut selected_window_id);
+    windows.sort_by_key(|window| window.index);
 
     let mut new_tree = build_tree(&windows);
     restore_folder_expanded(&mut new_tree, &expanded_state);

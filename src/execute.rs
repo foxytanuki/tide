@@ -791,7 +791,7 @@ async fn handle_new_window<T: TmuxApi>(
     name: String,
 ) {
     debug!(name, "creating new window");
-    let new_cmd = commands::new_window(&name);
+    let new_cmd = commands::new_window(&model.session_name, &name);
     match tmux.send_command(&new_cmd).await {
         Ok(output) => {
             let window_id = output.trim();

@@ -489,6 +489,23 @@ mod tests {
     }
 
     #[test]
+    fn window_list_loaded_sorts_windows_by_index_before_building_tree() {
+        let mut model = test_model();
+        let windows = vec![wi("@2", 2, "beta"), wi("@1", 1, "alpha")];
+
+        update(&mut model, Msg::WindowListLoaded(windows));
+
+        match &model.tree()[0] {
+            TreeNode::Window { info } => assert_eq!(info.id, "@1"),
+            other => panic!("expected first root window, got {:?}", other),
+        }
+        match &model.tree()[1] {
+            TreeNode::Window { info } => assert_eq!(info.id, "@2"),
+            other => panic!("expected second root window, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn window_renamed_pending_mismatch_triggers_immediate_rename() {
         let mut model = test_model();
         model.renames.pending.insert(
