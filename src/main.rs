@@ -565,6 +565,12 @@ fn process_tmux_event(model: &mut Model, tmux_event: TmuxEvent) -> Vec<Cmd> {
             update(model, Msg::WindowFocusChanged(window_id))
         }
         TmuxEvent::LayoutChange(window_id) if window_id == model.sidebar.window_id => {
+            if let Some(deadline) = model.sidebar.ignore_layout_change_until {
+                if std::time::Instant::now() < deadline {
+                    return vec![Cmd::EnsureSidebarWidth];
+                }
+                model.sidebar.ignore_layout_change_until = None;
+            }
             vec![Cmd::EnsureSidebarWidth, Cmd::ValidateSidebarPanes]
         }
         TmuxEvent::LayoutChange(_) => Vec::new(),
@@ -644,4 +650,46 @@ fn extract_deferred_preview(cmds: &mut Vec<Cmd>) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn test_model() -> Model {
+        Model::new(
+            "s".to_string(),
+            "$1".to_string(),
+            "%sidebar".to_string(),
+            "%home".to_string(),
+            "@home".to_string(),
+        )
+    }
+
+    #[test]
+    fn layout_change_is_suppressed_while_helper_is_running() {
+        let mut model = test_model();
+        model.sidebar.ignore_layout_change_until = Some(Instant::now() + Duration::from_millis(500));
+
+        let cmds = process_tmux_event(&mut model, TmuxEvent::LayoutChange("@home".to_string()));
+
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::EnsureSidebarWidth));
+        assert!(model.sidebar.ignore_layout_change_until.is_some());
+    }
+
+    #[test]
+    fn layout_change_revalidates_after_suppression_expires() {
+        let mut model = test_model();
+        model.sidebar.ignore_layout_change_until = Some(Instant::now() - Duration::from_millis(1));
+
+        let cmds = process_tmux_event(&mut model, TmuxEvent::LayoutChange("@home".to_string()));
+
+        assert_eq!(cmds.len(), 2);
+        assert!(matches!(cmds[0], Cmd::EnsureSidebarWidth));
+        assert!(matches!(cmds[1], Cmd::ValidateSidebarPanes));
+        assert!(model.sidebar.ignore_layout_change_until.is_none());
+    }
 }

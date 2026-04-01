@@ -136,7 +136,10 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
 mod tests {
     use super::*;
     use crate::model::{MoveSubject, PendingRename, PreviewState, SelectionTarget};
-    use crate::tree::{build_tree, get_node, window_ids_in_order, TreeNode, WindowInfo};
+    use crate::tree::{
+        build_tree, find_folder_flat_index_by_path, find_window_flat_index_by_id, get_node,
+        window_ids_in_order, TreeNode, WindowInfo,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn test_model() -> Model {
@@ -792,6 +795,167 @@ mod tests {
     }
 
     #[test]
+    fn move_item_enter_excludes_sidebar_host_from_reorder_order() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                wi("@home", 1, "sidebar"),
+                wi("@1", 2, "alpha"),
+                wi("@2", 3, "beta"),
+            ]),
+        );
+
+        let alpha_index = find_window_flat_index_by_id(model.flat_items(), model.tree(), "@1")
+            .expect("alpha should be visible");
+        model.set_cursor(alpha_index);
+
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+        );
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        );
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        match &cmds[0] {
+            Cmd::ReorderWindows { order, selection } => {
+                assert_eq!(order, &vec!["@2".to_string(), "@1".to_string()]);
+                assert_eq!(selection, &SelectionTarget::Window("@1".to_string()));
+            }
+            other => panic!("expected ReorderWindows, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn move_item_across_sidebar_host_restores_preview_on_reject() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                wi("@home", 1, "sidebar"),
+                wi("@1", 2, "alpha"),
+                wi("@2", 3, "beta"),
+            ]),
+        );
+        let before = window_ids_in_order(model.tree());
+
+        let alpha_index = find_window_flat_index_by_id(model.flat_items(), model.tree(), "@1")
+            .expect("alpha should be visible");
+        model.set_cursor(alpha_index);
+
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+        );
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        );
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::Render));
+        assert_eq!(model.mode, Mode::Normal);
+        assert_eq!(
+            model.info_message.as_deref(),
+            Some("cannot move across sidebar host")
+        );
+        assert_eq!(window_ids_in_order(model.tree()), before);
+        assert!(model.reorder.snapshot.is_none());
+    }
+
+    #[test]
+    fn move_item_across_host_containing_folder_is_rejected() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                wi("@home", 1, "proj:alpha"),
+                wi("@1", 2, "proj:beta"),
+                wi("@2", 3, "notes"),
+            ]),
+        );
+        let before = window_ids_in_order(model.tree());
+
+        let notes_index = find_window_flat_index_by_id(model.flat_items(), model.tree(), "@2")
+            .expect("notes should be visible");
+        model.set_cursor(notes_index);
+
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+        );
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        );
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::Render));
+        assert_eq!(model.mode, Mode::Normal);
+        assert_eq!(
+            model.info_message.as_deref(),
+            Some("cannot move across sidebar host")
+        );
+        assert_eq!(window_ids_in_order(model.tree()), before);
+        assert!(model.reorder.snapshot.is_none());
+    }
+
+    #[test]
+    fn move_project_across_sidebar_host_is_rejected() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                wi("@home", 1, "proj:alpha"),
+                wi("@1", 2, "proj:beta"),
+                wi("@2", 3, "other:main"),
+            ]),
+        );
+        let before = window_ids_in_order(model.tree());
+
+        let other_index = find_window_flat_index_by_id(model.flat_items(), model.tree(), "@2")
+            .expect("other:main should be visible");
+        model.set_cursor(other_index);
+
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT)),
+        );
+        update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        );
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::Render));
+        assert_eq!(model.mode, Mode::Normal);
+        assert_eq!(
+            model.info_message.as_deref(),
+            Some("cannot move across sidebar host")
+        );
+        assert_eq!(window_ids_in_order(model.tree()), before);
+        assert!(model.reorder.snapshot.is_none());
+    }
+
+    #[test]
     fn move_project_key_from_child_targets_root_project() {
         let mut model = test_model();
         update(
@@ -883,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_window_is_filtered_from_tree() {
+    fn sidebar_window_remains_visible_in_tree() {
         let mut model = test_model();
         update(
             &mut model,
@@ -903,7 +1067,89 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(names, vec!["@1".to_string(), "@2".to_string()]);
+        assert_eq!(
+            names,
+            vec!["@home".to_string(), "@1".to_string(), "@2".to_string()]
+        );
+    }
+
+    #[test]
+    fn move_item_rejects_sidebar_host_window() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@home", 1, "sidebar"), wi("@1", 2, "proj:edit")]),
+        );
+        model.set_cursor(0);
+
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+        );
+
+        assert_eq!(model.mode, Mode::Normal);
+        assert_eq!(
+            model.info_message.as_deref(),
+            Some("cannot move sidebar host window")
+        );
+        assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::Render)));
+        assert_eq!(model.reorder.pending_selection, None);
+    }
+
+    #[test]
+    fn move_item_rejects_folder_containing_sidebar_host() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@home", 1, "proj:alpha"), wi("@1", 2, "proj:beta")]),
+        );
+
+        let folder_index = find_folder_flat_index_by_path(model.flat_items(), model.tree(), "proj")
+            .expect("proj folder should be visible");
+        model.set_cursor(folder_index);
+
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+        );
+
+        assert_eq!(model.mode, Mode::Normal);
+        assert_eq!(
+            model.info_message.as_deref(),
+            Some("cannot move folder containing sidebar host")
+        );
+        assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::Render)));
+        assert_eq!(model.reorder.pending_selection, None);
+    }
+
+    #[test]
+    fn move_project_rejects_project_containing_sidebar_host() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                wi("@home", 1, "proj:alpha"),
+                wi("@1", 2, "proj:beta"),
+                wi("@2", 3, "other:main"),
+            ]),
+        );
+
+        let beta_index = find_window_flat_index_by_id(model.flat_items(), model.tree(), "@1")
+            .expect("proj:beta should be visible");
+        model.set_cursor(beta_index);
+
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT)),
+        );
+
+        assert_eq!(model.mode, Mode::Normal);
+        assert_eq!(
+            model.info_message.as_deref(),
+            Some("cannot move project containing sidebar host")
+        );
+        assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::Render)));
+        assert_eq!(model.reorder.pending_selection, None);
     }
 
     #[test]

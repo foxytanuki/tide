@@ -43,6 +43,8 @@ pub struct SidebarState {
     /// Saved "without sidebar" window layouts for pane width restoration.
     /// Maps window_id → (terminal_width_at_save, layout_string).
     pub pane_layouts: HashMap<String, (u16, String)>,
+    /// Ignore self-inflicted layout-change validation until this deadline.
+    pub ignore_layout_change_until: Option<Instant>,
     /// Windows that successfully had the 3x2 helper applied.
     pub helper_managed_windows: HashSet<String>,
     /// Window ID that the debounced preview will switch to.
@@ -155,6 +157,7 @@ impl Model {
                 pending_internal_focus_window: None,
                 close_restore_attempted: false,
                 pane_layouts: HashMap::new(),
+                ignore_layout_change_until: None,
                 helper_managed_windows: HashSet::new(),
                 pending_preview_id: None,
             },

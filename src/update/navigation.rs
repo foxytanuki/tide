@@ -1,13 +1,13 @@
 use crate::cmd::Cmd;
 use crate::model::{Mode, Model, MoveSubject, SelectionTarget};
 use crate::tree::{
-    find_folder_flat_index_by_path, find_parent_folder, find_window_flat_index_by_id, get_node_mut,
-    move_node_to_position, next_visible_item, prev_visible_item, toggle_expand,
-    visible_item_indices, window_ids_in_order, FlatNodeKind, TreeNode, WindowInfo,
+    find_folder_flat_index_by_path, find_parent_folder, find_window_flat_index_by_id, flatten,
+    get_node, get_node_mut, move_node_to_position, next_visible_item, prev_visible_item,
+    toggle_expand, visible_item_indices, window_ids_in_order, FlatNodeKind, TreeNode, WindowInfo,
 };
 
 use super::input::{clear_input, set_input};
-use super::naming::{reconstruct_folder_full_name, reconstruct_full_name};
+use super::naming::{join_folder_path, reconstruct_folder_full_name, reconstruct_full_name};
 
 pub(super) fn reset_to_normal_mode(model: &mut Model) {
     model.mode = Mode::Normal;
@@ -52,6 +52,19 @@ pub(super) fn handle_move_item(model: &mut Model) -> Vec<Cmd> {
         Some(target) => MoveSubject::Item(target),
         None => return vec![],
     };
+    match &subject {
+        MoveSubject::Item(SelectionTarget::Window(id)) if id == &model.sidebar.window_id => {
+            model.info_message = Some("cannot move sidebar host window".to_string());
+            return vec![Cmd::Render];
+        }
+        MoveSubject::Item(SelectionTarget::Folder(folder_path))
+            if folder_contains_sidebar_host(model, folder_path) =>
+        {
+            model.info_message = Some("cannot move folder containing sidebar host".to_string());
+            return vec![Cmd::Render];
+        }
+        _ => {}
+    }
     model.begin_reorder_preview();
     model.mode = Mode::Moving { subject };
     vec![Cmd::Render]
@@ -86,6 +99,10 @@ pub(super) fn handle_move_project(model: &mut Model) -> Vec<Cmd> {
     if root_folder.is_empty() {
         return vec![];
     }
+    if folder_contains_sidebar_host(model, &root_folder) {
+        model.info_message = Some("cannot move project containing sidebar host".to_string());
+        return vec![Cmd::Render];
+    }
 
     model.begin_reorder_preview();
     model.mode = Mode::Moving {
@@ -119,17 +136,24 @@ pub(super) fn handle_move_enter(model: &mut Model) -> Vec<Cmd> {
         MoveSubject::Project { folder_name } => SelectionTarget::Folder(folder_name.clone()),
     };
 
-    let order = window_ids_in_order(model.tree());
+    if crosses_sidebar_host_boundary(model, &subject) {
+        model.mode = Mode::Normal;
+        model.cancel_reorder_preview();
+        model.info_message = Some("cannot move across sidebar host".to_string());
+        return vec![Cmd::Render];
+    }
+
+    let order = reorder_window_ids(model, model.tree());
 
     let original_order = model
         .reorder
         .snapshot
         .as_ref()
-        .map(|snapshot| window_ids_in_order(&snapshot.tree));
+        .map(|snapshot| reorder_window_ids(model, &snapshot.tree));
 
     if original_order.as_ref() == Some(&order) {
         model.mode = Mode::Normal;
-        model.clear_reorder_preview();
+        model.cancel_reorder_preview();
         model.info_message = Some("move: already in that position".to_string());
         return vec![Cmd::Render];
     }
@@ -138,6 +162,120 @@ pub(super) fn handle_move_enter(model: &mut Model) -> Vec<Cmd> {
     model.clear_reorder_preview();
     model.reorder.pending_selection = Some(selection.clone());
     vec![Cmd::ReorderWindows { order, selection }]
+}
+
+fn reorder_window_ids(model: &Model, nodes: &[TreeNode]) -> Vec<String> {
+    window_ids_in_order(nodes)
+        .into_iter()
+        .filter(|id| id != &model.sidebar.window_id)
+        .collect()
+}
+
+fn folder_contains_sidebar_host(model: &Model, folder_path: &str) -> bool {
+    folder_contains_window_id(model.tree(), None, folder_path, &model.sidebar.window_id)
+}
+
+fn crosses_sidebar_host_boundary(model: &Model, subject: &MoveSubject) -> bool {
+    let Some(snapshot) = model.reorder.snapshot.as_ref() else {
+        return false;
+    };
+
+    let Some(original_path) = selection_path_in_tree(&snapshot.tree, subject) else {
+        return false;
+    };
+    let Some(current_path) = selection_path(model, subject) else {
+        return false;
+    };
+
+    let (Some((&original_index, original_parent)), Some((&current_index, current_parent))) =
+        (original_path.split_last(), current_path.split_last())
+    else {
+        return false;
+    };
+
+    if original_parent != current_parent || original_index == current_index {
+        return false;
+    }
+
+    let Some(siblings) = siblings_for_parent_path(&snapshot.tree, original_parent) else {
+        return false;
+    };
+
+    let start = original_index.min(current_index);
+    let end = original_index.max(current_index);
+    siblings[start..=end]
+        .iter()
+        .enumerate()
+        .any(|(offset, node)| {
+            let sibling_index = start + offset;
+            sibling_index != original_index
+                && tree_node_contains_window(node, &model.sidebar.window_id)
+        })
+}
+
+fn selection_path_in_tree(nodes: &[TreeNode], subject: &MoveSubject) -> Option<Vec<usize>> {
+    let flat_items = flatten(nodes);
+    match subject {
+        MoveSubject::Item(SelectionTarget::Window(window_id)) => {
+            let index = find_window_flat_index_by_id(&flat_items, nodes, window_id)?;
+            Some(flat_items.get(index)?.path.clone())
+        }
+        MoveSubject::Item(SelectionTarget::Folder(folder_name))
+        | MoveSubject::Project { folder_name } => {
+            let index = find_folder_flat_index_by_path(&flat_items, nodes, folder_name)?;
+            Some(flat_items.get(index)?.path.clone())
+        }
+    }
+}
+
+fn siblings_for_parent_path<'a>(
+    nodes: &'a [TreeNode],
+    parent_path: &[usize],
+) -> Option<&'a [TreeNode]> {
+    if parent_path.is_empty() {
+        return Some(nodes);
+    }
+
+    match get_node(nodes, parent_path).ok()? {
+        TreeNode::Folder { children, .. } => Some(children),
+        TreeNode::Window { .. } => None,
+    }
+}
+
+fn folder_contains_window_id(
+    nodes: &[TreeNode],
+    prefix: Option<&str>,
+    folder_path: &str,
+    window_id: &str,
+) -> bool {
+    for node in nodes {
+        match node {
+            TreeNode::Window { info } if info.id == window_id => {
+                if prefix == Some(folder_path)
+                    || prefix.is_some_and(|current| current.starts_with(&format!("{folder_path}:")))
+                {
+                    return true;
+                }
+            }
+            TreeNode::Folder { name, children, .. } => {
+                let next_prefix = join_folder_path(prefix, name);
+                if folder_contains_window_id(children, Some(&next_prefix), folder_path, window_id) {
+                    return true;
+                }
+            }
+            TreeNode::Window { .. } => {}
+        }
+    }
+    false
+}
+
+fn tree_node_contains_window(node: &TreeNode, window_id: &str) -> bool {
+    match node {
+        TreeNode::Window { info } => info.id == window_id,
+        TreeNode::Folder { children, .. } => children
+            .iter()
+            .any(|child| tree_node_contains_window(child, window_id)),
+    }
 }
 
 pub(super) fn handle_move_prev(model: &mut Model) -> Vec<Cmd> {

@@ -17,6 +17,7 @@ use crate::view::render;
 
 pub type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 const SIDEBAR_WIDTH_CHARS: u16 = 30;
+const LAYOUT_CHANGE_SUPPRESSION_MS: u64 = 500;
 
 pub trait TmuxApi {
     fn send_command<'a>(
@@ -878,10 +879,11 @@ async fn handle_reorder_windows<T: TmuxApi>(
     model: &mut Model,
     tmux: &mut T,
     queue: &mut VecDeque<Cmd>,
-    desired_order: Vec<String>,
+    mut desired_order: Vec<String>,
     selection: SelectionTarget,
 ) {
     debug!(count = desired_order.len(), target = ?selection, "reordering windows");
+    desired_order.retain(|window_id| window_id != &model.sidebar.window_id);
 
     let mut current_windows = match tmux.list_windows().await {
         Ok(windows) => windows,
@@ -1156,9 +1158,9 @@ fn content_pane_ids(panes: &[(String, PaneGeom)], sidebar_pane_id: &str) -> Vec<
 fn build_split_window_cmd(target: &str, current_path: Option<&str>) -> String {
     match current_path {
         Some(path) if !path.is_empty() => {
-            format!("split-window -t {target} -h -c {}", quote_tmux(path))
+            format!("split-window -d -t {target} -h -c {}", quote_tmux(path))
         }
-        _ => format!("split-window -t {target} -h"),
+        _ => format!("split-window -d -t {target} -h"),
     }
 }
 
@@ -1324,6 +1326,7 @@ async fn reapply_helper_layout_if_needed<T: TmuxApi>(
         return;
     };
 
+    suppress_sidebar_layout_validation(model);
     let _ = tmux
         .send_command(&format!(
             "select-layout -t {} {}",
@@ -1331,6 +1334,13 @@ async fn reapply_helper_layout_if_needed<T: TmuxApi>(
             quote_tmux(&explicit_layout)
         ))
         .await;
+}
+
+fn suppress_sidebar_layout_validation(model: &mut Model) {
+    model.sidebar.ignore_layout_change_until = Some(
+        std::time::Instant::now()
+            + std::time::Duration::from_millis(LAYOUT_CHANGE_SUPPRESSION_MS),
+    );
 }
 
 async fn validate_sidebar_panes<T: TmuxApi>(
@@ -1379,6 +1389,7 @@ async fn apply_layout_helper<T: TmuxApi>(
     tmux: &mut T,
     queue: &mut VecDeque<Cmd>,
 ) {
+    suppress_sidebar_layout_validation(model);
     let list_cmd = format!(
         "list-panes -t {} -F '#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}'",
         model.sidebar.window_id
@@ -2237,9 +2248,9 @@ mod tests {
     fn build_split_window_cmd_carries_current_path() {
         assert_eq!(
             build_split_window_cmd("%2", Some("/tmp/my dir")),
-            "split-window -t %2 -h -c \"/tmp/my dir\""
+            "split-window -d -t %2 -h -c \"/tmp/my dir\""
         );
-        assert_eq!(build_split_window_cmd("%2", None), "split-window -t %2 -h");
+        assert_eq!(build_split_window_cmd("%2", None), "split-window -d -t %2 -h");
     }
 
     #[test]
