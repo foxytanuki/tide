@@ -136,7 +136,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
 mod tests {
     use super::*;
     use crate::model::{MoveSubject, PendingRename, PreviewState, SelectionTarget};
-    use crate::tree::{build_tree, TreeNode, WindowInfo};
+    use crate::tree::{build_tree, get_node, window_ids_in_order, TreeNode, WindowInfo};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn test_model() -> Model {
@@ -766,7 +766,7 @@ mod tests {
         );
         update(
             &mut model,
-            Msg::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
+            Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
         );
         let cmds = update(
             &mut model,
@@ -808,6 +808,7 @@ mod tests {
             &mut model,
             Msg::Key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT)),
         );
+        assert_eq!(model.cursor(), 0);
         assert!(matches!(
             model.mode,
             Mode::Moving {
@@ -817,7 +818,7 @@ mod tests {
 
         update(
             &mut model,
-            Msg::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
+            Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
         );
         let cmds = update(
             &mut model,
@@ -846,12 +847,17 @@ mod tests {
     }
 
     #[test]
-    fn move_enter_rejects_out_of_range_position() {
+    fn move_cancel_restores_original_order() {
         let mut model = test_model();
         update(
             &mut model,
-            Msg::WindowListLoaded(vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "proj:term")]),
+            Msg::WindowListLoaded(vec![
+                wi("@1", 1, "proj:edit"),
+                wi("@2", 2, "scratch"),
+                wi("@3", 3, "proj:term"),
+            ]),
         );
+        let before = model.tree().to_vec();
 
         update(
             &mut model,
@@ -859,20 +865,45 @@ mod tests {
         );
         update(
             &mut model,
-            Msg::Key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE)),
+            Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
         );
         let cmds = update(
             &mut model,
-            Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         );
 
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], Cmd::Render));
-        assert!(matches!(model.mode, Mode::Moving { .. }));
+        assert_eq!(model.mode, Mode::Normal);
         assert_eq!(
-            model.error_message.as_deref(),
-            Some("move: invalid destination")
+            window_ids_in_order(model.tree()),
+            window_ids_in_order(&before)
         );
+        assert_eq!(model.reorder.pending_selection, None);
+    }
+
+    #[test]
+    fn sidebar_window_is_filtered_from_tree() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                wi("@home", 1, "sidebar"),
+                wi("@1", 2, "proj:edit"),
+                wi("@2", 3, "scratch"),
+            ]),
+        );
+
+        let names: Vec<_> = model
+            .flat_items()
+            .iter()
+            .filter_map(|item| match get_node(model.tree(), &item.path).ok()? {
+                TreeNode::Window { info } => Some(info.id.clone()),
+                TreeNode::Folder { .. } => None,
+            })
+            .collect();
+
+        assert_eq!(names, vec!["@1".to_string(), "@2".to_string()]);
     }
 
     #[test]

@@ -60,6 +60,12 @@ pub struct RenameState {
 
 pub struct ReorderState {
     pub pending_selection: Option<SelectionTarget>,
+    pub snapshot: Option<ReorderSnapshot>,
+}
+
+pub struct ReorderSnapshot {
+    pub tree: Vec<TreeNode>,
+    pub cursor: usize,
 }
 
 pub struct AiState {
@@ -158,6 +164,7 @@ impl Model {
             },
             reorder: ReorderState {
                 pending_selection: None,
+                snapshot: None,
             },
             ai: AiState {
                 panes: HashSet::new(),
@@ -273,6 +280,25 @@ impl Model {
                 .ok()
                 .map(SelectionTarget::Folder),
         }
+    }
+
+    pub fn begin_reorder_preview(&mut self) {
+        self.reorder.snapshot = Some(ReorderSnapshot {
+            tree: self.tree.clone(),
+            cursor: self.cursor,
+        });
+    }
+
+    pub fn cancel_reorder_preview(&mut self) {
+        if let Some(snapshot) = self.reorder.snapshot.take() {
+            self.tree = snapshot.tree;
+            self.rebuild_flat();
+            self.cursor = snapshot.cursor.min(self.flat_items.len().saturating_sub(1));
+        }
+    }
+
+    pub fn clear_reorder_preview(&mut self) {
+        self.reorder.snapshot = None;
     }
 
     /// Find any window ID in the tree that is not `exclude`.

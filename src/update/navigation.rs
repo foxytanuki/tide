@@ -12,6 +12,7 @@ use super::naming::{reconstruct_folder_full_name, reconstruct_full_name};
 pub(super) fn reset_to_normal_mode(model: &mut Model) {
     model.mode = Mode::Normal;
     clear_input(model);
+    model.clear_reorder_preview();
 }
 
 pub(super) fn exit_to_normal_mode(model: &mut Model) -> Vec<Cmd> {
@@ -51,7 +52,7 @@ pub(super) fn handle_move_item(model: &mut Model) -> Vec<Cmd> {
         Some(target) => MoveSubject::Item(target),
         None => return vec![],
     };
-    clear_input(model);
+    model.begin_reorder_preview();
     model.mode = Mode::Moving { subject };
     vec![Cmd::Render]
 }
@@ -86,12 +87,24 @@ pub(super) fn handle_move_project(model: &mut Model) -> Vec<Cmd> {
         return vec![];
     }
 
-    clear_input(model);
+    model.begin_reorder_preview();
     model.mode = Mode::Moving {
         subject: MoveSubject::Project {
-            folder_name: root_folder,
+            folder_name: root_folder.clone(),
         },
     };
+    if let Some(index) =
+        find_folder_flat_index_by_path(model.flat_items(), model.tree(), &root_folder)
+    {
+        model.set_cursor(index);
+    }
+    vec![Cmd::Render]
+}
+
+pub(super) fn cancel_move(model: &mut Model) -> Vec<Cmd> {
+    model.cancel_reorder_preview();
+    model.mode = Mode::Normal;
+    clear_input(model);
     vec![Cmd::Render]
 }
 
@@ -101,52 +114,120 @@ pub(super) fn handle_move_enter(model: &mut Model) -> Vec<Cmd> {
         _ => return vec![],
     };
 
-    let raw = model.input_buffer.trim();
-    let Ok(position) = raw.parse::<usize>() else {
-        model.error_message = Some("move: enter a valid number".to_string());
-        return vec![Cmd::Render];
-    };
-
     let selection = match &subject {
         MoveSubject::Item(target) => target.clone(),
         MoveSubject::Project { folder_name } => SelectionTarget::Folder(folder_name.clone()),
     };
 
-    let Some(order) = build_move_order(model, &subject, position) else {
-        model.error_message = Some("move: invalid destination".to_string());
-        return vec![Cmd::Render];
-    };
+    let order = window_ids_in_order(model.tree());
 
-    if order == window_ids_in_order(model.tree()) {
+    let original_order = model
+        .reorder
+        .snapshot
+        .as_ref()
+        .map(|snapshot| window_ids_in_order(&snapshot.tree));
+
+    if original_order.as_ref() == Some(&order) {
         model.mode = Mode::Normal;
-        clear_input(model);
+        model.clear_reorder_preview();
         model.info_message = Some("move: already in that position".to_string());
         return vec![Cmd::Render];
     }
 
     model.mode = Mode::Normal;
-    clear_input(model);
+    model.clear_reorder_preview();
     model.reorder.pending_selection = Some(selection.clone());
     vec![Cmd::ReorderWindows { order, selection }]
 }
 
-fn build_move_order(model: &Model, subject: &MoveSubject, position: usize) -> Option<Vec<String>> {
-    let mut tree = model.tree().to_vec();
-    let path = match subject {
+pub(super) fn handle_move_prev(model: &mut Model) -> Vec<Cmd> {
+    shift_move(model, -1)
+}
+
+pub(super) fn handle_move_next(model: &mut Model) -> Vec<Cmd> {
+    shift_move(model, 1)
+}
+
+fn shift_move(model: &mut Model, delta: isize) -> Vec<Cmd> {
+    let subject = match model.mode.clone() {
+        Mode::Moving { subject } => subject,
+        _ => return vec![],
+    };
+
+    let Some((path, sibling_count, current_position)) = move_subject_context(model, &subject)
+    else {
+        return vec![];
+    };
+
+    let next_position = if delta < 0 {
+        current_position.checked_sub(1)
+    } else {
+        let candidate = current_position + 1;
+        (candidate <= sibling_count).then_some(candidate)
+    };
+
+    let Some(next_position) = next_position else {
+        return vec![];
+    };
+
+    model.mutate_tree(|tree| {
+        let _ = move_node_to_position(tree, &path, next_position);
+    });
+
+    if let Some(target_index) = selection_flat_index(model, &subject) {
+        model.set_cursor(target_index);
+    }
+
+    vec![Cmd::Render]
+}
+
+fn move_subject_context(
+    model: &Model,
+    subject: &MoveSubject,
+) -> Option<(Vec<usize>, usize, usize)> {
+    let path = selection_path(model, subject)?;
+    let current_position = path.last().copied()? + 1;
+    let sibling_count = siblings_len(model.tree(), &path)?;
+    Some((path, sibling_count, current_position))
+}
+
+fn selection_path(model: &Model, subject: &MoveSubject) -> Option<Vec<usize>> {
+    match subject {
         MoveSubject::Item(SelectionTarget::Window(window_id)) => {
             let index = find_window_flat_index_by_id(model.flat_items(), model.tree(), window_id)?;
-            model.flat_items().get(index)?.path.clone()
+            Some(model.flat_items().get(index)?.path.clone())
         }
         MoveSubject::Item(SelectionTarget::Folder(folder_name))
         | MoveSubject::Project { folder_name } => {
             let index =
                 find_folder_flat_index_by_path(model.flat_items(), model.tree(), folder_name)?;
-            model.flat_items().get(index)?.path.clone()
+            Some(model.flat_items().get(index)?.path.clone())
         }
-    };
+    }
+}
 
-    move_node_to_position(&mut tree, &path, position).ok()?;
-    Some(window_ids_in_order(&tree))
+fn selection_flat_index(model: &Model, subject: &MoveSubject) -> Option<usize> {
+    match subject {
+        MoveSubject::Item(SelectionTarget::Window(window_id)) => {
+            find_window_flat_index_by_id(model.flat_items(), model.tree(), window_id)
+        }
+        MoveSubject::Item(SelectionTarget::Folder(folder_name))
+        | MoveSubject::Project { folder_name } => {
+            find_folder_flat_index_by_path(model.flat_items(), model.tree(), folder_name)
+        }
+    }
+}
+
+fn siblings_len(nodes: &[TreeNode], path: &[usize]) -> Option<usize> {
+    let (_index, parent_path) = path.split_last()?;
+    if parent_path.is_empty() {
+        return Some(nodes.len());
+    }
+
+    match crate::tree::get_node(nodes, parent_path).ok()? {
+        TreeNode::Folder { children, .. } => Some(children.len()),
+        TreeNode::Window { .. } => None,
+    }
 }
 
 pub(super) fn handle_cursor_up(model: &mut Model) -> Vec<Cmd> {

@@ -6,7 +6,9 @@ use crate::msg::Msg;
 use crate::tree::{get_node, TreeNode};
 
 use super::naming::{collect_folder_children, reconstruct_full_name};
-use super::navigation::{exit_to_normal_mode, handle_move_enter};
+use super::navigation::{
+    cancel_move, exit_to_normal_mode, handle_move_enter, handle_move_next, handle_move_prev,
+};
 use super::update;
 
 pub(super) fn handle_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
@@ -189,12 +191,11 @@ fn handle_moving_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
     if !is_plain_key(&event) {
         return vec![];
     }
-    if let Some(cmds) = handle_input_key(model, event.code) {
-        return cmds;
-    }
     match event.code {
+        KeyCode::Char('k') | KeyCode::Up => handle_move_prev(model),
+        KeyCode::Char('j') | KeyCode::Down => handle_move_next(model),
         KeyCode::Enter => handle_move_enter(model),
-        KeyCode::Esc => exit_to_normal_mode(model),
+        KeyCode::Esc => cancel_move(model),
         _ => vec![],
     }
 }
