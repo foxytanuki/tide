@@ -72,6 +72,13 @@ pub(super) fn handle_window_list_loaded(
     model: &mut Model,
     mut windows: Vec<WindowInfo>,
 ) -> Vec<Cmd> {
+    windows.retain(|window| window.id != model.sidebar.window_id);
+
+    if matches!(model.mode, Mode::Moving { .. }) {
+        model.mode = Mode::Normal;
+        model.clear_reorder_preview();
+    }
+
     let expanded_state = collect_folder_expanded(model.tree());
     let mut selected_target = derive_selected_target(model);
 

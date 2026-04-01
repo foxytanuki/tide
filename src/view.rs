@@ -17,10 +17,7 @@ pub fn render(model: &Model, frame: &mut Frame) {
     frame.render_widget(outer, area);
 
     let footer_height: u16 = match model.mode {
-        Mode::Renaming { .. }
-        | Mode::RenamingFolder { .. }
-        | Mode::CreatingProject
-        | Mode::Moving { .. } => 2,
+        Mode::Renaming { .. } | Mode::RenamingFolder { .. } | Mode::CreatingProject => 2,
         _ => 1,
     };
 
@@ -278,11 +275,7 @@ fn build_footer_text(model: &Model, width: usize) -> String {
             let line2 = truncate("[enter] ok [esc] cancel", width);
             format!("{}\n{}", line1, line2)
         }
-        Mode::Moving { .. } => {
-            let line1 = truncate(&format!("Move to: {}", model.input_buffer), width);
-            let line2 = truncate("[enter] ok [esc] cancel", width);
-            format!("{}\n{}", line1, line2)
-        }
+        Mode::Moving { .. } => truncate("Move: [↑/↓] place [enter] ok [esc] cancel", width),
         Mode::ConfirmClose { .. } => truncate("Close window? [y/n]", width),
     }
 }
@@ -338,7 +331,6 @@ fn input_prefix_len(mode: &Mode) -> Option<u16> {
     match mode {
         Mode::Renaming { .. } | Mode::RenamingFolder { .. } => Some("Rename: ".len() as u16),
         Mode::CreatingProject => Some("Project: ".len() as u16),
-        Mode::Moving { .. } => Some("Move to: ".len() as u16),
         _ => None,
     }
 }
@@ -351,10 +343,7 @@ pub fn tree_item_at(model: &Model, row: u16) -> Option<usize> {
     let inner = outer.inner(area);
 
     let footer_height: u16 = match model.mode {
-        Mode::Renaming { .. }
-        | Mode::RenamingFolder { .. }
-        | Mode::CreatingProject
-        | Mode::Moving { .. } => 2,
+        Mode::Renaming { .. } | Mode::RenamingFolder { .. } | Mode::CreatingProject => 2,
         _ => 1,
     };
     let chunks =

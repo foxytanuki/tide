@@ -893,6 +893,7 @@ async fn handle_reorder_windows<T: TmuxApi>(
             return;
         }
     };
+    current_windows.retain(|window| window.id != model.sidebar.window_id);
     current_windows.sort_by_key(|window| window.index);
     let current_ids: Vec<String> = current_windows.iter().map(|window| window.id.clone()).collect();
 
@@ -2719,6 +2720,32 @@ mod tests {
                 "swap-window -s @1 -t @2",
             ]
         );
+        assert!(matches!(queue.front(), Some(Cmd::ListWindows)));
+    }
+
+    #[tokio::test]
+    async fn reorder_windows_never_swaps_sidebar_window() {
+        let mut model = test_model();
+        let mut tmux = FakeTmux::with_window_lists(
+            vec![Ok(String::new())],
+            vec![Ok(vec![
+                wi("@1", 1, "proj:edit"),
+                wi("@old", 2, "sidebar"),
+                wi("@2", 3, "proj:term"),
+            ])],
+        );
+        let mut queue = VecDeque::new();
+
+        handle_reorder_windows(
+            &mut model,
+            &mut tmux,
+            &mut queue,
+            vec!["@2".to_string(), "@1".to_string()],
+            SelectionTarget::Window("@1".to_string()),
+        )
+        .await;
+
+        assert_eq!(tmux.commands, vec!["swap-window -s @2 -t @1"]);
         assert!(matches!(queue.front(), Some(Cmd::ListWindows)));
     }
 
