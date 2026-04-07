@@ -2,11 +2,11 @@
 rust = "latest"
 
 [tasks.install]
-description = "Build and install tmuxide"
+description = "Build and install tide"
 run = "cargo install --path ."
 
 [tasks.build]
-description = "Build tmuxide (debug)"
+description = "Build tide (debug)"
 run = "cargo build"
 
 [tasks.check]
