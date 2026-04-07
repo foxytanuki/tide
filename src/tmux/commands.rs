@@ -16,13 +16,14 @@ pub fn resize_pane_width(pane_id: &str, width: u16) -> String {
     format!("resize-pane -t {pane_id} -x {width}")
 }
 
-pub fn new_window(session_name: &str, name: &str) -> String {
+pub fn new_window(session_name: &str, name: &str, cwd: Option<&str>) -> String {
     let target = format!("={session_name}:{{end}}");
-    format!(
-        "new-window -d -a -t {} -n {} -P -F '#{{window_id}}'",
-        quote_tmux(&target),
-        quote_tmux(name)
-    )
+    let mut cmd = format!("new-window -d -a -t {}", quote_tmux(&target));
+    if let Some(cwd) = cwd {
+        cmd.push_str(&format!(" -c {}", quote_tmux(cwd)));
+    }
+    cmd.push_str(&format!(" -n {} -P -F '#{{window_id}}'", quote_tmux(name)));
+    cmd
 }
 
 pub fn rename_window(window_id: &str, name: &str) -> String {
@@ -51,8 +52,16 @@ mod tests {
     #[test]
     fn new_window_targets_end_of_exact_session() {
         assert_eq!(
-            new_window("work", "proj:tab3"),
+            new_window("work", "proj:tab3", None),
             "new-window -d -a -t \"=work:{end}\" -n \"proj:tab3\" -P -F '#{window_id}'"
+        );
+    }
+
+    #[test]
+    fn new_window_sets_cwd_when_provided() {
+        assert_eq!(
+            new_window("work", "proj:tab3", Some("/tmp/my dir")),
+            "new-window -d -a -t \"=work:{end}\" -c \"/tmp/my dir\" -n \"proj:tab3\" -P -F '#{window_id}'"
         );
     }
 }

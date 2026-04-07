@@ -74,6 +74,46 @@ async fn query_window_layout<T: TmuxApi>(tmux: &mut T, window_id: &str) -> Optio
     }
 }
 
+async fn query_pane_current_path<T: TmuxApi>(tmux: &mut T, pane_id: &str) -> Option<String> {
+    if pane_id.is_empty() {
+        return None;
+    }
+
+    match tmux
+        .send_command(&format!(
+            "display-message -p -t {} '#{{pane_current_path}}'",
+            pane_id
+        ))
+        .await
+    {
+        Ok(output) => {
+            let path = output.trim().to_string();
+            if path.is_empty() { None } else { Some(path) }
+        }
+        Err(_) => None,
+    }
+}
+
+async fn resolve_new_window_cwd<T: TmuxApi>(model: &Model, tmux: &mut T) -> Option<String> {
+    let home_pane_id = model.sidebar.home_pane_id.as_str();
+    if home_pane_id != model.sidebar.pane_id && !home_pane_id.is_empty() {
+        if let Some(path) = query_pane_current_path(tmux, home_pane_id).await {
+            return Some(path);
+        }
+    }
+
+    let fallback_pane_id =
+        choose_home_pane_in_window(tmux, &model.sidebar.window_id, &model.sidebar.pane_id).await;
+    if fallback_pane_id.is_empty()
+        || fallback_pane_id == model.sidebar.pane_id
+        || fallback_pane_id == home_pane_id
+    {
+        return None;
+    }
+
+    query_pane_current_path(tmux, &fallback_pane_id).await
+}
+
 /// Save a window's current layout paired with terminal width.
 async fn save_window_layout<T: TmuxApi>(model: &mut Model, tmux: &mut T, window_id: &str) {
     if let Some(layout) = query_window_layout(tmux, window_id).await {
@@ -795,7 +835,8 @@ async fn handle_new_window<T: TmuxApi>(
     name: String,
 ) {
     debug!(name, "creating new window");
-    let new_cmd = commands::new_window(&model.session_name, &name);
+    let cwd = resolve_new_window_cwd(model, tmux).await;
+    let new_cmd = commands::new_window(&model.session_name, &name, cwd.as_deref());
     match tmux.send_command(&new_cmd).await {
         Ok(output) => {
             let window_id = output.trim();
@@ -1421,16 +1462,7 @@ async fn apply_layout_helper<T: TmuxApi>(
         .into_iter()
         .next()
         .expect("content_count > 0 ensures content pane exists");
-    let base_path_cmd = format!(
-        "display-message -p -t {} '#{{pane_current_path}}'",
-        base_pane_id
-    );
-    let base_current_path = tmux
-        .send_command(&base_path_cmd)
-        .await
-        .ok()
-        .map(|path| path.trim().to_string())
-        .filter(|path| !path.is_empty());
+    let base_current_path = query_pane_current_path(tmux, &base_pane_id).await;
 
     let mut splits_needed = 6usize.saturating_sub(content_count);
     while splits_needed > 0 {
@@ -2262,6 +2294,42 @@ mod tests {
         assert!(cmd.ends_with("\" C-m"));
     }
 
+    #[tokio::test]
+    async fn resolve_new_window_cwd_prefers_home_pane() {
+        let model = test_model();
+        let mut tmux = FakeTmux::new(vec![Ok("/work/project\n".to_string())]);
+
+        let cwd = resolve_new_window_cwd(&model, &mut tmux).await;
+
+        assert_eq!(cwd.as_deref(), Some("/work/project"));
+        assert_eq!(
+            tmux.commands,
+            vec!["display-message -p -t %home_old '#{pane_current_path}'".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_new_window_cwd_falls_back_when_home_pane_is_stale() {
+        let model = test_model();
+        let mut tmux = FakeTmux::new(vec![
+            Err("stale pane".to_string()),
+            Ok("%sidebar\t0\n%fallback\t1\n".to_string()),
+            Ok("/work/fallback\n".to_string()),
+        ]);
+
+        let cwd = resolve_new_window_cwd(&model, &mut tmux).await;
+
+        assert_eq!(cwd.as_deref(), Some("/work/fallback"));
+        assert_eq!(
+            tmux.commands,
+            vec![
+                "display-message -p -t %home_old '#{pane_current_path}'".to_string(),
+                "list-panes -t @old -F '#{pane_id}\t#{pane_active}'".to_string(),
+                "display-message -p -t %fallback '#{pane_current_path}'".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn build_sidebar_main_3x2_layout_places_right_column_last_two_panes() {
         let layout = build_sidebar_main_3x2_layout(120, 40, 1, &[2, 3, 4, 5, 6, 7])
@@ -2700,6 +2768,57 @@ mod tests {
         assert_eq!(tmux.commands.len(), 3);
         assert!(tmux.commands[1].contains("display-message -t %sidebar -p '#{window_id}'"));
         assert!(tmux.commands[2].contains("list-panes -t @new"));
+    }
+
+    #[tokio::test]
+    async fn new_window_uses_working_pane_cwd() {
+        let mut model = test_model();
+        let mut tmux = FakeTmux::new(vec![
+            Ok("/work/project\n".to_string()),
+            Ok("@new\n".to_string()),
+            Ok(String::new()),
+        ]);
+        let mut queue = VecDeque::new();
+
+        handle_new_window(&mut model, &mut tmux, &mut queue, "proj:tab3".to_string()).await;
+
+        assert_eq!(
+            tmux.commands[1],
+            "new-window -d -a -t \"=s:{end}\" -c \"/work/project\" -n \"proj:tab3\" -P -F '#{window_id}'"
+        );
+        assert!(matches!(queue.pop_front(), Some(Cmd::ListWindows)));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(Cmd::PreviewWindow { id }) if id == "@new"
+        ));
+        assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn new_window_omits_cwd_when_no_working_pane_path_is_available() {
+        let mut model = test_model();
+        let mut tmux = FakeTmux::new(vec![
+            Err("stale pane".to_string()),
+            Ok("%sidebar\t1\n".to_string()),
+            Ok("@new\n".to_string()),
+            Ok(String::new()),
+        ]);
+        let mut queue = VecDeque::new();
+
+        handle_new_window(&mut model, &mut tmux, &mut queue, "proj:tab3".to_string()).await;
+
+        assert_eq!(
+            tmux.commands[2],
+            "new-window -d -a -t \"=s:{end}\" -n \"proj:tab3\" -P -F '#{window_id}'"
+        );
+        assert!(matches!(queue.pop_front(), Some(Cmd::ListWindows)));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(Cmd::PreviewWindow { id }) if id == "@new"
+        ));
+        assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
+        assert!(queue.is_empty());
     }
 
     #[tokio::test]
