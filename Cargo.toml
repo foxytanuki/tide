@@ -3,6 +3,10 @@ name = "tide"
 version = "0.2.0"
 edition = "2021"
 license = "MIT"
+description = "A tree-view sidebar for tmux"
+repository = "https://github.com/foxytanuki/tide"
+keywords = ["tmux", "tui", "terminal", "session-manager", "sidebar"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 ratatui = "0.30"
