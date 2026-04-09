@@ -33,6 +33,7 @@ use tide::tmux::WindowInfo;
 const AI_POLL_INTERVAL_MS: u64 = 500;
 const PREVIEW_DEBOUNCE_MS: u64 = 50;
 const INPUT_POLL_MS: u64 = 100;
+const MAX_TMUX_EVENTS_PER_BATCH: usize = 64;
 
 fn init_logging() {
     use std::sync::Mutex;
@@ -598,10 +599,15 @@ fn process_tmux_batch(
 ) -> Vec<Cmd> {
     debug!(?first_event, "received tmux event");
     let mut cmds = process_tmux_event(model, first_event);
+    let mut processed_events = 1;
 
-    while let Ok(event) = tmux_rx.try_recv() {
+    while processed_events < MAX_TMUX_EVENTS_PER_BATCH {
+        let Ok(event) = tmux_rx.try_recv() else {
+            break;
+        };
         debug!(?event, "draining tmux event");
         cmds.extend(process_tmux_event(model, event));
+        processed_events += 1;
     }
 
     coalesce_commands(cmds)
@@ -814,5 +820,63 @@ mod tests {
         assert_eq!(cmds.len(), 2);
         assert!(matches!(cmds[0], Cmd::EnsureSidebarWidth));
         assert!(matches!(cmds[1], Cmd::ValidateSidebarPanes));
+    }
+
+    #[test]
+    fn process_tmux_batch_is_bounded_under_pane_output_backlog() {
+        let mut model = test_model();
+        let (tx, mut rx) = mpsc::channel(128);
+
+        for _ in 0..(MAX_TMUX_EVENTS_PER_BATCH + 20) {
+            tx.try_send(TmuxEvent::PaneOutput("%ai".to_string()))
+                .expect("queue pane output");
+        }
+
+        let cmds = process_tmux_batch(&mut model, &mut rx, TmuxEvent::PaneOutput("%ai".to_string()));
+
+        assert!(cmds.is_empty());
+        assert_eq!(model.ai.output_counts.get("%ai").copied(), Some(MAX_TMUX_EVENTS_PER_BATCH as u32));
+    }
+
+    #[test]
+    fn process_tmux_batch_processes_remaining_queued_events_later() {
+        let mut model = test_model();
+        let (tx, mut rx) = mpsc::channel(128);
+
+        for _ in 0..MAX_TMUX_EVENTS_PER_BATCH {
+            tx.try_send(TmuxEvent::PaneOutput("%ai".to_string())).unwrap();
+        }
+        tx.try_send(TmuxEvent::WindowAdd("@1".to_string())).unwrap();
+
+        let cmds = process_tmux_batch(&mut model, &mut rx, TmuxEvent::PaneOutput("%ai".to_string()));
+
+        assert!(cmds.is_empty());
+        assert_eq!(model.ai.output_counts.get("%ai").copied(), Some(MAX_TMUX_EVENTS_PER_BATCH as u32));
+
+        let cmds = process_tmux_batch(&mut model, &mut rx, TmuxEvent::WindowAdd("@2".to_string()));
+
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::ListWindows));
+    }
+
+    #[test]
+    fn process_tmux_batch_event_behind_many_outputs_is_eventually_processed() {
+        let mut model = test_model();
+        let (tx, mut rx) = mpsc::channel(256);
+
+        for _ in 0..MAX_TMUX_EVENTS_PER_BATCH {
+            tx.try_send(TmuxEvent::PaneOutput("%ai".to_string())).unwrap();
+        }
+        tx.try_send(TmuxEvent::WindowAdd("@1".to_string())).unwrap();
+
+        let cmds = process_tmux_batch(&mut model, &mut rx, TmuxEvent::PaneOutput("%ai".to_string()));
+
+        assert!(cmds.is_empty());
+        assert_eq!(model.ai.output_counts.get("%ai").copied(), Some(MAX_TMUX_EVENTS_PER_BATCH as u32));
+
+        let cmds = process_tmux_batch(&mut model, &mut rx, TmuxEvent::PaneOutput("%ai".to_string()));
+
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::ListWindows));
     }
 }
