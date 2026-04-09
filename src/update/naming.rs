@@ -191,7 +191,7 @@ fn collect_folder_children_recursive(
     }
 }
 
-pub(super) fn collect_folder_expanded(nodes: &[TreeNode]) -> HashMap<String, bool> {
+pub(crate) fn collect_folder_expanded(nodes: &[TreeNode]) -> HashMap<String, bool> {
     let mut map = HashMap::new();
     collect_folder_expanded_inner(nodes, None, &mut map);
     map

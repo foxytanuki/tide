@@ -4,7 +4,7 @@ use crate::cmd::Cmd;
 use crate::model::{Mode, Model, PreviewState, SelectionTarget};
 use crate::tree::{build_tree, WindowInfo};
 
-use super::naming::{collect_folder_expanded, restore_folder_expanded};
+use super::naming::restore_folder_expanded;
 use super::navigation::clear_mode_if_missing_target;
 
 pub(super) fn handle_window_focus_changed(model: &mut Model, window_id: String) -> Vec<Cmd> {
@@ -78,7 +78,7 @@ pub(super) fn handle_window_list_loaded(
         model.clear_reorder_preview();
     }
 
-    let expanded_state = collect_folder_expanded(model.tree());
+    let expanded_state = model.folder_expanded_snapshot().clone();
     let mut selected_target = derive_selected_target(model);
 
     let selected_exists = match selected_target.as_ref() {

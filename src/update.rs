@@ -8,6 +8,8 @@ mod naming;
 mod navigation;
 mod window_list;
 
+pub(crate) use naming::collect_folder_expanded;
+
 use input::*;
 use naming::*;
 use navigation::*;
@@ -561,6 +563,32 @@ mod tests {
         ));
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], Cmd::Render));
+    }
+
+    #[test]
+    fn window_list_loaded_rename_only_preserves_folder_expansion() {
+        let mut model = test_model();
+        let before = vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "scratch")];
+        update(&mut model, Msg::WindowListLoaded(before));
+
+        model.mutate_tree(|tree| {
+            if let TreeNode::Folder { expanded, .. } = &mut tree[0] {
+                *expanded = false;
+            }
+        });
+        model.set_cursor(0);
+
+        let after = vec![wi("@1", 1, "proj:new"), wi("@2", 2, "scratch")];
+        update(&mut model, Msg::WindowListLoaded(after));
+
+        assert_eq!(model.cursor(), 0);
+        assert!(matches!(
+            model.tree()[0],
+            TreeNode::Folder {
+                expanded: false,
+                ..
+            }
+        ));
     }
 
     #[test]

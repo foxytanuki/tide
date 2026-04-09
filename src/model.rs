@@ -5,11 +5,13 @@ use crate::tree::{
     expand_to_window_by_id, flatten, folder_path_for_path, get_node, next_visible_item, FlatItem,
     FlatNodeKind, TreeNode, WindowInfo,
 };
+use crate::update::collect_folder_expanded;
 
 pub struct Model {
     tree: Vec<TreeNode>,
     flat_items: Vec<FlatItem>,
     pub window_list_snapshot: Option<Vec<WindowInfo>>,
+    folder_expanded_snapshot: HashMap<String, bool>,
     window_flat_indices: HashMap<String, usize>,
     folder_flat_indices: HashMap<String, usize>,
     selection_targets: Vec<Option<SelectionTarget>>,
@@ -142,6 +144,7 @@ impl Model {
             tree: Vec::new(),
             flat_items: Vec::new(),
             window_list_snapshot: None,
+            folder_expanded_snapshot: HashMap::new(),
             window_flat_indices: HashMap::new(),
             folder_flat_indices: HashMap::new(),
             selection_targets: Vec::new(),
@@ -226,6 +229,10 @@ impl Model {
         self.window_list_snapshot = Some(windows);
     }
 
+    pub fn folder_expanded_snapshot(&self) -> &HashMap<String, bool> {
+        &self.folder_expanded_snapshot
+    }
+
     /// Mutate the tree in-place, then rebuild the flat list + clamp cursor.
     pub fn mutate_tree<F, R>(&mut self, f: F) -> R
     where
@@ -238,6 +245,7 @@ impl Model {
 
     fn rebuild_flat(&mut self) {
         self.flat_items = flatten(&self.tree);
+        self.folder_expanded_snapshot = collect_folder_expanded(&self.tree);
         self.window_flat_indices.clear();
         self.folder_flat_indices.clear();
         self.selection_targets.clear();
