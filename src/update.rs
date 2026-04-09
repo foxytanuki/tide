@@ -592,6 +592,28 @@ mod tests {
     }
 
     #[test]
+    fn window_list_loaded_rename_only_updates_leaf_without_rebuild() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "scratch")]),
+        );
+
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@1", 1, "proj:renamed"), wi("@2", 2, "scratch")]),
+        );
+
+        match &model.tree()[0] {
+            TreeNode::Folder { children, .. } => match &children[0] {
+                TreeNode::Window { info } => assert_eq!(info.name, "renamed"),
+                other => panic!("expected folder child window, got {:?}", other),
+            },
+            other => panic!("expected root folder, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn window_list_loaded_rebuilds_same_list_while_moving() {
         let mut model = test_model();
         let windows = vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "scratch")];
@@ -620,6 +642,80 @@ mod tests {
         }));
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], Cmd::Render));
+    }
+
+    #[test]
+    fn window_list_loaded_add_remove_keeps_selected_window_by_id() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@1", 1, "alpha"), wi("@2", 2, "beta")]),
+        );
+        model.set_cursor(1);
+
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@3", 1, "gamma"), wi("@2", 2, "beta")]),
+        );
+
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@2")
+        );
+        assert_eq!(model.cursor(), 1);
+    }
+
+    #[test]
+    fn window_list_loaded_add_remove_fast_path_handles_root_level_addition() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@1", 1, "alpha"), wi("@3", 3, "gamma")]),
+        );
+        model.set_cursor(1);
+
+        let cmds = update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                wi("@1", 1, "alpha"),
+                wi("@2", 2, "beta"),
+                wi("@3", 3, "gamma"),
+            ]),
+        );
+
+        assert_eq!(model.cursor(), 2);
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@3")
+        );
+        assert_eq!(model.tree().len(), 3);
+        assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::Render)));
+    }
+
+    #[test]
+    fn window_list_loaded_add_remove_fast_path_handles_root_level_removal() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                wi("@1", 1, "alpha"),
+                wi("@2", 2, "beta"),
+                wi("@3", 3, "gamma"),
+            ]),
+        );
+        model.set_cursor(1);
+
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@1", 1, "alpha"), wi("@3", 3, "gamma")]),
+        );
+
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@3")
+        );
+        assert_eq!(model.cursor(), 1);
+        assert_eq!(model.tree().len(), 2);
     }
 
     #[test]

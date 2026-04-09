@@ -1,7 +1,7 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use tide::model::Model;
 use tide::msg::Msg;
-use tide::tree::{build_tree, flatten, WindowInfo};
+use tide::tree::{build_tree, flatten, TreeNode, WindowInfo};
 use tide::update::update;
 use tide::view::build_tree_items;
 
@@ -32,6 +32,113 @@ fn fixture_model(count: usize) -> Model {
     );
     let _ = update(&mut model, Msg::WindowListLoaded(fixture_windows(count)));
     model
+}
+
+fn rename_only_windows(count: usize) -> Vec<WindowInfo> {
+    let mut windows = fixture_windows(count);
+    if let Some(first) = windows.first_mut() {
+        first.name = format!("{}:renamed", first.name);
+    }
+    windows
+}
+
+fn add_remove_windows(count: usize) -> Vec<WindowInfo> {
+    let mut windows = fixture_windows(count);
+    if !windows.is_empty() {
+        windows.remove(0);
+    }
+    windows.push(WindowInfo {
+        id: format!("@{}", count + 1),
+        index: count + 1,
+        name: format!("proj{}:added", count % 25),
+        active: false,
+    });
+    windows
+}
+
+fn bench_window_list_loaded(c: &mut Criterion) {
+    let mut group = c.benchmark_group("window_list_loaded");
+
+    for count in [100usize, 500, 1000] {
+        let base = fixture_windows(count);
+
+        group.bench_with_input(BenchmarkId::new("same_list", count), &base, |b, windows| {
+            b.iter_batched(
+                || fixture_model(count),
+                |mut model| {
+                    update(
+                        &mut model,
+                        Msg::WindowListLoaded(black_box(windows.clone())),
+                    );
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        let renamed = rename_only_windows(count);
+        group.bench_with_input(
+            BenchmarkId::new("rename_only", count),
+            &renamed,
+            |b, windows| {
+                b.iter_batched(
+                    || fixture_model(count),
+                    |mut model| {
+                        update(
+                            &mut model,
+                            Msg::WindowListLoaded(black_box(windows.clone())),
+                        );
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        let changed = add_remove_windows(count);
+        group.bench_with_input(
+            BenchmarkId::new("add_remove", count),
+            &changed,
+            |b, windows| {
+                b.iter_batched(
+                    || fixture_model(count),
+                    |mut model| {
+                        update(
+                            &mut model,
+                            Msg::WindowListLoaded(black_box(windows.clone())),
+                        );
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        let collapsed = base.clone();
+        group.bench_with_input(
+            BenchmarkId::new("collapsed_folder", count),
+            &collapsed,
+            |b, windows| {
+                b.iter_batched(
+                    || {
+                        let mut model = fixture_model(count);
+                        model.mutate_tree(|tree| {
+                            if let Some(TreeNode::Folder { expanded, .. }) = tree.get_mut(0) {
+                                *expanded = false;
+                            }
+                        });
+                        model
+                    },
+                    |mut model| {
+                        update(
+                            &mut model,
+                            Msg::WindowListLoaded(black_box(windows.clone())),
+                        );
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
 }
 
 fn bench_build_tree(c: &mut Criterion) {
@@ -71,5 +178,11 @@ fn bench_view_build(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(phase0, bench_build_tree, bench_flatten, bench_view_build);
+criterion_group!(
+    phase0,
+    bench_build_tree,
+    bench_flatten,
+    bench_view_build,
+    bench_window_list_loaded
+);
 criterion_main!(phase0);

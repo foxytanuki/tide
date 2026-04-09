@@ -233,6 +233,23 @@ impl Model {
         &self.folder_expanded_snapshot
     }
 
+    pub fn rename_window_leaves(&mut self, leaf_names_by_id: &HashMap<String, String>) {
+        fn rename_nodes(nodes: &mut [TreeNode], leaf_names_by_id: &HashMap<String, String>) {
+            for node in nodes {
+                match node {
+                    TreeNode::Window { info } => {
+                        if let Some(new_name) = leaf_names_by_id.get(info.id.as_str()) {
+                            info.name = new_name.clone();
+                        }
+                    }
+                    TreeNode::Folder { children, .. } => rename_nodes(children, leaf_names_by_id),
+                }
+            }
+        }
+
+        rename_nodes(&mut self.tree, leaf_names_by_id);
+    }
+
     /// Mutate the tree in-place, then rebuild the flat list + clamp cursor.
     pub fn mutate_tree<F, R>(&mut self, f: F) -> R
     where
