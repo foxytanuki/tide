@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::model::{Mode, Model};
-use crate::tree::{get_node, visible_item_number, FlatItem, FlatNodeKind, TreeNode};
+use crate::tree::{FlatItem, TreeNode, WindowInfo};
 
 pub fn render(model: &Model, frame: &mut Frame) {
     let outer = Block::default()
@@ -56,12 +56,30 @@ pub fn render(model: &Model, frame: &mut Frame) {
 }
 
 pub fn build_tree_items(model: &Model, width: usize) -> Vec<ListItem<'static>> {
-    model
-        .flat_items()
-        .iter()
-        .enumerate()
-        .map(|(idx, item)| render_tree_item(model, idx, item, width))
-        .collect()
+    let flat_items = model.flat_items();
+    let active_window_id = model
+        .sidebar
+        .pending_preview_id
+        .as_deref()
+        .unwrap_or(&model.sidebar.window_id);
+    let mut rendered = Vec::with_capacity(flat_items.len());
+    let mut flat_index = 0;
+    let cursor = model.cursor();
+
+    collect_tree_items(
+        model.tree(),
+        flat_items,
+        width,
+        cursor,
+        active_window_id,
+        &model.ai.windows,
+        &model.ai.recently_finished,
+        &mut flat_index,
+        &mut rendered,
+    );
+
+    debug_assert_eq!(flat_index, flat_items.len());
+    rendered
 }
 
 /// Badge state for a tree item's AI activity indicator.
@@ -74,83 +92,236 @@ enum AiBadge {
     Finished,
 }
 
-fn render_tree_item(
-    model: &Model,
-    index: usize,
-    item: &FlatItem,
-    width: usize,
-) -> ListItem<'static> {
-    let indent = " ".repeat(item.depth * 2);
-    let mut content = String::new();
-    let mut style = Style::default();
-    let mut badge = AiBadge::None;
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SubtreeAiState {
+    has_active: bool,
+    has_finished: bool,
+}
 
-    match get_node(model.tree(), &item.path) {
-        Ok(node) => match (&item.kind, node) {
-            (
-                FlatNodeKind::Folder,
-                TreeNode::Folder {
-                    name,
-                    expanded,
+impl SubtreeAiState {
+    fn merge(&mut self, other: Self) {
+        self.has_active |= other.has_active;
+        self.has_finished |= other.has_finished;
+    }
+
+    fn badge_for_collapsed_folder(self) -> AiBadge {
+        if self.has_active {
+            AiBadge::Active
+        } else if self.has_finished {
+            AiBadge::Finished
+        } else {
+            AiBadge::None
+        }
+    }
+}
+
+fn collect_tree_items(
+    nodes: &[TreeNode],
+    flat_items: &[FlatItem],
+    width: usize,
+    cursor: usize,
+    active_window_id: &str,
+    ai_windows: &HashSet<String>,
+    recently_finished: &HashMap<String, Instant>,
+    flat_index: &mut usize,
+    out: &mut Vec<ListItem<'static>>,
+) -> SubtreeAiState {
+    let mut subtree = SubtreeAiState::default();
+
+    for node in nodes {
+        subtree.merge(collect_tree_item(
+            node,
+            flat_items,
+            width,
+            cursor,
+            active_window_id,
+            ai_windows,
+            recently_finished,
+            flat_index,
+            out,
+        ));
+    }
+
+    subtree
+}
+
+fn collect_tree_item(
+    node: &TreeNode,
+    flat_items: &[FlatItem],
+    width: usize,
+    cursor: usize,
+    active_window_id: &str,
+    ai_windows: &HashSet<String>,
+    recently_finished: &HashMap<String, Instant>,
+    flat_index: &mut usize,
+    out: &mut Vec<ListItem<'static>>,
+) -> SubtreeAiState {
+    match node {
+        TreeNode::Folder {
+            name,
+            expanded,
+            children,
+        } => {
+            let Some(item) = flat_items.get(*flat_index) else {
+                debug_assert!(false, "flat/tree mismatch on folder row");
+                return subtree_ai_state(children, ai_windows, recently_finished);
+            };
+            let is_selected = *flat_index == cursor;
+            *flat_index += 1;
+
+            let rendered_index = out.len();
+            out.push(ListItem::new(String::new()));
+
+            let child_state = if *expanded {
+                collect_tree_items(
                     children,
-                },
-            ) => {
-                let marker = if *expanded { "v" } else { ">" };
-                let prefix = visible_prefix(model, index, &indent);
-                content = format!("{}{} {}", prefix, marker, name);
-                style = style.add_modifier(Modifier::BOLD);
-                if children.is_empty() {
-                    style = style.fg(Color::DarkGray);
-                }
-                // Bubble up: show dot only when collapsed (expanded shows individual dots)
-                // Active takes priority over recently-finished
-                if !*expanded {
-                    if folder_has_ai_window(children, &model.ai.windows) {
-                        badge = AiBadge::Active;
-                    } else if folder_has_recently_finished(children, &model.ai.recently_finished) {
-                        badge = AiBadge::Finished;
-                    }
-                }
-            }
-            (FlatNodeKind::Window, TreeNode::Window { info }) => {
-                let active_id = model
-                    .sidebar
-                    .pending_preview_id
-                    .as_deref()
-                    .unwrap_or(&model.sidebar.window_id);
-                let prefix = window_prefix(model, index, item, &indent);
-                if info.id == active_id {
-                    content = format!("{prefix}* {}", info.name);
-                    style = style.fg(Color::Yellow);
+                    flat_items,
+                    width,
+                    cursor,
+                    active_window_id,
+                    ai_windows,
+                    recently_finished,
+                    flat_index,
+                    out,
+                )
+            } else {
+                subtree_ai_state(children, ai_windows, recently_finished)
+            };
+
+            out[rendered_index] = render_folder_item(
+                item,
+                name,
+                *expanded,
+                children.is_empty(),
+                width,
+                is_selected,
+                if *expanded {
+                    AiBadge::None
                 } else {
-                    content = format!("{prefix}{}", info.name);
-                }
-                if model.ai.windows.contains(&info.id) {
-                    badge = AiBadge::Active;
-                } else if model.ai.recently_finished.contains_key(&info.id) {
-                    badge = AiBadge::Finished;
-                }
+                    child_state.badge_for_collapsed_folder()
+                },
+            );
+
+            child_state
+        }
+        TreeNode::Window { info } => {
+            let Some(item) = flat_items.get(*flat_index) else {
+                debug_assert!(false, "flat/tree mismatch on window row");
+                return window_ai_state(info.id.as_str(), ai_windows, recently_finished);
+            };
+            let is_selected = *flat_index == cursor;
+            *flat_index += 1;
+            let ai_state = window_ai_state(info.id.as_str(), ai_windows, recently_finished);
+            let badge = ai_state.badge_for_collapsed_folder();
+            out.push(render_window_item(
+                item,
+                info,
+                active_window_id,
+                width,
+                is_selected,
+                badge,
+            ));
+            ai_state
+        }
+    }
+}
+
+fn subtree_ai_state(
+    children: &[TreeNode],
+    ai_windows: &HashSet<String>,
+    recently_finished: &HashMap<String, Instant>,
+) -> SubtreeAiState {
+    let mut state = SubtreeAiState::default();
+
+    for child in children {
+        match child {
+            TreeNode::Window { info } => {
+                state.merge(window_ai_state(
+                    info.id.as_str(),
+                    ai_windows,
+                    recently_finished,
+                ));
             }
-            _ => {
-                content = format!("{}?", indent);
+            TreeNode::Folder { children, .. } => {
+                state.merge(subtree_ai_state(children, ai_windows, recently_finished));
             }
-        },
-        Err(_) => {
-            content.push('?');
         }
     }
 
-    if index == model.cursor() {
+    state
+}
+
+fn window_ai_state(
+    window_id: &str,
+    ai_windows: &HashSet<String>,
+    recently_finished: &HashMap<String, Instant>,
+) -> SubtreeAiState {
+    SubtreeAiState {
+        has_active: ai_windows.contains(window_id),
+        has_finished: recently_finished.contains_key(window_id),
+    }
+}
+
+fn render_folder_item(
+    item: &FlatItem,
+    name: &str,
+    expanded: bool,
+    is_empty: bool,
+    width: usize,
+    selected: bool,
+    badge: AiBadge,
+) -> ListItem<'static> {
+    let indent = " ".repeat(item.depth * 2);
+    let marker = if expanded { "v" } else { ">" };
+    let content = format!("{}{} {}", visible_prefix(item, &indent), marker, name);
+    let mut style = Style::default();
+    style = style.add_modifier(Modifier::BOLD);
+    if is_empty {
+        style = style.fg(Color::DarkGray);
+    }
+    if selected {
         style = style.add_modifier(Modifier::REVERSED);
     }
 
+    render_line_with_badge(&content, style, width, badge)
+}
+
+fn render_window_item(
+    item: &FlatItem,
+    info: &WindowInfo,
+    active_window_id: &str,
+    width: usize,
+    selected: bool,
+    badge: AiBadge,
+) -> ListItem<'static> {
+    let indent = " ".repeat(item.depth * 2);
+    let prefix = window_prefix(item, &indent);
+    let mut style = Style::default();
+    let content = if info.id == active_window_id {
+        style = style.fg(Color::Yellow);
+        format!("{prefix}* {}", info.name)
+    } else {
+        format!("{prefix}{}", info.name)
+    };
+    if selected {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+
+    render_line_with_badge(&content, style, width, badge)
+}
+
+fn render_line_with_badge(
+    content: &str,
+    style: Style,
+    width: usize,
+    badge: AiBadge,
+) -> ListItem<'static> {
+    let truncated = truncate(content, width);
+
     match badge {
         AiBadge::Active if width > 1 => {
-            let truncated = truncate(&content, width.saturating_sub(2));
-            let text_width = truncated
-                .chars()
-                .map(|c| c.width().unwrap_or(0))
-                .sum::<usize>();
+            let truncated = truncate(content, width.saturating_sub(2));
+            let text_width = display_width(&truncated);
             let padding = width.saturating_sub(text_width).saturating_sub(1);
             let line = Line::from(vec![
                 Span::styled(truncated, style),
@@ -160,11 +331,8 @@ fn render_tree_item(
             ListItem::new(line)
         }
         AiBadge::Finished if width > 1 => {
-            let truncated = truncate(&content, width.saturating_sub(2));
-            let text_width = truncated
-                .chars()
-                .map(|c| c.width().unwrap_or(0))
-                .sum::<usize>();
+            let truncated = truncate(content, width.saturating_sub(2));
+            let text_width = display_width(&truncated);
             let padding = width.saturating_sub(text_width).saturating_sub(1);
             let line = Line::from(vec![
                 Span::styled(truncated, style),
@@ -173,21 +341,21 @@ fn render_tree_item(
             ]);
             ListItem::new(line)
         }
-        _ => ListItem::new(truncate(&content, width)).style(style),
+        _ => ListItem::new(truncated).style(style),
     }
 }
 
-fn visible_prefix(model: &Model, index: usize, indent: &str) -> String {
-    match visible_item_number(model.flat_items(), index) {
+fn visible_prefix(item: &FlatItem, indent: &str) -> String {
+    match item.visible_number {
         Some(n) => format!("{indent}{n}:"),
         None => indent.to_string(),
     }
 }
 
-fn window_prefix(model: &Model, index: usize, item: &FlatItem, indent: &str) -> String {
+fn window_prefix(item: &FlatItem, indent: &str) -> String {
     let connector = window_connector(item.is_last_sibling);
 
-    match visible_item_number(model.flat_items(), index) {
+    match item.visible_number {
         Some(n) => format!("{indent}{connector} {n}: "),
         None => format!("{indent}{connector} "),
     }
@@ -199,47 +367,6 @@ fn window_connector(is_last_sibling: bool) -> &'static str {
     } else {
         "├─"
     }
-}
-
-/// Check if any window inside a folder (recursively) has AI activity.
-fn folder_has_ai_window(children: &[TreeNode], ai_windows: &HashSet<String>) -> bool {
-    for child in children {
-        match child {
-            TreeNode::Window { info } => {
-                if ai_windows.contains(&info.id) {
-                    return true;
-                }
-            }
-            TreeNode::Folder { children, .. } => {
-                if folder_has_ai_window(children, ai_windows) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Check if any window inside a folder (recursively) has recently finished AI.
-fn folder_has_recently_finished(
-    children: &[TreeNode],
-    recently_finished: &HashMap<String, Instant>,
-) -> bool {
-    for child in children {
-        match child {
-            TreeNode::Window { info } => {
-                if recently_finished.contains_key(&info.id) {
-                    return true;
-                }
-            }
-            TreeNode::Folder { children, .. } => {
-                if folder_has_recently_finished(children, recently_finished) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 fn build_footer_text(model: &Model, width: usize) -> String {
@@ -372,7 +499,34 @@ fn display_width(input: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_normal_footer_text, fit_footer_actions, window_connector};
+    use std::collections::{HashMap, HashSet};
+    use std::time::Instant;
+
+    use super::{
+        build_normal_footer_text, build_tree_items, fit_footer_actions, subtree_ai_state,
+        window_connector,
+    };
+    use crate::model::Model;
+    use crate::tree::{build_tree, get_node, toggle_expand, TreeNode, WindowInfo};
+
+    fn test_model() -> Model {
+        Model::new(
+            "s".to_string(),
+            "$1".to_string(),
+            "%sidebar".to_string(),
+            "%home".to_string(),
+            "@home".to_string(),
+        )
+    }
+
+    fn window(id: &str, index: usize, name: &str) -> WindowInfo {
+        WindowInfo {
+            id: id.to_string(),
+            index,
+            name: name.to_string(),
+            active: false,
+        }
+    }
 
     #[test]
     fn window_connector_uses_box_drawing_glyphs() {
@@ -404,5 +558,66 @@ mod tests {
             build_normal_footer_text(96),
             "[r]ename [x]close [c]new [m]ove [M]proj [L]ayout [C]proj [R]estart"
         );
+    }
+
+    #[test]
+    fn subtree_ai_state_bubbles_nested_window_activity() {
+        let tree = build_tree(&[
+            window("@1", 1, "proj:api:tab1"),
+            window("@2", 2, "proj:api:tab2"),
+            window("@3", 3, "proj:web"),
+        ]);
+        let mut ai_windows = HashSet::new();
+        ai_windows.insert("@2".to_string());
+        let mut recently_finished = HashMap::new();
+        recently_finished.insert("@3".to_string(), Instant::now());
+
+        let state = subtree_ai_state(&tree, &ai_windows, &recently_finished);
+
+        assert!(state.has_active);
+        assert!(state.has_finished);
+    }
+
+    #[test]
+    fn build_tree_items_matches_visible_flat_rows() {
+        let mut model = test_model();
+        let mut tree = build_tree(&[
+            window("@1", 1, "proj:api:tab1"),
+            window("@2", 2, "proj:api:tab2"),
+            window("@3", 3, "scratch"),
+        ]);
+        let node = get_node(&tree, &[0, 0]).expect("nested folder exists");
+        assert!(matches!(node, TreeNode::Folder { .. }));
+        let folder = crate::tree::get_node_mut(&mut tree, &[0, 0]).expect("nested folder exists");
+        toggle_expand(folder);
+        model.replace_tree_preserve_selection(tree, None);
+
+        let items = build_tree_items(&model, 25);
+
+        assert_eq!(items.len(), model.flat_items().len());
+    }
+
+    #[test]
+    fn collapsed_folder_badge_moves_to_parent_only_when_collapsed() {
+        let mut model = test_model();
+        let expanded_tree =
+            build_tree(&[window("@1", 1, "proj:tab1"), window("@2", 2, "proj:tab2")]);
+        model.ai.windows.insert("@2".to_string());
+
+        let mut tree = expanded_tree.clone();
+        let folder = crate::tree::get_node_mut(&mut tree, &[0]).expect("folder exists");
+        toggle_expand(folder);
+        model.replace_tree_preserve_selection(tree, None);
+
+        let collapsed = build_tree_items(&model, 25);
+        assert!(format!("{:?}", collapsed[0]).contains('●'));
+
+        model.replace_tree_preserve_selection(expanded_tree, None);
+        let expanded = build_tree_items(&model, 25);
+        assert!(!format!("{:?}", expanded[0]).contains('●'));
+        assert!(expanded
+            .iter()
+            .skip(1)
+            .any(|item| format!("{:?}", item).contains('●')));
     }
 }

@@ -2,14 +2,16 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::tree::{
-    expand_to_window_by_id, find_folder_flat_index_by_path, find_window_flat_index_by_id, flatten,
-    folder_path_for_path, get_node, next_visible_item, FlatItem, FlatNodeKind, TreeNode,
-    WindowInfo,
+    expand_to_window_by_id, flatten, folder_path_for_path, get_node, next_visible_item, FlatItem,
+    FlatNodeKind, TreeNode, WindowInfo,
 };
 
 pub struct Model {
     tree: Vec<TreeNode>,
     flat_items: Vec<FlatItem>,
+    window_flat_indices: HashMap<String, usize>,
+    folder_flat_indices: HashMap<String, usize>,
+    selection_targets: Vec<Option<SelectionTarget>>,
     cursor: usize,
     pub session_name: String,
     pub session_id: String,
@@ -138,6 +140,9 @@ impl Model {
         Self {
             tree: Vec::new(),
             flat_items: Vec::new(),
+            window_flat_indices: HashMap::new(),
+            folder_flat_indices: HashMap::new(),
+            selection_targets: Vec::new(),
             cursor: 0,
             session_name,
             session_id,
@@ -209,21 +214,8 @@ impl Model {
         }
         self.rebuild_flat();
         if let Some(target) = selected_target {
-            match target {
-                SelectionTarget::Window(window_id) => {
-                    if let Some(index) =
-                        find_window_flat_index_by_id(&self.flat_items, &self.tree, window_id)
-                    {
-                        self.cursor = index;
-                    }
-                }
-                SelectionTarget::Folder(folder_path) => {
-                    if let Some(index) =
-                        find_folder_flat_index_by_path(&self.flat_items, &self.tree, folder_path)
-                    {
-                        self.cursor = index;
-                    }
-                }
+            if let Some(index) = self.flat_index_for_selection_target(target) {
+                self.cursor = index;
             }
         }
     }
@@ -240,6 +232,32 @@ impl Model {
 
     fn rebuild_flat(&mut self) {
         self.flat_items = flatten(&self.tree);
+        self.window_flat_indices.clear();
+        self.folder_flat_indices.clear();
+        self.selection_targets.clear();
+        self.selection_targets.reserve(self.flat_items.len());
+        for (idx, item) in self.flat_items.iter().enumerate() {
+            match item.kind {
+                FlatNodeKind::Window => {
+                    if let Ok(TreeNode::Window { info }) = get_node(&self.tree, &item.path) {
+                        self.window_flat_indices.insert(info.id.clone(), idx);
+                        self.selection_targets
+                            .push(Some(SelectionTarget::Window(info.id.clone())));
+                    } else {
+                        self.selection_targets.push(None);
+                    }
+                }
+                FlatNodeKind::Folder => {
+                    if let Ok(folder_path) = folder_path_for_path(&self.tree, &item.path) {
+                        self.folder_flat_indices.insert(folder_path.clone(), idx);
+                        self.selection_targets
+                            .push(Some(SelectionTarget::Folder(folder_path)));
+                    } else {
+                        self.selection_targets.push(None);
+                    }
+                }
+            }
+        }
         if self.flat_items.is_empty() {
             self.cursor = 0;
         } else {
@@ -268,6 +286,21 @@ impl Model {
         get_node(&self.tree, &item.path).ok()
     }
 
+    pub fn flat_index_for_window_id(&self, window_id: &str) -> Option<usize> {
+        self.window_flat_indices.get(window_id).copied()
+    }
+
+    pub fn flat_index_for_folder_path(&self, folder_path: &str) -> Option<usize> {
+        self.folder_flat_indices.get(folder_path).copied()
+    }
+
+    pub fn flat_index_for_selection_target(&self, target: &SelectionTarget) -> Option<usize> {
+        match target {
+            SelectionTarget::Window(window_id) => self.flat_index_for_window_id(window_id),
+            SelectionTarget::Folder(folder_path) => self.flat_index_for_folder_path(folder_path),
+        }
+    }
+
     pub fn selected_window_info(&self) -> Option<&WindowInfo> {
         match self.selected_node()? {
             TreeNode::Window { info } => Some(info),
@@ -276,13 +309,7 @@ impl Model {
     }
 
     pub fn selected_selection_target(&self) -> Option<SelectionTarget> {
-        let item = self.flat_items.get(self.cursor)?;
-        match get_node(&self.tree, &item.path).ok()? {
-            TreeNode::Window { info } => Some(SelectionTarget::Window(info.id.clone())),
-            TreeNode::Folder { .. } => folder_path_for_path(&self.tree, &item.path)
-                .ok()
-                .map(SelectionTarget::Folder),
-        }
+        self.selection_targets.get(self.cursor)?.clone()
     }
 
     pub fn begin_reorder_preview(&mut self) {
@@ -393,5 +420,21 @@ mod tests {
             crate::tree::FlatNodeKind::Window
         ));
         assert_eq!(model.flat_items().len(), 4);
+    }
+
+    #[test]
+    fn selected_selection_target_uses_rebuilt_cache() {
+        let mut model = test_model();
+        let tree = build_tree(&[window("@1", 1, "proj:one"), window("@2", 2, "dev")]);
+        model.replace_tree_preserve_selection(tree, None);
+
+        assert_eq!(model.flat_index_for_window_id("@1"), Some(1));
+        assert_eq!(model.flat_index_for_folder_path("proj"), Some(0));
+
+        model.set_cursor(1);
+        assert_eq!(
+            model.selected_selection_target(),
+            Some(SelectionTarget::Window("@1".into()))
+        );
     }
 }

@@ -110,9 +110,7 @@ pub(super) fn handle_move_project(model: &mut Model) -> Vec<Cmd> {
             folder_name: root_folder.clone(),
         },
     };
-    if let Some(index) =
-        find_folder_flat_index_by_path(model.flat_items(), model.tree(), &root_folder)
-    {
+    if let Some(index) = model.flat_index_for_folder_path(&root_folder) {
         model.set_cursor(index);
     }
     vec![Cmd::Render]
@@ -332,13 +330,12 @@ fn move_subject_context(
 fn selection_path(model: &Model, subject: &MoveSubject) -> Option<Vec<usize>> {
     match subject {
         MoveSubject::Item(SelectionTarget::Window(window_id)) => {
-            let index = find_window_flat_index_by_id(model.flat_items(), model.tree(), window_id)?;
+            let index = model.flat_index_for_window_id(window_id)?;
             Some(model.flat_items().get(index)?.path.clone())
         }
         MoveSubject::Item(SelectionTarget::Folder(folder_name))
         | MoveSubject::Project { folder_name } => {
-            let index =
-                find_folder_flat_index_by_path(model.flat_items(), model.tree(), folder_name)?;
+            let index = model.flat_index_for_folder_path(folder_name)?;
             Some(model.flat_items().get(index)?.path.clone())
         }
     }
@@ -347,12 +344,10 @@ fn selection_path(model: &Model, subject: &MoveSubject) -> Option<Vec<usize>> {
 fn selection_flat_index(model: &Model, subject: &MoveSubject) -> Option<usize> {
     match subject {
         MoveSubject::Item(SelectionTarget::Window(window_id)) => {
-            find_window_flat_index_by_id(model.flat_items(), model.tree(), window_id)
+            model.flat_index_for_window_id(window_id)
         }
         MoveSubject::Item(SelectionTarget::Folder(folder_name))
-        | MoveSubject::Project { folder_name } => {
-            find_folder_flat_index_by_path(model.flat_items(), model.tree(), folder_name)
-        }
+        | MoveSubject::Project { folder_name } => model.flat_index_for_folder_path(folder_name),
     }
 }
 
