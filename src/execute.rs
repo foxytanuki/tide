@@ -88,7 +88,11 @@ async fn query_pane_current_path<T: TmuxApi>(tmux: &mut T, pane_id: &str) -> Opt
     {
         Ok(output) => {
             let path = output.trim().to_string();
-            if path.is_empty() { None } else { Some(path) }
+            if path.is_empty() {
+                None
+            } else {
+                Some(path)
+            }
         }
         Err(_) => None,
     }
@@ -938,7 +942,10 @@ async fn handle_reorder_windows<T: TmuxApi>(
     };
     current_windows.retain(|window| window.id != model.sidebar.window_id);
     current_windows.sort_by_key(|window| window.index);
-    let current_ids: Vec<String> = current_windows.iter().map(|window| window.id.clone()).collect();
+    let current_ids: Vec<String> = current_windows
+        .iter()
+        .map(|window| window.id.clone())
+        .collect();
 
     let mut desired_iter = desired_order.iter();
     let desired_set: HashSet<&str> = desired_order.iter().map(String::as_str).collect();
@@ -954,7 +961,11 @@ async fn handle_reorder_windows<T: TmuxApi>(
     }
 
     if final_order.len() != current_ids.len() || desired_iter.next().is_some() {
-        warn!(current = current_ids.len(), desired = desired_order.len(), "reorder: inconsistent window set");
+        warn!(
+            current = current_ids.len(),
+            desired = desired_order.len(),
+            "reorder: inconsistent window set"
+        );
         model.reorder.pending_selection = None;
         model.error_message = Some("reorder: window set changed".to_string());
         queue.push_front(Cmd::Render);
@@ -1222,17 +1233,7 @@ fn is_shell_command(current_command: &str) -> bool {
 
     matches!(
         command,
-        "sh"
-            | "bash"
-            | "zsh"
-            | "fish"
-            | "dash"
-            | "ash"
-            | "ksh"
-            | "csh"
-            | "tcsh"
-            | "nu"
-            | "pwsh"
+        "sh" | "bash" | "zsh" | "fish" | "dash" | "ash" | "ksh" | "csh" | "tcsh" | "nu" | "pwsh"
     )
 }
 
@@ -1379,8 +1380,7 @@ async fn reapply_helper_layout_if_needed<T: TmuxApi>(
 
 fn suppress_sidebar_layout_validation(model: &mut Model) {
     model.sidebar.ignore_layout_change_until = Some(
-        std::time::Instant::now()
-            + std::time::Duration::from_millis(LAYOUT_CHANGE_SUPPRESSION_MS),
+        std::time::Instant::now() + std::time::Duration::from_millis(LAYOUT_CHANGE_SUPPRESSION_MS),
     );
 }
 
@@ -2282,7 +2282,10 @@ mod tests {
             build_split_window_cmd("%2", Some("/tmp/my dir")),
             "split-window -d -t %2 -h -c \"/tmp/my dir\""
         );
-        assert_eq!(build_split_window_cmd("%2", None), "split-window -d -t %2 -h");
+        assert_eq!(
+            build_split_window_cmd("%2", None),
+            "split-window -d -t %2 -h"
+        );
     }
 
     #[test]
@@ -2845,10 +2848,7 @@ mod tests {
 
         assert_eq!(
             tmux.commands,
-            vec![
-                "swap-window -s @3 -t @1",
-                "swap-window -s @1 -t @2",
-            ]
+            vec!["swap-window -s @3 -t @1", "swap-window -s @1 -t @2",]
         );
         assert!(matches!(queue.front(), Some(Cmd::ListWindows)));
     }
@@ -2888,7 +2888,10 @@ mod tests {
             .expect("layout should build");
 
         let mut tmux = FakeTmux::new(vec![
-            Ok("%9\t0\t0\n%2\t31\t0\n%3\t50\t0\n%4\t69\t0\n%5\t31\t20\n%6\t50\t20\n%7\t69\t20\n".to_string()),
+            Ok(
+                "%9\t0\t0\n%2\t31\t0\n%3\t50\t0\n%4\t69\t0\n%5\t31\t20\n%6\t50\t20\n%7\t69\t20\n"
+                    .to_string(),
+            ),
             Ok("/work\n".to_string()),
             Ok(format!("1234,{}", layout.split_once(',').unwrap().1)),
             Ok(String::new()),
@@ -2916,8 +2919,14 @@ mod tests {
             .commands
             .iter()
             .any(|cmd| cmd == "send-keys -t %7 yazi C-m"));
-        assert!(tmux.commands.iter().any(|cmd| cmd.starts_with("select-layout -t @old ")));
-        assert!(model.sidebar.helper_managed_windows.contains(&model.sidebar.window_id));
+        assert!(tmux
+            .commands
+            .iter()
+            .any(|cmd| cmd.starts_with("select-layout -t @old ")));
+        assert!(model
+            .sidebar
+            .helper_managed_windows
+            .contains(&model.sidebar.window_id));
         assert_eq!(model.info_message.as_deref(), Some("layout helper applied"));
     }
 
@@ -2925,13 +2934,19 @@ mod tests {
     async fn apply_layout_helper_reapply_skips_launch_on_helper_managed_window() {
         let mut model = test_model();
         model.sidebar.pane_id = "%9".to_string();
-        model.sidebar.helper_managed_windows.insert("@old".to_string());
+        model
+            .sidebar
+            .helper_managed_windows
+            .insert("@old".to_string());
 
         let layout = build_sidebar_main_3x2_layout(120, 40, 9, &[2, 3, 4, 5, 6, 7])
             .expect("layout should build");
 
         let mut tmux = FakeTmux::new(vec![
-            Ok("%9\t0\t0\n%2\t31\t0\n%3\t50\t0\n%4\t69\t0\n%5\t31\t20\n%6\t50\t20\n%7\t69\t20\n".to_string()),
+            Ok(
+                "%9\t0\t0\n%2\t31\t0\n%3\t50\t0\n%4\t69\t0\n%5\t31\t20\n%6\t50\t20\n%7\t69\t20\n"
+                    .to_string(),
+            ),
             Ok("/work\n".to_string()),
             Ok(format!("1234,{}", layout.split_once(',').unwrap().1)),
             Ok(String::new()),
@@ -2942,12 +2957,21 @@ mod tests {
         let mut queue = VecDeque::new();
         apply_layout_helper(&mut model, &mut tmux, &mut queue).await;
 
-        assert!(!tmux.commands.iter().any(|cmd| cmd.contains("pane_current_command")));
-        assert!(tmux.commands.iter().any(|cmd| cmd.starts_with("select-layout -t @old ")));
+        assert!(!tmux
+            .commands
+            .iter()
+            .any(|cmd| cmd.contains("pane_current_command")));
+        assert!(tmux
+            .commands
+            .iter()
+            .any(|cmd| cmd.starts_with("select-layout -t @old ")));
         assert!(!tmux.commands.iter().any(|cmd| cmd.contains(" lazygit C-m")));
         assert!(!tmux.commands.iter().any(|cmd| cmd.contains(" yazi C-m")));
         assert!(!tmux.commands.iter().any(|cmd| cmd.contains("cd -- ")));
-        assert_eq!(model.info_message.as_deref(), Some("layout helper refreshed"));
+        assert_eq!(
+            model.info_message.as_deref(),
+            Some("layout helper refreshed")
+        );
     }
 
     #[tokio::test]
@@ -3000,7 +3024,10 @@ mod tests {
     async fn follow_to_window_reapplies_helper_layout_for_helper_managed_windows() {
         let mut model = test_model();
         model.sidebar.pane_id = "%9".to_string();
-        model.sidebar.helper_managed_windows.insert("@new".to_string());
+        model
+            .sidebar
+            .helper_managed_windows
+            .insert("@new".to_string());
 
         let mut queue = VecDeque::new();
         let explicit_layout = build_sidebar_main_3x2_layout(120, 40, 9, &[2, 3, 4, 5, 6, 7])

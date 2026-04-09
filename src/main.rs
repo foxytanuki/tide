@@ -671,7 +671,8 @@ mod tests {
     #[test]
     fn layout_change_is_suppressed_while_helper_is_running() {
         let mut model = test_model();
-        model.sidebar.ignore_layout_change_until = Some(Instant::now() + Duration::from_millis(500));
+        model.sidebar.ignore_layout_change_until =
+            Some(Instant::now() + Duration::from_millis(500));
 
         let cmds = process_tmux_event(&mut model, TmuxEvent::LayoutChange("@home".to_string()));
 
