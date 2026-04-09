@@ -185,6 +185,32 @@ mod tests {
         assert_follow_window(&cmds, "@user");
     }
 
+    #[test]
+    fn window_change_requests_single_resync_each_time() {
+        let mut model = test_model();
+
+        let first = update(&mut model, Msg::WindowChanged);
+        let second = update(&mut model, Msg::WindowChanged);
+
+        assert_eq!(first.len(), 1);
+        assert!(matches!(first[0], Cmd::ListWindows));
+        assert_eq!(second.len(), 1);
+        assert!(matches!(second[0], Cmd::ListWindows));
+    }
+
+    #[test]
+    fn burst_of_non_plain_keys_is_dropped_without_rendering() {
+        let mut model = test_model();
+
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+        );
+
+        assert!(cmds.is_empty());
+        assert_eq!(model.mode, Mode::Normal);
+    }
+
     fn wi(id: &str, index: usize, name: &str) -> WindowInfo {
         WindowInfo {
             id: id.to_string(),

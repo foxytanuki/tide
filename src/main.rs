@@ -1,13 +1,3 @@
-mod cmd;
-mod execute;
-mod launcher;
-mod model;
-mod msg;
-mod tmux;
-mod tree;
-mod update;
-mod view;
-
 use std::env;
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -24,17 +14,21 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use tide::cmd::Cmd;
+use tide::execute::{execute_commands, AppTerminal};
+use tide::launcher;
+use tide::metrics::snapshot_tmux_metrics;
+use tide::model::Model;
+use tide::msg::Msg;
+use tide::tmux::commands;
+use tide::tmux::{TmuxControl, TmuxEvent};
+use tide::update::update;
+use tide::view::render;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::cmd::Cmd;
-use crate::execute::{execute_commands, AppTerminal};
-use crate::model::Model;
-use crate::msg::Msg;
-use crate::tmux::commands;
-use crate::tmux::{TmuxControl, TmuxEvent};
-use crate::update::update;
-use crate::view::render;
+#[cfg(test)]
+use tide::tmux::WindowInfo;
 
 const AI_POLL_INTERVAL_MS: u64 = 500;
 const PREVIEW_DEBOUNCE_MS: u64 = 50;
@@ -242,6 +236,15 @@ impl App {
         .await;
         restore_prefix_f_binding(&mut self.tmux, prev_f_binding).await;
         self.tmux.shutdown().await;
+        let metrics = snapshot_tmux_metrics();
+        info!(
+            pane_output_dropped = metrics.pane_output_dropped,
+            coalesced_resync_deferred = metrics.coalesced_resync_deferred,
+            coalesced_resync_flushed = metrics.coalesced_resync_flushed,
+            command_failures = metrics.command_failures,
+            batch_reconciles = metrics.batch_reconciles,
+            "tmux metrics"
+        );
     }
 }
 
@@ -657,6 +660,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     fn test_model() -> Model {
         Model::new(
@@ -666,6 +670,15 @@ mod tests {
             "%home".to_string(),
             "@home".to_string(),
         )
+    }
+
+    fn window(id: &str, index: usize, name: &str) -> WindowInfo {
+        WindowInfo {
+            id: id.to_string(),
+            index,
+            name: name.to_string(),
+            active: false,
+        }
     }
 
     #[test]
@@ -692,5 +705,53 @@ mod tests {
         assert!(matches!(cmds[0], Cmd::EnsureSidebarWidth));
         assert!(matches!(cmds[1], Cmd::ValidateSidebarPanes));
         assert!(model.sidebar.ignore_layout_change_until.is_none());
+    }
+
+    #[test]
+    fn process_ui_batch_keeps_last_preview_and_single_render() {
+        let mut model = test_model();
+        let _ = update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                window("@1", 1, "one"),
+                window("@2", 2, "two"),
+                window("@3", 3, "three"),
+            ]),
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+            .unwrap();
+        tx.send(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+            .unwrap();
+
+        let cmds = process_ui_batch(
+            &mut model,
+            &mut rx,
+            Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        );
+
+        assert_eq!(cmds.len(), 2);
+        assert!(matches!(cmds[0], Cmd::PreviewWindow { ref id } if id == "@3"));
+        assert!(matches!(cmds[1], Cmd::Render));
+        assert_eq!(model.cursor(), 2);
+    }
+
+    #[test]
+    fn apply_preview_debounce_cancels_pending_preview_on_non_cursor_action() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let mut pending_preview = Some("@2".to_string());
+            let sleep = tokio::time::sleep(Duration::from_secs(86400));
+            tokio::pin!(sleep);
+            let mut cmds = vec![Cmd::ListWindows, Cmd::Render];
+
+            apply_preview_debounce(&mut cmds, &mut pending_preview, sleep.as_mut());
+
+            assert_eq!(pending_preview, None);
+            assert_eq!(cmds.len(), 2);
+            assert!(matches!(cmds[0], Cmd::ListWindows));
+            assert!(matches!(cmds[1], Cmd::Render));
+        });
     }
 }

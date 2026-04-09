@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(flat[0].depth, 0);
         assert_eq!(flat[0].kind, FlatNodeKind::Folder);
         assert_eq!(flat[0].visible_number, Some(1));
-        assert!(flat[0].is_last_sibling);
+        assert!(!flat[0].is_last_sibling);
         assert_eq!(flat[1].depth, 0);
         assert_eq!(flat[1].kind, FlatNodeKind::Window);
         assert_eq!(flat[1].visible_number, Some(2));

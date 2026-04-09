@@ -8,6 +8,7 @@ use ratatui::Terminal;
 use tracing::{debug, info, warn};
 
 use crate::cmd::Cmd;
+use crate::metrics;
 use crate::model::{Model, PendingRename, PreviewState, SelectionTarget};
 use crate::msg::Msg;
 use crate::tmux::commands;
@@ -1674,10 +1675,16 @@ async fn poll_ai_processes<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue: &
     match tmux.send_command(&list_cmd).await {
         Ok(output) => {
             let candidates = find_ai_pane_candidates(&output, &model.sidebar.pane_id);
+            let classify_started_at = std::time::Instant::now();
             let (panes, windows) = classify_active_panes(
                 &candidates,
                 &mut model.ai.cpu_tracker,
                 &mut model.ai.output_counts,
+            );
+            tracing::trace!(
+                candidates = candidates.len(),
+                elapsed_us = classify_started_at.elapsed().as_micros() as u64,
+                "ai classification completed"
             );
             enqueue_follow_up(
                 queue,
@@ -1737,9 +1744,15 @@ async fn reset_all_borders<T: TmuxApi>(model: &mut Model, tmux: &mut T) {
 }
 
 fn render_model(model: &mut Model, terminal: &mut AppTerminal) {
+    let started_at = std::time::Instant::now();
     if let Err(err) = terminal.draw(|f| render(model, f)) {
         model.error_message = Some(format!("render: {err}"));
     }
+    tracing::trace!(
+        flat_items = model.flat_items().len(),
+        elapsed_us = started_at.elapsed().as_micros() as u64,
+        "render completed"
+    );
 }
 
 fn clear_internal_window_change_suppression(model: &mut Model) {
@@ -1753,10 +1766,12 @@ async fn send_batch_with_reconcile<T: TmuxApi>(
     batch: &str,
 ) -> Result<(), String> {
     if let Err(err) = tmux.send_command(batch).await {
+        let reconciles = metrics::record_batch_reconcile();
         let old_window = model.sidebar.window_id.clone();
         let old_home = model.sidebar.home_pane_id.clone();
         warn!(
             %err,
+            reconciles,
             old_window = %old_window,
             old_home = %old_home,
             batch = %batch,

@@ -235,3 +235,20 @@ fn tmux_status_with_tmux_removed(args: &[&str]) -> Result<std::process::ExitStat
         .env_remove("TMUX")
         .status()?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_target_helpers_format_exact_targets() {
+        assert_eq!(exact_session_target("work"), "=work");
+        assert_eq!(exact_session_window_target("work"), "=work:");
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("it's here"), "'it'\\''s here'");
+    }
+}

@@ -25,12 +25,7 @@ pub fn render(model: &Model, frame: &mut Frame) {
         Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).split(inner);
 
     // Tree area
-    let tree_items: Vec<ListItem> = model
-        .flat_items()
-        .iter()
-        .enumerate()
-        .map(|(idx, item)| render_tree_item(model, idx, item, chunks[0].width as usize))
-        .collect();
+    let tree_items = build_tree_items(model, chunks[0].width as usize);
 
     frame.render_widget(List::new(tree_items), chunks[0]);
 
@@ -58,6 +53,15 @@ pub fn render(model: &Model, frame: &mut Frame) {
         let cursor_y = chunks[1].y;
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+pub fn build_tree_items(model: &Model, width: usize) -> Vec<ListItem<'static>> {
+    model
+        .flat_items()
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| render_tree_item(model, idx, item, width))
+        .collect()
 }
 
 /// Badge state for a tree item's AI activity indicator.

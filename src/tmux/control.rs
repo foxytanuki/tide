@@ -9,6 +9,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, Duration};
 
+use crate::metrics;
+
 use super::parser::{parse_control_marker, parse_line, ControlMarker};
 use super::WindowInfo;
 
@@ -111,7 +113,8 @@ impl TmuxControl {
         let result = self.send_and_wait_for_response(cmd, response_rx).await;
 
         if let Err(ref err) = result {
-            tracing::warn!(cmd, %err, "tmux command failed");
+            let failures = metrics::record_tmux_command_failure();
+            tracing::warn!(cmd, %err, failures, "tmux command failed");
         }
 
         result
@@ -544,6 +547,8 @@ fn flush_pending_resync_event(
         String::new(),
     )) {
         Ok(()) => {
+            let flushed = metrics::record_coalesced_resync_flushed();
+            tracing::debug!(flushed, "delivered deferred coalesced resync event");
             *pending_resync_event = false;
             true
         }
@@ -570,7 +575,11 @@ fn send_event(
         // Closed channel → return false to break the reader loop.
         match tx.try_send(event) {
             Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => true, // drop, keep going
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let dropped = metrics::record_pane_output_dropped();
+                tracing::debug!(dropped, "dropping pane output event on backpressure");
+                true
+            }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     } else {
@@ -579,7 +588,9 @@ fn send_event(
             Err(mpsc::error::TrySendError::Full(_)) => {
                 if !*pending_resync_event {
                     *pending_resync_event = true;
+                    let deferred = metrics::record_coalesced_resync_deferred();
                     tracing::warn!(
+                        deferred,
                         "tmux event channel full; deferring coalesced session resync event"
                     );
                 }
@@ -630,6 +641,7 @@ fn parse_window_line(line: &str) -> Result<WindowInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::snapshot_tmux_metrics;
     use tokio::sync::mpsc;
 
     #[test]
@@ -646,6 +658,7 @@ mod tests {
 
     #[test]
     fn pane_output_is_dropped_when_channel_full() {
+        let before = snapshot_tmux_metrics();
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(super::super::TmuxEvent::WindowAdd("@1".to_string()))
             .expect("prefill channel");
@@ -658,6 +671,8 @@ mod tests {
         );
         assert!(ok);
         assert!(!pending_resync);
+        let after = snapshot_tmux_metrics();
+        assert!(after.pane_output_dropped >= before.pane_output_dropped + 1);
 
         let evt = rx.try_recv().expect("expected prefilled event");
         assert_eq!(evt, super::super::TmuxEvent::WindowAdd("@1".to_string()));
@@ -665,6 +680,7 @@ mod tests {
 
     #[test]
     fn non_output_full_channel_defers_coalesced_resync() {
+        let before = snapshot_tmux_metrics();
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(super::super::TmuxEvent::WindowAdd("@1".to_string()))
             .expect("prefill channel");
@@ -677,10 +693,14 @@ mod tests {
         );
         assert!(ok);
         assert!(pending_resync);
+        let deferred = snapshot_tmux_metrics();
+        assert!(deferred.coalesced_resync_deferred >= before.coalesced_resync_deferred + 1);
 
         let _ = rx.try_recv().expect("expected prefilled event");
         assert!(flush_pending_resync_event(&tx, &mut pending_resync));
         assert!(!pending_resync);
+        let flushed = snapshot_tmux_metrics();
+        assert!(flushed.coalesced_resync_flushed >= before.coalesced_resync_flushed + 1);
 
         let evt = rx.try_recv().expect("expected deferred resync event");
         assert_eq!(
