@@ -19,7 +19,7 @@ cargo test <test_name>   # single test
 cargo install --path .   # install binary as `tide`
 ```
 
-Task runner (`mise.toml`): `mise run build`, `mise run check`, `mise run install`
+Task runner (`justfile`): `just build`, `just check`, `just install`, `just test`
 
 ### Logging
 
