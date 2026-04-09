@@ -881,9 +881,7 @@ async fn handle_new_window<T: TmuxApi>(
             }
         }
         Err(err) => {
-            warn!(%err, "new-window failed");
-            model.error_message = Some(format!("new-window: {err}"));
-            queue.push_front(Cmd::Render);
+            reconcile_after_command_failure(model, tmux, queue, "new-window", &err, true).await;
         }
     }
 }
@@ -904,9 +902,7 @@ async fn handle_rename_window<T: TmuxApi>(
     }
     let cmd_str = commands::rename_window(&id, &name);
     if let Err(err) = tmux.send_command(&cmd_str).await {
-        warn!(%err, "rename-window failed");
-        model.error_message = Some(format!("rename-window: {err}"));
-        queue.push_front(Cmd::Render);
+        reconcile_after_command_failure(model, tmux, queue, "rename-window", &err, true).await;
     } else {
         if let Err(err) = tmux.send_command(&disable_rename).await {
             warn!(
@@ -989,10 +985,8 @@ async fn handle_reorder_windows<T: TmuxApi>(
 
         let cmd_str = commands::swap_window(&working[found_idx], &working[idx]);
         if let Err(err) = tmux.send_command(&cmd_str).await {
-            warn!(%err, source = %working[found_idx], target = %working[idx], "swap-window failed");
             model.reorder.pending_selection = None;
-            model.error_message = Some(format!("swap-window: {err}"));
-            queue.push_front(Cmd::Render);
+            reconcile_after_command_failure(model, tmux, queue, "swap-window", &err, true).await;
             return;
         }
         working.swap(idx, found_idx);
@@ -1062,9 +1056,7 @@ async fn handle_close_window<T: TmuxApi>(
     debug!(id, "closing window");
     let cmd_str = commands::kill_window(&id);
     if let Err(err) = tmux.send_command(&cmd_str).await {
-        warn!(%err, "kill-window failed");
-        model.error_message = Some(format!("kill-window: {err}"));
-        queue.push_front(Cmd::Render);
+        reconcile_after_command_failure(model, tmux, queue, "kill-window", &err, true).await;
     } else {
         model.sidebar.pane_layouts.remove(&id);
         model.sidebar.helper_managed_windows.remove(&id);
@@ -1758,6 +1750,25 @@ fn render_model(model: &mut Model, terminal: &mut AppTerminal) {
 fn clear_internal_window_change_suppression(model: &mut Model) {
     model.sidebar.ignore_window_changes = 0;
     model.sidebar.pending_internal_focus_window = None;
+}
+
+async fn reconcile_after_command_failure<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    queue: &mut VecDeque<Cmd>,
+    command_name: &str,
+    err: &str,
+    refresh_windows: bool,
+) {
+    warn!(%err, command = command_name, "tmux command failed; reconciling state");
+    model.error_message = Some(format!("{command_name}: {err}"));
+    reconcile_sidebar_state(model, tmux).await;
+
+    if refresh_windows {
+        handle_list_windows(model, tmux, queue).await;
+    } else {
+        queue.push_front(Cmd::Render);
+    }
 }
 
 async fn send_batch_with_reconcile<T: TmuxApi>(
@@ -2786,6 +2797,127 @@ mod tests {
         assert_eq!(tmux.commands.len(), 3);
         assert!(tmux.commands[1].contains("display-message -t %sidebar -p '#{window_id}'"));
         assert!(tmux.commands[2].contains("list-panes -t @new"));
+    }
+
+    #[tokio::test]
+    async fn new_window_failure_reconciles_sidebar_and_refreshes_windows() {
+        let mut model = test_model();
+        let mut tmux = FakeTmux::with_window_lists(
+            vec![
+                Ok("/work/project\n".to_string()),
+                Err("boom".to_string()),
+                Ok("@new\n".to_string()),
+                Ok("%home_new\t1\n".to_string()),
+            ],
+            vec![Ok(vec![wi("@new", 1, "scratch")])],
+        );
+        let mut queue = VecDeque::new();
+
+        handle_new_window(&mut model, &mut tmux, &mut queue, "proj:tab3".to_string()).await;
+
+        assert_eq!(model.error_message.as_deref(), Some("new-window: boom"));
+        assert_eq!(model.sidebar.window_id, "@new");
+        assert_eq!(model.sidebar.home_pane_id, "%home_new");
+        assert_eq!(tmux.commands.len(), 4);
+        assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rename_window_failure_reconciles_sidebar_and_refreshes_windows() {
+        let mut model = test_model();
+        let mut tmux = FakeTmux::with_window_lists(
+            vec![
+                Ok(String::new()),
+                Err("rename failed".to_string()),
+                Ok("@renamed\n".to_string()),
+                Ok("%home_new\t1\n".to_string()),
+            ],
+            vec![Ok(vec![wi("@renamed", 1, "proj:tab3")])],
+        );
+        let mut queue = VecDeque::new();
+
+        handle_rename_window(
+            &mut model,
+            &mut tmux,
+            &mut queue,
+            "@1".to_string(),
+            "proj:tab3".to_string(),
+        )
+        .await;
+
+        assert_eq!(
+            model.error_message.as_deref(),
+            Some("rename-window: rename failed")
+        );
+        assert_eq!(model.sidebar.window_id, "@renamed");
+        assert_eq!(model.sidebar.home_pane_id, "%home_new");
+        assert_eq!(tmux.commands.len(), 4);
+        assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reorder_failure_reconciles_sidebar_and_refreshes_windows() {
+        let mut model = test_model();
+        let mut tmux = FakeTmux::with_window_lists(
+            vec![
+                Err("swap failed".to_string()),
+                Ok("@new\n".to_string()),
+                Ok("%home_new\t1\n".to_string()),
+            ],
+            vec![
+                Ok(vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "proj:term")]),
+                Ok(vec![wi("@new", 1, "scratch")]),
+            ],
+        );
+        let mut queue = VecDeque::new();
+
+        handle_reorder_windows(
+            &mut model,
+            &mut tmux,
+            &mut queue,
+            vec!["@2".to_string(), "@1".to_string()],
+            SelectionTarget::Window("@1".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            model.error_message.as_deref(),
+            Some("swap-window: swap failed")
+        );
+        assert_eq!(model.sidebar.window_id, "@new");
+        assert_eq!(model.sidebar.home_pane_id, "%home_new");
+        assert_eq!(model.reorder.pending_selection, None);
+        assert_eq!(tmux.commands.len(), 3);
+        assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_window_failure_reconciles_sidebar_and_refreshes_windows() {
+        let mut model = test_model();
+        let mut tmux = FakeTmux::with_window_lists(
+            vec![
+                Err("kill failed".to_string()),
+                Ok("@new\n".to_string()),
+                Ok("%home_new\t1\n".to_string()),
+            ],
+            vec![Ok(vec![wi("@new", 1, "scratch")])],
+        );
+        let mut queue = VecDeque::new();
+
+        handle_close_window(&mut model, &mut tmux, &mut queue, "@1".to_string()).await;
+
+        assert_eq!(
+            model.error_message.as_deref(),
+            Some("kill-window: kill failed")
+        );
+        assert_eq!(model.sidebar.window_id, "@new");
+        assert_eq!(model.sidebar.home_pane_id, "%home_new");
+        assert_eq!(tmux.commands.len(), 3);
+        assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
+        assert!(queue.is_empty());
     }
 
     #[tokio::test]
