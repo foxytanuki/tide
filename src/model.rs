@@ -9,6 +9,7 @@ use crate::tree::{
 pub struct Model {
     tree: Vec<TreeNode>,
     flat_items: Vec<FlatItem>,
+    pub window_list_snapshot: Option<Vec<WindowInfo>>,
     window_flat_indices: HashMap<String, usize>,
     folder_flat_indices: HashMap<String, usize>,
     selection_targets: Vec<Option<SelectionTarget>>,
@@ -140,6 +141,7 @@ impl Model {
         Self {
             tree: Vec::new(),
             flat_items: Vec::new(),
+            window_list_snapshot: None,
             window_flat_indices: HashMap::new(),
             folder_flat_indices: HashMap::new(),
             selection_targets: Vec::new(),
@@ -218,6 +220,10 @@ impl Model {
                 self.cursor = index;
             }
         }
+    }
+
+    pub fn set_window_list_snapshot(&mut self, windows: Vec<WindowInfo>) {
+        self.window_list_snapshot = Some(windows);
     }
 
     /// Mutate the tree in-place, then rebuild the flat list + clamp cursor.

@@ -537,6 +537,64 @@ mod tests {
     }
 
     #[test]
+    fn window_list_loaded_skips_rebuild_for_same_list() {
+        let mut model = test_model();
+        let windows = vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "scratch")];
+        update(&mut model, Msg::WindowListLoaded(windows.clone()));
+
+        model.mutate_tree(|tree| {
+            if let TreeNode::Folder { expanded, .. } = &mut tree[0] {
+                *expanded = false;
+            }
+        });
+        model.set_cursor(0);
+
+        let cmds = update(&mut model, Msg::WindowListLoaded(windows));
+
+        assert_eq!(model.cursor(), 0);
+        assert!(matches!(
+            model.tree()[0],
+            TreeNode::Folder {
+                expanded: false,
+                ..
+            }
+        ));
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::Render));
+    }
+
+    #[test]
+    fn window_list_loaded_rebuilds_same_list_while_moving() {
+        let mut model = test_model();
+        let windows = vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "scratch")];
+        update(&mut model, Msg::WindowListLoaded(windows.clone()));
+
+        model.mutate_tree(|tree| {
+            tree.push(TreeNode::Window {
+                info: wi("@extra", 99, "extra"),
+            });
+        });
+        model.set_cursor(0);
+        model.mode = Mode::Moving {
+            subject: crate::model::MoveSubject::Item(crate::model::SelectionTarget::Window(
+                "@1".to_string(),
+            )),
+        };
+
+        let cmds = update(&mut model, Msg::WindowListLoaded(windows));
+
+        assert!(matches!(model.mode, Mode::Normal));
+        assert_eq!(model.cursor(), 0);
+        assert_eq!(model.tree().len(), 2);
+        assert!(model.tree().iter().all(|node| match node {
+            TreeNode::Window { info } => info.id != "@extra",
+            TreeNode::Folder { .. } => true,
+        }));
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::Render));
+    }
+
+    #[test]
     fn window_renamed_pending_mismatch_triggers_immediate_rename() {
         let mut model = test_model();
         model.renames.pending.insert(

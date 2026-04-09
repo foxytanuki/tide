@@ -72,7 +72,8 @@ pub(super) fn handle_window_list_loaded(
     model: &mut Model,
     mut windows: Vec<WindowInfo>,
 ) -> Vec<Cmd> {
-    if matches!(model.mode, Mode::Moving { .. }) {
+    let was_moving = matches!(model.mode, Mode::Moving { .. });
+    if was_moving {
         model.mode = Mode::Normal;
         model.clear_reorder_preview();
     }
@@ -101,11 +102,28 @@ pub(super) fn handle_window_list_loaded(
     bump_last_pending_if_missing(model, &windows, &mut selected_target);
     windows.sort_by_key(|window| window.index);
 
+    let should_skip_rebuild = !was_moving
+        && model
+            .window_list_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot == &windows);
+
+    if should_skip_rebuild {
+        model.set_window_list_snapshot(windows.clone());
+        let (mut followup_cmds, stale_pending_ids) = reconcile_pending_renames(model, &windows);
+        clear_stale_pending_renames(model, stale_pending_ids);
+        clear_orphaned_last_pending_rename(model);
+        clear_mode_if_missing_target(model, &windows);
+        followup_cmds.push(Cmd::Render);
+        return followup_cmds;
+    }
+
     let mut new_tree = build_tree(&windows);
     restore_folder_expanded(&mut new_tree, &expanded_state);
     let selected_ref = selected_target.as_ref();
     model.replace_tree_preserve_selection(new_tree, selected_ref);
     model.reorder.pending_selection = None;
+    model.set_window_list_snapshot(windows.clone());
 
     let (mut followup_cmds, stale_pending_ids) = reconcile_pending_renames(model, &windows);
     clear_stale_pending_renames(model, stale_pending_ids);

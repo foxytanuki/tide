@@ -119,6 +119,69 @@ async fn resolve_new_window_cwd<T: TmuxApi>(model: &Model, tmux: &mut T) -> Opti
     query_pane_current_path(tmux, &fallback_pane_id).await
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct WindowPaneTargets {
+    leftmost: String,
+    home: String,
+}
+
+async fn query_window_pane_targets<T: TmuxApi>(
+    tmux: &mut T,
+    window_id: &str,
+    sidebar_pane_id: &str,
+) -> WindowPaneTargets {
+    let pane_list = tmux
+        .send_command(&format!(
+            "list-panes -t {} -F '#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}\t#{{pane_active}}'",
+            window_id
+        ))
+        .await
+        .unwrap_or_default();
+
+    let mut first_non_sidebar = String::new();
+    let mut leftmost: Option<(u16, u16, String)> = None;
+    let mut active = String::new();
+
+    for line in pane_list.lines() {
+        let mut parts = line.split('\t');
+        let pane_id = parts.next().unwrap_or("").trim();
+        let pane_left: u16 = match parts.next().unwrap_or("").trim().parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let pane_top: u16 = match parts.next().unwrap_or("").trim().parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let is_active = parts.next().unwrap_or("").trim() == "1";
+        if pane_id.is_empty() || pane_id == sidebar_pane_id {
+            continue;
+        }
+        if first_non_sidebar.is_empty() {
+            first_non_sidebar = pane_id.to_string();
+        }
+        if is_active {
+            active = pane_id.to_string();
+        }
+
+        match &leftmost {
+            Some((best_left, best_top, _))
+                if pane_left > *best_left || (pane_left == *best_left && pane_top >= *best_top) => {
+            }
+            _ => leftmost = Some((pane_left, pane_top, pane_id.to_string())),
+        }
+    }
+
+    WindowPaneTargets {
+        leftmost: leftmost.map(|(_, _, pane_id)| pane_id).unwrap_or_default(),
+        home: if active.is_empty() {
+            first_non_sidebar
+        } else {
+            active
+        },
+    }
+}
+
 /// Save a window's current layout paired with terminal width.
 async fn save_window_layout<T: TmuxApi>(model: &mut Model, tmux: &mut T, window_id: &str) {
     if let Some(layout) = query_window_layout(tmux, window_id).await {
@@ -661,16 +724,14 @@ async fn handle_preview_window<T: TmuxApi>(
 
     // Query phase: find join target.
     // Always target the leftmost pane so sidebar stays at far left.
-    let target_leftmost =
-        choose_leftmost_pane_in_window(tmux, &target_window_id, &model.sidebar.pane_id).await;
-    let target_home =
-        choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar.pane_id).await;
-    let join_target = if target_leftmost.is_empty() {
+    let target_panes =
+        query_window_pane_targets(tmux, &target_window_id, &model.sidebar.pane_id).await;
+    let join_target = if target_panes.leftmost.is_empty() {
         model.error_message = Some("preview: could not resolve leftmost pane".to_string());
         queue.push_front(Cmd::Render);
         return;
     } else {
-        target_leftmost
+        target_panes.leftmost
     };
 
     // Save target window's layout before sidebar joins (for future restoration).
@@ -697,8 +758,8 @@ async fn handle_preview_window<T: TmuxApi>(
     reapply_helper_layout_if_needed(model, tmux, &target_window_id).await;
 
     // Resolve home pane if needed (query after move).
-    let new_home = if !target_home.is_empty() {
-        target_home
+    let new_home = if !target_panes.home.is_empty() {
+        target_panes.home
     } else {
         choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar.pane_id).await
     };
@@ -1083,16 +1144,14 @@ async fn handle_follow_to_window<T: TmuxApi>(
 
     // Query phase.
     // Always target the leftmost pane so sidebar stays at far left.
-    let target_leftmost =
-        choose_leftmost_pane_in_window(tmux, &target_window_id, &model.sidebar.pane_id).await;
-    let target_home =
-        choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar.pane_id).await;
-    let join_target = if target_leftmost.is_empty() {
+    let target_panes =
+        query_window_pane_targets(tmux, &target_window_id, &model.sidebar.pane_id).await;
+    let join_target = if target_panes.leftmost.is_empty() {
         model.error_message = Some("follow: could not resolve leftmost pane".to_string());
         queue.push_front(Cmd::Render);
         return;
     } else {
-        target_leftmost
+        target_panes.leftmost
     };
 
     // Save target window's layout before sidebar joins.
@@ -1115,8 +1174,8 @@ async fn handle_follow_to_window<T: TmuxApi>(
     reapply_helper_layout_if_needed(model, tmux, &target_window_id).await;
 
     // Resolve home pane.
-    let new_home = if !target_home.is_empty() {
-        target_home
+    let new_home = if !target_panes.home.is_empty() {
+        target_panes.home
     } else {
         choose_home_pane_in_window(tmux, &target_window_id, &model.sidebar.pane_id).await
     };
@@ -1667,21 +1726,61 @@ async fn poll_ai_processes<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue: &
     match tmux.send_command(&list_cmd).await {
         Ok(output) => {
             let candidates = find_ai_pane_candidates(&output, &model.sidebar.pane_id);
+            if candidates.is_empty() {
+                model.ai.cpu_tracker.clear();
+                model.ai.output_counts.clear();
+                enqueue_follow_up(
+                    queue,
+                    update(
+                        model,
+                        Msg::AiProcessPollResult {
+                            panes: HashSet::new(),
+                            windows: HashSet::new(),
+                        },
+                    ),
+                );
+                return;
+            }
+
+            let prev_cpu = std::mem::take(&mut model.ai.cpu_tracker);
+            let output_counts = std::mem::take(&mut model.ai.output_counts);
+            let candidate_count = candidates.len();
             let classify_started_at = std::time::Instant::now();
-            let (panes, windows) = classify_active_panes(
-                &candidates,
-                &mut model.ai.cpu_tracker,
-                &mut model.ai.output_counts,
-            );
-            tracing::trace!(
-                candidates = candidates.len(),
-                elapsed_us = classify_started_at.elapsed().as_micros() as u64,
-                "ai classification completed"
-            );
-            enqueue_follow_up(
-                queue,
-                update(model, Msg::AiProcessPollResult { panes, windows }),
-            );
+            match tokio::task::spawn_blocking(move || {
+                let mut prev_cpu = prev_cpu;
+                let mut output_counts = output_counts;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    classify_active_panes(&candidates, &mut prev_cpu, &mut output_counts)
+                }));
+                match result {
+                    Ok((panes, windows)) => Ok((panes, windows, prev_cpu, output_counts)),
+                    Err(_) => Err((prev_cpu, output_counts)),
+                }
+            })
+            .await
+            {
+                Ok(Ok((panes, windows, prev_cpu, output_counts))) => {
+                    model.ai.cpu_tracker = prev_cpu;
+                    model.ai.output_counts = output_counts;
+                    tracing::trace!(
+                        candidates = candidate_count,
+                        elapsed_us = classify_started_at.elapsed().as_micros() as u64,
+                        "ai classification completed"
+                    );
+                    enqueue_follow_up(
+                        queue,
+                        update(model, Msg::AiProcessPollResult { panes, windows }),
+                    );
+                }
+                Ok(Err((prev_cpu, output_counts))) => {
+                    model.ai.cpu_tracker = prev_cpu;
+                    model.ai.output_counts = output_counts;
+                    warn!("ai classification panicked; restored tracking state");
+                }
+                Err(err) => {
+                    warn!(%err, "ai classification task failed");
+                }
+            }
         }
         Err(err) => {
             debug!(%err, "ai process poll failed");
@@ -1886,6 +1985,7 @@ fn is_ai_process_name(name: &str) -> bool {
         .any(|ai_name| lower.contains(ai_name))
 }
 
+#[derive(Clone)]
 struct AiPaneCandidate {
     pane_id: String,
     window_id: String,
@@ -3181,8 +3281,7 @@ mod tests {
             .expect("layout should build");
 
         let mut tmux = FakeTmux::new(vec![
-            Ok("%2\t0\t0\n%3\t39\t0\n%4\t78\t0\n%5\t0\t20\n%6\t39\t20\n%7\t78\t20\n".to_string()),
-            Ok("%2\t1\n%3\t0\n%4\t0\n%5\t0\n%6\t0\n%7\t0\n".to_string()),
+            Ok("%2\t0\t0\t1\n%3\t39\t0\t0\n%4\t78\t0\t0\n%5\t0\t20\t0\n%6\t39\t20\t0\n%7\t78\t20\t0\n".to_string()),
             Ok("aaaa,119x40,0,0{39x40,0,0[39x19,0,0,2,39x20,0,20,5],38x40,40,0[38x19,40,0,3,38x20,40,20,6],39x40,79,0[39x19,79,0,4,39x20,79,20,7]}".to_string()),
             Ok("9999,200x80,0,0{30x80,0,0,9,169x80,31,0[169x39,31,0,11,169x40,31,40,12]}".to_string()),
             Ok(String::new()),
