@@ -181,7 +181,7 @@ fn visible_prefix(model: &Model, index: usize, indent: &str) -> String {
 }
 
 fn window_prefix(model: &Model, index: usize, item: &FlatItem, indent: &str) -> String {
-    let connector = window_connector(is_last_sibling(model.tree(), &item.path));
+    let connector = window_connector(item.is_last_sibling);
 
     match visible_item_number(model.flat_items(), index) {
         Some(n) => format!("{indent}{connector} {n}: "),
@@ -195,23 +195,6 @@ fn window_connector(is_last_sibling: bool) -> &'static str {
     } else {
         "├─"
     }
-}
-
-fn is_last_sibling(tree: &[TreeNode], path: &[usize]) -> bool {
-    let Some((&index, parent_path)) = path.split_last() else {
-        return false;
-    };
-
-    let sibling_count = if parent_path.is_empty() {
-        tree.len()
-    } else {
-        match get_node(tree, parent_path) {
-            Ok(TreeNode::Folder { children, .. }) => children.len(),
-            _ => return false,
-        }
-    };
-
-    index + 1 == sibling_count
 }
 
 /// Check if any window inside a folder (recursively) has AI activity.
@@ -385,62 +368,7 @@ fn display_width(input: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_normal_footer_text, fit_footer_actions, is_last_sibling, window_connector};
-    use crate::tree::{TreeNode, WindowInfo};
-
-    #[test]
-    fn last_root_window_uses_last_sibling_connector() {
-        let tree = vec![
-            TreeNode::Window {
-                info: WindowInfo {
-                    id: "1".into(),
-                    index: 1,
-                    name: "one".into(),
-                    active: false,
-                },
-            },
-            TreeNode::Window {
-                info: WindowInfo {
-                    id: "2".into(),
-                    index: 2,
-                    name: "two".into(),
-                    active: false,
-                },
-            },
-        ];
-
-        assert!(is_last_sibling(&tree, &[1]));
-        assert!(!is_last_sibling(&tree, &[0]));
-    }
-
-    #[test]
-    fn last_nested_window_uses_last_sibling_connector() {
-        let tree = vec![TreeNode::Folder {
-            name: "proj".into(),
-            expanded: true,
-            children: vec![
-                TreeNode::Window {
-                    info: WindowInfo {
-                        id: "1".into(),
-                        index: 1,
-                        name: "one".into(),
-                        active: false,
-                    },
-                },
-                TreeNode::Window {
-                    info: WindowInfo {
-                        id: "2".into(),
-                        index: 2,
-                        name: "two".into(),
-                        active: false,
-                    },
-                },
-            ],
-        }];
-
-        assert!(is_last_sibling(&tree, &[0, 1]));
-        assert!(!is_last_sibling(&tree, &[0, 0]));
-    }
+    use super::{build_normal_footer_text, fit_footer_actions, window_connector};
 
     #[test]
     fn window_connector_uses_box_drawing_glyphs() {

@@ -35,6 +35,10 @@ pub struct FlatItem {
     pub kind: FlatNodeKind,
     /// True when this is an expanded folder (used for cursor skip logic).
     pub expanded: bool,
+    /// 1-based visible index for navigable rows, cached for rendering.
+    pub visible_number: Option<usize>,
+    /// Whether this item is the last sibling in its parent list.
+    pub is_last_sibling: bool,
 }
 
 pub fn build_tree(windows: &[WindowInfo]) -> Vec<TreeNode> {
@@ -109,10 +113,18 @@ fn push_window_leaf(nodes: &mut Vec<TreeNode>, window: &WindowInfo, leaf_name: &
 
 pub fn flatten(nodes: &[TreeNode]) -> Vec<FlatItem> {
     let mut out = Vec::new();
+    let mut visible_number = 0;
     for (index, node) in nodes.iter().enumerate() {
         let mut path = Vec::with_capacity(2);
         path.push(index);
-        flatten_node(node, 0, &mut path, &mut out);
+        flatten_node(
+            node,
+            0,
+            &mut path,
+            index + 1 == nodes.len(),
+            &mut visible_number,
+            &mut out,
+        );
     }
     out
 }
@@ -149,17 +161,7 @@ pub fn visible_item_indices(flat: &[FlatItem]) -> Vec<usize> {
 }
 
 pub fn visible_item_number(flat: &[FlatItem], index: usize) -> Option<usize> {
-    let item = flat.get(index)?;
-    if !is_navigable_item(item) {
-        return None;
-    }
-
-    Some(
-        flat.iter()
-            .take(index + 1)
-            .filter(|item| is_navigable_item(item))
-            .count(),
-    )
+    flat.get(index)?.visible_number
 }
 
 pub fn next_visible_item(flat: &[FlatItem], current: usize) -> Option<usize> {
@@ -373,32 +375,57 @@ pub fn find_window_flat_index_by_id(
     None
 }
 
-fn flatten_node(node: &TreeNode, depth: usize, path: &mut Vec<usize>, out: &mut Vec<FlatItem>) {
+fn flatten_node(
+    node: &TreeNode,
+    depth: usize,
+    path: &mut Vec<usize>,
+    is_last_sibling: bool,
+    visible_number: &mut usize,
+    out: &mut Vec<FlatItem>,
+) {
     match node {
         TreeNode::Folder {
             children, expanded, ..
         } => {
+            let item_visible_number = if *expanded {
+                None
+            } else {
+                *visible_number += 1;
+                Some(*visible_number)
+            };
             out.push(FlatItem {
                 depth,
                 path: path.clone(),
                 kind: FlatNodeKind::Folder,
                 expanded: *expanded,
+                visible_number: item_visible_number,
+                is_last_sibling,
             });
 
             if *expanded {
                 for (child_idx, child) in children.iter().enumerate() {
                     path.push(child_idx);
-                    flatten_node(child, depth + 1, path, out);
+                    flatten_node(
+                        child,
+                        depth + 1,
+                        path,
+                        child_idx + 1 == children.len(),
+                        visible_number,
+                        out,
+                    );
                     path.pop();
                 }
             }
         }
         TreeNode::Window { .. } => {
+            *visible_number += 1;
             out.push(FlatItem {
                 depth,
                 path: path.clone(),
                 kind: FlatNodeKind::Window,
                 expanded: false,
+                visible_number: Some(*visible_number),
+                is_last_sibling,
             });
         }
     }
@@ -484,8 +511,35 @@ mod tests {
         assert_eq!(flat.len(), 2);
         assert_eq!(flat[0].depth, 0);
         assert_eq!(flat[0].kind, FlatNodeKind::Folder);
+        assert_eq!(flat[0].visible_number, Some(1));
+        assert!(flat[0].is_last_sibling);
         assert_eq!(flat[1].depth, 0);
         assert_eq!(flat[1].kind, FlatNodeKind::Window);
+        assert_eq!(flat[1].visible_number, Some(2));
+        assert!(flat[1].is_last_sibling);
+    }
+
+    #[test]
+    fn flatten_caches_visible_numbers_and_sibling_positions() {
+        let tree = build_tree(&[
+            w("@1", 1, "proj:edit"),
+            w("@2", 2, "proj:term"),
+            w("@3", 3, "solo"),
+        ]);
+
+        let flat = flatten(&tree);
+
+        assert_eq!(flat[0].visible_number, None); // expanded folder is skipped
+        assert!(!flat[0].is_last_sibling);
+
+        assert_eq!(flat[1].visible_number, Some(1));
+        assert!(!flat[1].is_last_sibling);
+
+        assert_eq!(flat[2].visible_number, Some(2));
+        assert!(flat[2].is_last_sibling);
+
+        assert_eq!(flat[3].visible_number, Some(3));
+        assert!(flat[3].is_last_sibling);
     }
 
     #[test]
@@ -642,6 +696,36 @@ mod tests {
         assert_eq!(flat[4].kind, FlatNodeKind::Window); // main
         assert_eq!(flat[5].depth, 0);
         assert_eq!(flat[5].kind, FlatNodeKind::Window); // solo
+    }
+
+    #[test]
+    fn flatten_two_level_nesting_caches_nested_sibling_positions() {
+        let tree = build_tree(&[
+            w("@1", 1, "proj:sub:edit"),
+            w("@2", 2, "proj:sub:term"),
+            w("@3", 3, "proj:main"),
+            w("@4", 4, "solo"),
+        ]);
+
+        let flat = flatten(&tree);
+
+        assert_eq!(flat[0].visible_number, None); // proj
+        assert!(!flat[0].is_last_sibling);
+
+        assert_eq!(flat[1].visible_number, None); // sub
+        assert!(!flat[1].is_last_sibling);
+
+        assert_eq!(flat[2].visible_number, Some(1)); // edit
+        assert!(!flat[2].is_last_sibling);
+
+        assert_eq!(flat[3].visible_number, Some(2)); // term
+        assert!(flat[3].is_last_sibling);
+
+        assert_eq!(flat[4].visible_number, Some(3)); // main
+        assert!(flat[4].is_last_sibling);
+
+        assert_eq!(flat[5].visible_number, Some(4)); // solo
+        assert!(flat[5].is_last_sibling);
     }
 
     #[test]
