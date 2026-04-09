@@ -170,6 +170,7 @@ impl App {
         let mut ai_poll_interval =
             tokio::time::interval(Duration::from_millis(AI_POLL_INTERVAL_MS));
         ai_poll_interval.reset();
+        ai_poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let preview_sleep = tokio::time::sleep(Duration::from_secs(86400));
         tokio::pin!(preview_sleep);
@@ -181,8 +182,6 @@ impl App {
             }
 
             tokio::select! {
-                biased;
-
                 maybe_ui = self.ui_rx.recv() => {
                     if !handle_ui_tick(
                         &mut self.model,
@@ -209,7 +208,19 @@ impl App {
                 }
 
                 maybe_tmux = self.tmux.event_stream().recv() => {
-                    if !handle_tmux_tick(&mut self.model, &mut self.tmux, &mut self.terminal, maybe_tmux).await {
+                    let Some(tmux_event) = maybe_tmux else {
+                        warn!("tmux event stream closed");
+                        self.model.error_message = Some("tmux event stream closed".to_string());
+                        let _ = self.terminal.draw(|f| render(&self.model, f));
+                        break;
+                    };
+
+                    let cmds = {
+                        let tmux_rx = self.tmux.event_stream();
+                        process_tmux_batch(&mut self.model, tmux_rx, tmux_event)
+                    };
+
+                    if !execute_if_any(&mut self.model, &mut self.tmux, &mut self.terminal, cmds).await {
                         break;
                     }
                 }
@@ -502,23 +513,6 @@ async fn handle_preview_tick(
     true
 }
 
-async fn handle_tmux_tick(
-    model: &mut Model,
-    tmux: &mut TmuxControl,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    maybe_tmux: Option<TmuxEvent>,
-) -> bool {
-    let Some(tmux_event) = maybe_tmux else {
-        warn!("tmux event stream closed");
-        model.error_message = Some("tmux event stream closed".to_string());
-        let _ = terminal.draw(|f| render(model, f));
-        return false;
-    };
-    debug!(?tmux_event, "received tmux event");
-    let cmds = process_tmux_event(model, tmux_event);
-    execute_if_any(model, tmux, terminal, cmds).await
-}
-
 async fn handle_ai_poll_tick(
     model: &mut Model,
     tmux: &mut TmuxControl,
@@ -597,19 +591,35 @@ fn process_tmux_event(model: &mut Model, tmux_event: TmuxEvent) -> Vec<Cmd> {
     }
 }
 
-/// Coalesce commands from batched UI events:
-/// keep only the last PreviewWindow and collapse multiple Renders into one.
-fn coalesce_commands(cmds: Vec<Cmd>) -> Vec<Cmd> {
-    if cmds.len() <= 2 {
-        return cmds;
+fn process_tmux_batch(
+    model: &mut Model,
+    tmux_rx: &mut mpsc::Receiver<TmuxEvent>,
+    first_event: TmuxEvent,
+) -> Vec<Cmd> {
+    debug!(?first_event, "received tmux event");
+    let mut cmds = process_tmux_event(model, first_event);
+
+    while let Ok(event) = tmux_rx.try_recv() {
+        debug!(?event, "draining tmux event");
+        cmds.extend(process_tmux_event(model, event));
     }
 
+    coalesce_commands(cmds)
+}
+
+/// Coalesce commands from batched UI events:
+/// keep only the last PreviewWindow, deduplicate refresh commands,
+/// and collapse multiple Renders into one.
+fn coalesce_commands(cmds: Vec<Cmd>) -> Vec<Cmd> {
     let last_preview_idx = cmds
         .iter()
         .rposition(|c| matches!(c, Cmd::PreviewWindow { .. }));
 
     let mut result = Vec::new();
     let mut has_render = false;
+    let mut has_list_windows = false;
+    let mut has_ensure_sidebar_width = false;
+    let mut has_validate_sidebar_panes = false;
 
     for (i, cmd) in cmds.into_iter().enumerate() {
         match &cmd {
@@ -620,6 +630,24 @@ fn coalesce_commands(cmds: Vec<Cmd>) -> Vec<Cmd> {
             }
             Cmd::Render => {
                 has_render = true;
+            }
+            Cmd::ListWindows => {
+                if !has_list_windows {
+                    has_list_windows = true;
+                    result.push(cmd);
+                }
+            }
+            Cmd::EnsureSidebarWidth => {
+                if !has_ensure_sidebar_width {
+                    has_ensure_sidebar_width = true;
+                    result.push(cmd);
+                }
+            }
+            Cmd::ValidateSidebarPanes => {
+                if !has_validate_sidebar_panes {
+                    has_validate_sidebar_panes = true;
+                    result.push(cmd);
+                }
             }
             _ => {
                 result.push(cmd);
@@ -753,5 +781,38 @@ mod tests {
             assert!(matches!(cmds[0], Cmd::ListWindows));
             assert!(matches!(cmds[1], Cmd::Render));
         });
+    }
+
+    #[test]
+    fn process_tmux_batch_coalesces_redundant_refresh_commands() {
+        let mut model = test_model();
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(TmuxEvent::WindowClose("@2".to_string()))
+            .expect("queue close event");
+        tx.try_send(TmuxEvent::SessionChanged("$1".to_string(), "s".to_string()))
+            .expect("queue session event");
+
+        let cmds = process_tmux_batch(&mut model, &mut rx, TmuxEvent::WindowAdd("@1".to_string()));
+
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::ListWindows));
+    }
+
+    #[test]
+    fn process_tmux_batch_coalesces_sidebar_validation_commands() {
+        let mut model = test_model();
+        let (tx, mut rx) = mpsc::channel(8);
+        tx.try_send(TmuxEvent::LayoutChange("@home".to_string()))
+            .expect("queue layout event");
+
+        let cmds = process_tmux_batch(
+            &mut model,
+            &mut rx,
+            TmuxEvent::LayoutChange("@home".to_string()),
+        );
+
+        assert_eq!(cmds.len(), 2);
+        assert!(matches!(cmds[0], Cmd::EnsureSidebarWidth));
+        assert!(matches!(cmds[1], Cmd::ValidateSidebarPanes));
     }
 }

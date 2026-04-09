@@ -570,6 +570,14 @@ fn send_event(
     event: super::TmuxEvent,
     pending_resync_event: &mut bool,
 ) -> bool {
+    if *pending_resync_event {
+        tracing::trace!(
+            ?event,
+            "dropping tmux event while coalesced resync is pending"
+        );
+        return true;
+    }
+
     if matches!(event, super::TmuxEvent::PaneOutput(_)) {
         // Best-effort: drop if channel is full rather than blocking.
         // Closed channel → return false to break the reader loop.
@@ -705,6 +713,50 @@ mod tests {
         let evt = rx.try_recv().expect("expected deferred resync event");
         assert_eq!(
             evt,
+            super::super::TmuxEvent::SessionChanged(String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn pending_resync_suppresses_additional_non_output_events() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut pending_resync = true;
+
+        let ok = send_event(
+            &tx,
+            super::super::TmuxEvent::WindowClose("@1".to_string()),
+            &mut pending_resync,
+        );
+
+        assert!(ok);
+        assert!(pending_resync);
+        assert!(rx.try_recv().is_err());
+
+        assert!(flush_pending_resync_event(&tx, &mut pending_resync));
+        assert_eq!(
+            rx.try_recv().expect("expected deferred resync event"),
+            super::super::TmuxEvent::SessionChanged(String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn pending_resync_suppresses_pane_output_until_flushed() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut pending_resync = true;
+
+        let ok = send_event(
+            &tx,
+            super::super::TmuxEvent::PaneOutput("%9".to_string()),
+            &mut pending_resync,
+        );
+
+        assert!(ok);
+        assert!(pending_resync);
+        assert!(rx.try_recv().is_err());
+
+        assert!(flush_pending_resync_event(&tx, &mut pending_resync));
+        assert_eq!(
+            rx.try_recv().expect("expected deferred resync event"),
             super::super::TmuxEvent::SessionChanged(String::new(), String::new())
         );
     }
