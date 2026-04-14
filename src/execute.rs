@@ -802,7 +802,8 @@ async fn handle_restore_preview<T: TmuxApi>(
         debug!(orig_window = %orig_window, "restoring preview");
 
         // Resolve both the join target and fresh home pane in one pane list query.
-        let orig_panes = query_window_pane_targets(tmux, &orig_window, &model.sidebar.pane_id).await;
+        let orig_panes =
+            query_window_pane_targets(tmux, &orig_window, &model.sidebar.pane_id).await;
 
         // Suppress session-window-changed events from join-pane + select-window.
         model.sidebar.ignore_window_changes = 2;
@@ -819,8 +820,11 @@ async fn handle_restore_preview<T: TmuxApi>(
             queue.push_front(Cmd::Render);
             return;
         }
-        let batch =
-            join_batch_with_window_select(&model.sidebar.pane_id, &orig_panes.leftmost, &orig_window);
+        let batch = join_batch_with_window_select(
+            &model.sidebar.pane_id,
+            &orig_panes.leftmost,
+            &orig_window,
+        );
 
         let restored = if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
             warn!(%err, "restore batch failed, trying fallback");

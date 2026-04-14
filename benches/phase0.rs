@@ -37,22 +37,30 @@ fn fixture_model(count: usize) -> Model {
 fn rename_only_windows(count: usize) -> Vec<WindowInfo> {
     let mut windows = fixture_windows(count);
     if let Some(first) = windows.first_mut() {
-        first.name = format!("{}:renamed", first.name);
+        first.name = match first.name.rsplit_once(':') {
+            Some((folder, _)) => format!("{folder}:renamed"),
+            None => "renamed".to_string(),
+        };
     }
     windows
 }
 
-fn add_remove_windows(count: usize) -> Vec<WindowInfo> {
+fn add_only_windows(count: usize) -> Vec<WindowInfo> {
     let mut windows = fixture_windows(count);
-    if !windows.is_empty() {
-        windows.remove(0);
-    }
     windows.push(WindowInfo {
         id: format!("@{}", count + 1),
         index: count + 1,
         name: format!("proj{}:added", count % 25),
         active: false,
     });
+    windows
+}
+
+fn remove_only_windows(count: usize) -> Vec<WindowInfo> {
+    let mut windows = fixture_windows(count);
+    if !windows.is_empty() {
+        windows.remove(0);
+    }
     windows
 }
 
@@ -93,10 +101,24 @@ fn bench_window_list_loaded(c: &mut Criterion) {
             },
         );
 
-        let changed = add_remove_windows(count);
+        let added = add_only_windows(count);
+        group.bench_with_input(BenchmarkId::new("add_only", count), &added, |b, windows| {
+            b.iter_batched(
+                || fixture_model(count),
+                |mut model| {
+                    update(
+                        &mut model,
+                        Msg::WindowListLoaded(black_box(windows.clone())),
+                    );
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        let removed = remove_only_windows(count);
         group.bench_with_input(
-            BenchmarkId::new("add_remove", count),
-            &changed,
+            BenchmarkId::new("remove_only", count),
+            &removed,
             |b, windows| {
                 b.iter_batched(
                     || fixture_model(count),

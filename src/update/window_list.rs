@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tracing::debug;
 
@@ -125,10 +125,6 @@ pub(super) fn handle_window_list_loaded(
     }
 
     if !was_moving {
-        if let Some(cmds) = try_incremental_add_remove(model, &windows, &selected_target) {
-            return cmds;
-        }
-
         if let Some(leaf_names_by_id) = rename_only_leaf_updates(model, &windows) {
             model.rename_window_leaves(&leaf_names_by_id);
             model.reorder.pending_selection = None;
@@ -140,6 +136,10 @@ pub(super) fn handle_window_list_loaded(
             clear_mode_if_missing_target(model, &windows);
             followup_cmds.push(Cmd::Render);
             return followup_cmds;
+        }
+
+        if let Some(cmds) = try_incremental_add_remove(model, &windows, &selected_target) {
+            return cmds;
         }
     }
 
@@ -332,16 +332,18 @@ fn try_incremental_add_remove(
     let snapshot = model.window_list_snapshot.as_ref()?;
     let snapshot_ids: Vec<&str> = snapshot.iter().map(|w| w.id.as_str()).collect();
     let window_ids: Vec<&str> = windows.iter().map(|w| w.id.as_str()).collect();
+    let snapshot_id_set: HashSet<&str> = snapshot_ids.iter().copied().collect();
+    let window_id_set: HashSet<&str> = window_ids.iter().copied().collect();
 
     let removed_ids: Vec<&str> = snapshot_ids
         .iter()
         .copied()
-        .filter(|id| !window_ids.contains(id))
+        .filter(|id| !window_id_set.contains(id))
         .collect();
     let added_ids: Vec<&str> = window_ids
         .iter()
         .copied()
-        .filter(|id| !snapshot_ids.contains(id))
+        .filter(|id| !snapshot_id_set.contains(id))
         .collect();
 
     let single_change = match (added_ids.as_slice(), removed_ids.as_slice()) {
@@ -350,13 +352,7 @@ fn try_incremental_add_remove(
         _ => None,
     }?;
 
-    if !snapshot_ids
-        .iter()
-        .zip(window_ids.iter())
-        .all(|(old, new)| {
-            old == new || single_change.0 == Some(*new) || single_change.1 == Some(*old)
-        })
-    {
+    if !ids_match_single_insert_or_remove(&snapshot_ids, &window_ids, single_change) {
         return None;
     }
 
@@ -404,6 +400,70 @@ fn try_incremental_add_remove(
     clear_mode_if_missing_target(model, windows);
     followup_cmds.push(Cmd::Render);
     Some(followup_cmds)
+}
+
+fn ids_match_single_insert_or_remove(
+    snapshot_ids: &[&str],
+    window_ids: &[&str],
+    single_change: (Option<&str>, Option<&str>),
+) -> bool {
+    let (added_id, removed_id) = single_change;
+    let mut old_idx = 0usize;
+    let mut new_idx = 0usize;
+    let mut skipped = false;
+
+    while old_idx < snapshot_ids.len() && new_idx < window_ids.len() {
+        if snapshot_ids[old_idx] == window_ids[new_idx] {
+            old_idx += 1;
+            new_idx += 1;
+            continue;
+        }
+
+        if skipped {
+            return false;
+        }
+        skipped = true;
+
+        match (added_id, removed_id) {
+            (Some(added), None) if window_ids[new_idx] == added => {
+                new_idx += 1;
+            }
+            (None, Some(removed)) if snapshot_ids[old_idx] == removed => {
+                old_idx += 1;
+            }
+            _ => return false,
+        }
+    }
+
+    if old_idx < snapshot_ids.len() || new_idx < window_ids.len() {
+        if skipped {
+            match (added_id, removed_id) {
+                (Some(added), None) => {
+                    new_idx + 1 == window_ids.len() && window_ids[new_idx] == added
+                }
+                (None, Some(removed)) => {
+                    old_idx + 1 == snapshot_ids.len() && snapshot_ids[old_idx] == removed
+                }
+                _ => false,
+            }
+        } else {
+            match (added_id, removed_id) {
+                (Some(added), None) => {
+                    old_idx == snapshot_ids.len()
+                        && new_idx + 1 == window_ids.len()
+                        && window_ids[new_idx] == added
+                }
+                (None, Some(removed)) => {
+                    old_idx + 1 == snapshot_ids.len()
+                        && snapshot_ids[old_idx] == removed
+                        && new_idx == window_ids.len()
+                }
+                _ => false,
+            }
+        }
+    } else {
+        true
+    }
 }
 
 fn insert_window_node(

@@ -614,6 +614,52 @@ mod tests {
     }
 
     #[test]
+    fn window_list_loaded_add_only_fast_path_inserts_single_window() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@1", 1, "alpha"), wi("@3", 3, "gamma")]),
+        );
+
+        let cmds = update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                wi("@1", 1, "alpha"),
+                wi("@2", 2, "beta"),
+                wi("@3", 3, "gamma"),
+            ]),
+        );
+
+        assert_eq!(model.tree().len(), 3);
+        assert_eq!(model.cursor(), 0);
+        assert!(cmds.iter().any(|cmd| matches!(cmd, Cmd::Render)));
+    }
+
+    #[test]
+    fn window_list_loaded_remove_only_fast_path_removes_single_window() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                wi("@1", 1, "alpha"),
+                wi("@2", 2, "beta"),
+                wi("@3", 3, "gamma"),
+            ]),
+        );
+
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@1", 1, "alpha"), wi("@3", 3, "gamma")]),
+        );
+
+        assert_eq!(model.tree().len(), 2);
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@1")
+        );
+    }
+
+    #[test]
     fn window_list_loaded_rebuilds_same_list_while_moving() {
         let mut model = test_model();
         let windows = vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "scratch")];
