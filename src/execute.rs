@@ -1590,6 +1590,15 @@ async fn apply_layout_helper<T: TmuxApi>(
         return;
     }
 
+    let disable_rename = commands::disable_window_rename(&model.sidebar.window_id);
+    if let Err(err) = tmux.send_command(&disable_rename).await {
+        warn!(
+            window_id = %model.sidebar.window_id,
+            %err,
+            "layout helper: failed to disable automatic rename"
+        );
+    }
+
     let top = &content_ids[4];
     let bottom = &content_ids[5];
 
@@ -3142,6 +3151,7 @@ mod tests {
             Ok("/work\n".to_string()),
             Ok(format!("1234,{}", layout.split_once(',').unwrap().1)),
             Ok(String::new()),
+            Ok(String::new()),
             Ok("%2\tbash\n%3\tbash\n%4\tbash\n%5\tbash\n%6\tbash\n%7\tbash\n".to_string()),
             Ok(String::new()),
             Ok(String::new()),
@@ -3158,6 +3168,17 @@ mod tests {
             .commands
             .iter()
             .any(|cmd| cmd.contains("pane_current_command")));
+        let disable_idx = tmux
+            .commands
+            .iter()
+            .position(|cmd| cmd == "set-window-option -t @old automatic-rename off ; set-window-option -t @old allow-rename off")
+            .expect("layout helper should disable window rename");
+        let lazygit_idx = tmux
+            .commands
+            .iter()
+            .position(|cmd| cmd == "send-keys -t %4 lazygit C-m")
+            .expect("layout helper should launch lazygit");
+        assert!(disable_idx < lazygit_idx);
         assert!(tmux
             .commands
             .iter()
@@ -3199,6 +3220,7 @@ mod tests {
             Ok(String::new()),
             Ok(String::new()),
             Ok(String::new()),
+            Ok(String::new()),
         ]);
 
         let mut queue = VecDeque::new();
@@ -3212,6 +3234,10 @@ mod tests {
             .commands
             .iter()
             .any(|cmd| cmd.starts_with("select-layout -t @old ")));
+        assert!(tmux
+            .commands
+            .iter()
+            .any(|cmd| cmd == "set-window-option -t @old automatic-rename off ; set-window-option -t @old allow-rename off"));
         assert!(!tmux.commands.iter().any(|cmd| cmd.contains(" lazygit C-m")));
         assert!(!tmux.commands.iter().any(|cmd| cmd.contains(" yazi C-m")));
         assert!(!tmux.commands.iter().any(|cmd| cmd.contains("cd -- ")));
