@@ -801,6 +801,9 @@ async fn handle_restore_preview<T: TmuxApi>(
 
         debug!(orig_window = %orig_window, "restoring preview");
 
+        // Resolve both the join target and fresh home pane in one pane list query.
+        let orig_panes = query_window_pane_targets(tmux, &orig_window, &model.sidebar.pane_id).await;
+
         // Suppress session-window-changed events from join-pane + select-window.
         model.sidebar.ignore_window_changes = 2;
         model.sidebar.pending_internal_focus_window = Some(orig_window.clone());
@@ -809,19 +812,15 @@ async fn handle_restore_preview<T: TmuxApi>(
         save_window_layout(model, tmux, &orig_window).await;
         let leaving_window = snapshot_leaving_window_layout(model, tmux).await;
 
-        // Always target the leftmost pane so sidebar stays at far left.
-        let orig_leftmost =
-            choose_leftmost_pane_in_window(tmux, &orig_window, &model.sidebar.pane_id).await;
-
         // Batch: join sidebar back + switch + focus.
-        if orig_leftmost.is_empty() {
+        if orig_panes.leftmost.is_empty() {
             model.error_message =
                 Some("restore preview: could not resolve leftmost pane".to_string());
             queue.push_front(Cmd::Render);
             return;
         }
         let batch =
-            join_batch_with_window_select(&model.sidebar.pane_id, &orig_leftmost, &orig_window);
+            join_batch_with_window_select(&model.sidebar.pane_id, &orig_panes.leftmost, &orig_window);
 
         let restored = if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
             warn!(%err, "restore batch failed, trying fallback");
@@ -856,15 +855,12 @@ async fn handle_restore_preview<T: TmuxApi>(
 
         if restored {
             model.sidebar.window_id = orig_window.clone();
-            // Re-detect home pane: orig_home may be stale (e.g. pane
-            // was closed), especially after the fallback path.
-            let fresh_home =
-                choose_home_pane_in_window(tmux, &model.sidebar.window_id, &model.sidebar.pane_id)
-                    .await;
-            model.sidebar.home_pane_id = if fresh_home.is_empty() {
+            // Reuse the same pane-list result; fallback to the original saved
+            // home only if the active pane disappeared.
+            model.sidebar.home_pane_id = if orig_panes.home.is_empty() {
                 orig_home
             } else {
-                fresh_home
+                orig_panes.home
             };
             model.sidebar.preview = PreviewState::Home;
         } else {
@@ -3326,5 +3322,43 @@ mod tests {
             .commands
             .iter()
             .any(|cmd| cmd.starts_with("select-layout -t @new ")));
+    }
+
+    #[tokio::test]
+    async fn restore_preview_uses_one_pane_query_for_target_and_home() {
+        let mut model = test_model();
+        model.terminal_size = (120, 40);
+        model.sidebar.window_id = "@cur".to_string();
+        model.sidebar.home_pane_id = "%cur_home".to_string();
+        model.sidebar.preview = PreviewState::Previewing {
+            original_window_id: "@orig".to_string(),
+            original_home_pane_id: "%orig_home".to_string(),
+        };
+        model
+            .sidebar
+            .pane_layouts
+            .insert("@cur".to_string(), (120, "layout-cur".to_string()));
+        model
+            .sidebar
+            .pane_layouts
+            .insert("@orig".to_string(), (120, "layout-orig".to_string()));
+
+        let mut tmux = FakeTmux::new(vec![
+            Ok("%orig_a\t0\t0\t0\n%orig_b\t40\t0\t1\n%sidebar\t80\t0\t0\n".to_string()),
+            Ok("layout-orig\n".to_string()),
+            Ok("layout-cur\n".to_string()),
+            Ok(String::new()),
+            Ok(String::new()),
+        ]);
+        let mut queue = VecDeque::new();
+
+        handle_restore_preview(&mut model, &mut tmux, &mut queue).await;
+
+        assert_eq!(tmux.commands.len(), 5);
+        assert!(tmux.commands[0].starts_with("list-panes -t @orig"));
+        assert!(tmux.commands[3].starts_with("join-pane -dfhb -l 30 -s %sidebar -t %orig_a"));
+        assert_eq!(model.sidebar.window_id, "@orig");
+        assert_eq!(model.sidebar.home_pane_id, "%orig_b");
+        assert!(matches!(queue.front(), Some(Cmd::CheckBorder)));
     }
 }
