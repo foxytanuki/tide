@@ -832,10 +832,17 @@ mod tests {
                 .expect("queue pane output");
         }
 
-        let cmds = process_tmux_batch(&mut model, &mut rx, TmuxEvent::PaneOutput("%ai".to_string()));
+        let cmds = process_tmux_batch(
+            &mut model,
+            &mut rx,
+            TmuxEvent::PaneOutput("%ai".to_string()),
+        );
 
         assert!(cmds.is_empty());
-        assert_eq!(model.ai.output_counts.get("%ai").copied(), Some(MAX_TMUX_EVENTS_PER_BATCH as u32));
+        assert_eq!(
+            model.ai.output_counts.get("%ai").copied(),
+            Some(MAX_TMUX_EVENTS_PER_BATCH as u32)
+        );
     }
 
     #[test]
@@ -844,14 +851,22 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(128);
 
         for _ in 0..MAX_TMUX_EVENTS_PER_BATCH {
-            tx.try_send(TmuxEvent::PaneOutput("%ai".to_string())).unwrap();
+            tx.try_send(TmuxEvent::PaneOutput("%ai".to_string()))
+                .unwrap();
         }
         tx.try_send(TmuxEvent::WindowAdd("@1".to_string())).unwrap();
 
-        let cmds = process_tmux_batch(&mut model, &mut rx, TmuxEvent::PaneOutput("%ai".to_string()));
+        let cmds = process_tmux_batch(
+            &mut model,
+            &mut rx,
+            TmuxEvent::PaneOutput("%ai".to_string()),
+        );
 
         assert!(cmds.is_empty());
-        assert_eq!(model.ai.output_counts.get("%ai").copied(), Some(MAX_TMUX_EVENTS_PER_BATCH as u32));
+        assert_eq!(
+            model.ai.output_counts.get("%ai").copied(),
+            Some(MAX_TMUX_EVENTS_PER_BATCH as u32)
+        );
 
         let cmds = process_tmux_batch(&mut model, &mut rx, TmuxEvent::WindowAdd("@2".to_string()));
 
@@ -865,16 +880,28 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(256);
 
         for _ in 0..MAX_TMUX_EVENTS_PER_BATCH {
-            tx.try_send(TmuxEvent::PaneOutput("%ai".to_string())).unwrap();
+            tx.try_send(TmuxEvent::PaneOutput("%ai".to_string()))
+                .unwrap();
         }
         tx.try_send(TmuxEvent::WindowAdd("@1".to_string())).unwrap();
 
-        let cmds = process_tmux_batch(&mut model, &mut rx, TmuxEvent::PaneOutput("%ai".to_string()));
+        let cmds = process_tmux_batch(
+            &mut model,
+            &mut rx,
+            TmuxEvent::PaneOutput("%ai".to_string()),
+        );
 
         assert!(cmds.is_empty());
-        assert_eq!(model.ai.output_counts.get("%ai").copied(), Some(MAX_TMUX_EVENTS_PER_BATCH as u32));
+        assert_eq!(
+            model.ai.output_counts.get("%ai").copied(),
+            Some(MAX_TMUX_EVENTS_PER_BATCH as u32)
+        );
 
-        let cmds = process_tmux_batch(&mut model, &mut rx, TmuxEvent::PaneOutput("%ai".to_string()));
+        let cmds = process_tmux_batch(
+            &mut model,
+            &mut rx,
+            TmuxEvent::PaneOutput("%ai".to_string()),
+        );
 
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], Cmd::ListWindows));

@@ -4,7 +4,7 @@ use tracing::debug;
 
 use crate::cmd::Cmd;
 use crate::model::{Mode, Model, PreviewState, SelectionTarget};
-use crate::tree::{build_tree, WindowInfo};
+use crate::tree::{build_tree, get_node_mut, TreeNode, WindowInfo};
 
 use super::naming::restore_folder_expanded;
 use super::navigation::clear_mode_if_missing_target;
@@ -125,8 +125,7 @@ pub(super) fn handle_window_list_loaded(
     }
 
     if !was_moving {
-        if let Some(cmds) = try_incremental_root_level_add_remove(model, &windows, &selected_target)
-        {
+        if let Some(cmds) = try_incremental_add_remove(model, &windows, &selected_target) {
             return cmds;
         }
 
@@ -325,17 +324,12 @@ fn leaf_name(name: &str) -> &str {
     name.rsplit_once(':').map(|(_, leaf)| leaf).unwrap_or(name)
 }
 
-fn try_incremental_root_level_add_remove(
+fn try_incremental_add_remove(
     model: &mut Model,
     windows: &[WindowInfo],
     selected_target: &Option<SelectionTarget>,
 ) -> Option<Vec<Cmd>> {
     let snapshot = model.window_list_snapshot.as_ref()?;
-    if snapshot.iter().any(|w| w.name.contains(':')) || windows.iter().any(|w| w.name.contains(':'))
-    {
-        return None;
-    }
-
     let snapshot_ids: Vec<&str> = snapshot.iter().map(|w| w.id.as_str()).collect();
     let window_ids: Vec<&str> = windows.iter().map(|w| w.id.as_str()).collect();
 
@@ -370,24 +364,28 @@ fn try_incremental_root_level_add_remove(
     match single_change {
         (Some(added_id), None) => {
             let added = windows.iter().find(|w| w.id == added_id)?;
-            let insert_at = windows
-                .iter()
-                .take_while(|w| w.id != added.id)
-                .count()
-                .min(tree.len());
-            tree.insert(
-                insert_at,
-                crate::tree::TreeNode::Window {
-                    info: added.clone(),
-                },
-            );
+            insert_window_node(&mut tree, windows, added)?;
         }
         (None, Some(removed_id)) => {
-            let remove_at = tree.iter().position(|node| match node {
-                crate::tree::TreeNode::Window { info } => info.id == removed_id,
-                _ => false,
-            })?;
-            tree.remove(remove_at);
+            if let Some((folder_path, _)) = snapshot
+                .iter()
+                .find(|w| w.id == removed_id)
+                .and_then(|w| folder_path_for_window_name(w.name.as_str()))
+            {
+                let remaining_in_folder = snapshot
+                    .iter()
+                    .filter(|w| {
+                        folder_path_for_window_name(w.name.as_str())
+                            .is_some_and(|(path, _)| path == folder_path)
+                    })
+                    .count();
+                if remaining_in_folder <= 1 {
+                    return None;
+                }
+            }
+            if !remove_window_node(&mut tree, removed_id, snapshot) {
+                return None;
+            }
         }
         _ => return None,
     }
@@ -406,4 +404,111 @@ fn try_incremental_root_level_add_remove(
     clear_mode_if_missing_target(model, windows);
     followup_cmds.push(Cmd::Render);
     Some(followup_cmds)
+}
+
+fn insert_window_node(
+    tree: &mut Vec<TreeNode>,
+    windows: &[WindowInfo],
+    added: &WindowInfo,
+) -> Option<()> {
+    let path = folder_path_for_window_name(added.name.as_str());
+    let Some((folder_path, leaf_name)) = path else {
+        let insert_at = insertion_index(windows, added.id.as_str(), None)?;
+        tree.insert(
+            insert_at,
+            TreeNode::Window {
+                info: added.clone(),
+            },
+        );
+        return Some(());
+    };
+
+    let parent_path = find_folder_path(tree.as_slice(), &folder_path)?;
+    let parent = get_node_mut(tree.as_mut_slice(), &parent_path).ok()?;
+    let children = match parent {
+        TreeNode::Folder { children, .. } => children,
+        TreeNode::Window { .. } => return None,
+    };
+    let insert_at = insertion_index(windows, added.id.as_str(), Some(&folder_path))?;
+    let mut info = added.clone();
+    info.name = leaf_name.to_string();
+    children.insert(insert_at, TreeNode::Window { info });
+    Some(())
+}
+
+fn remove_window_node(tree: &mut Vec<TreeNode>, removed_id: &str, snapshot: &[WindowInfo]) -> bool {
+    remove_window_node_recursive(tree, removed_id).unwrap_or_else(|| {
+        let Some(position) = insertion_index(snapshot, removed_id, None) else {
+            return false;
+        };
+        if position < tree.len() {
+            tree.remove(position);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+fn insertion_index(
+    windows: &[WindowInfo],
+    window_id: &str,
+    folder_path: Option<&str>,
+) -> Option<usize> {
+    let mut count = 0usize;
+    for window in windows {
+        if window.id == window_id {
+            return Some(count);
+        }
+        let matches_scope = match folder_path {
+            Some(path) => {
+                folder_path_for_window_name(window.name.as_str()).is_some_and(|(p, _)| p == path)
+            }
+            None => !window.name.contains(':'),
+        };
+        if matches_scope {
+            count += 1;
+        }
+    }
+    None
+}
+
+fn folder_path_for_window_name(name: &str) -> Option<(String, String)> {
+    let (folder, leaf) = name.rsplit_once(':')?;
+    Some((folder.to_string(), leaf.to_string()))
+}
+
+fn find_folder_path(nodes: &[TreeNode], folder_path: &str) -> Option<Vec<usize>> {
+    let mut path = Vec::new();
+    let mut current = nodes;
+    for part in folder_path.split(':') {
+        let idx = current
+            .iter()
+            .position(|node| matches!(node, TreeNode::Folder { name, .. } if name == part))?;
+        path.push(idx);
+        current = match &current[idx] {
+            TreeNode::Folder { children, .. } => children,
+            TreeNode::Window { .. } => return None,
+        };
+    }
+    Some(path)
+}
+
+fn remove_window_node_recursive(nodes: &mut Vec<TreeNode>, removed_id: &str) -> Option<bool> {
+    if let Some(idx) = nodes
+        .iter()
+        .position(|node| matches!(node, TreeNode::Window { info } if info.id == removed_id))
+    {
+        nodes.remove(idx);
+        return Some(true);
+    }
+
+    for node in nodes.iter_mut() {
+        if let TreeNode::Folder { children, .. } = node {
+            if remove_window_node_recursive(children, removed_id)? {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
 }

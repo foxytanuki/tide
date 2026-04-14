@@ -719,6 +719,72 @@ mod tests {
     }
 
     #[test]
+    fn window_list_loaded_add_remove_fast_path_handles_nested_folder_tab() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@1", 1, "proj:edit")]),
+        );
+
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "proj:tab")]),
+        );
+
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@1")
+        );
+        assert_eq!(model.tree().len(), 1);
+        match &model.tree()[0] {
+            TreeNode::Folder { children, .. } => assert_eq!(children.len(), 2),
+            other => panic!("expected folder, got {:?}", other),
+        }
+
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@2", 2, "proj:tab")]),
+        );
+
+        assert!(matches!(model.tree()[0], TreeNode::Folder { .. }));
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@2")
+        );
+    }
+
+    #[test]
+    fn window_list_loaded_add_remove_fast_path_handles_nested_folder_api_tab() {
+        let mut model = test_model();
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@1", 1, "proj:api:edit")]),
+        );
+
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                wi("@1", 1, "proj:api:edit"),
+                wi("@2", 2, "proj:api:tab"),
+            ]),
+        );
+
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@1")
+        );
+        assert_eq!(model.tree().len(), 1);
+        update(
+            &mut model,
+            Msg::WindowListLoaded(vec![wi("@2", 2, "proj:api:tab")]),
+        );
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@2")
+        );
+    }
+
+    #[test]
     fn window_renamed_pending_mismatch_triggers_immediate_rename() {
         let mut model = test_model();
         model.renames.pending.insert(
