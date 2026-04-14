@@ -1728,6 +1728,10 @@ async fn poll_ai_processes<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue: &
         model.ai.output_suppress -= 1;
         model.ai.output_counts.clear();
     }
+    if model.ai.poll_skip_ticks > 0 {
+        model.ai.poll_skip_ticks -= 1;
+        return;
+    }
     let list_cmd = format!(
         "list-panes -s -t {} -F '#{{window_id}}\t#{{pane_id}}\t#{{pane_current_command}}\t#{{pane_pid}}'",
         model.session_name
@@ -1738,6 +1742,7 @@ async fn poll_ai_processes<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue: &
             if candidates.is_empty() {
                 model.ai.cpu_tracker.clear();
                 model.ai.output_counts.clear();
+                schedule_ai_poll_backoff(model);
                 enqueue_follow_up(
                     queue,
                     update(
@@ -1754,6 +1759,8 @@ async fn poll_ai_processes<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue: &
             let prev_cpu = std::mem::take(&mut model.ai.cpu_tracker);
             let output_counts = std::mem::take(&mut model.ai.output_counts);
             let candidate_count = candidates.len();
+            model.ai.idle_polls = 0;
+            model.ai.poll_skip_ticks = 0;
             let classify_started_at = std::time::Instant::now();
             match tokio::task::spawn_blocking(move || {
                 let mut prev_cpu = prev_cpu;
@@ -1795,6 +1802,17 @@ async fn poll_ai_processes<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue: &
             debug!(%err, "ai process poll failed");
         }
     }
+}
+
+fn schedule_ai_poll_backoff(model: &mut Model) {
+    model.ai.idle_polls = model.ai.idle_polls.saturating_add(1);
+    model.ai.poll_skip_ticks = match model.ai.idle_polls {
+        0..=3 => 0,
+        4..=7 => 1,
+        8..=15 => 2,
+        16..=31 => 4,
+        _ => 8,
+    };
 }
 
 fn enqueue_follow_up(queue: &mut VecDeque<Cmd>, follow_up: Vec<Cmd>) {
@@ -2836,6 +2854,37 @@ mod tests {
             !panes.contains("%10"),
             "no output + no CPU should let grace expire"
         );
+    }
+
+    #[tokio::test]
+    async fn poll_ai_processes_backs_off_after_idle_polls() {
+        let mut model = test_model();
+        model.ai.poll_skip_ticks = 2;
+        model.ai.idle_polls = 6;
+        let mut tmux = FakeTmux::new(vec![]);
+        let mut queue = VecDeque::new();
+
+        poll_ai_processes(&mut model, &mut tmux, &mut queue).await;
+
+        assert!(tmux.commands.is_empty(), "poll should be skipped");
+        assert_eq!(model.ai.poll_skip_ticks, 1);
+        assert_eq!(model.ai.idle_polls, 6);
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn poll_ai_processes_resets_backoff_when_candidates_appear() {
+        let mut model = test_model();
+        model.ai.idle_polls = 9;
+        let output = "@1\t%10\tclaude\t1000\n";
+        let mut tmux = FakeTmux::new(vec![Ok(output.to_string())]);
+        let mut queue = VecDeque::new();
+
+        poll_ai_processes(&mut model, &mut tmux, &mut queue).await;
+
+        assert_eq!(model.ai.poll_skip_ticks, 0);
+        assert_eq!(model.ai.idle_polls, 0);
+        assert_eq!(tmux.commands.len(), 1);
     }
 
     #[test]

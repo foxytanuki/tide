@@ -90,6 +90,10 @@ pub struct AiState {
     pub output_counts: HashMap<String, u32>,
     /// Polls to skip %output counts after window switch (pane redraw noise).
     pub output_suppress: u8,
+    /// Consecutive empty AI polls, used to back off the expensive pane scan.
+    pub idle_polls: u8,
+    /// Remaining 500ms ticks to skip before the next AI poll.
+    pub poll_skip_ticks: u8,
     /// Window IDs where AI recently finished, with completion timestamp.
     /// Used to show fading badge: ○ (new moon) → disappear after timeout.
     pub recently_finished: HashMap<String, Instant>,
@@ -186,6 +190,8 @@ impl Model {
                 cpu_tracker: HashMap::new(),
                 output_counts: HashMap::new(),
                 output_suppress: 0,
+                idle_polls: 0,
+                poll_skip_ticks: 0,
                 recently_finished: HashMap::new(),
             },
             terminal_size: (80, 24),
