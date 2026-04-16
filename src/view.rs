@@ -56,29 +56,24 @@ pub fn render(model: &Model, frame: &mut Frame) {
 }
 
 pub fn build_tree_items(model: &Model, width: usize) -> Vec<ListItem<'static>> {
-    let flat_items = model.flat_items();
-    let active_window_id = model
-        .sidebar
-        .pending_preview_id
-        .as_deref()
-        .unwrap_or(&model.sidebar.window_id);
-    let mut rendered = Vec::with_capacity(flat_items.len());
-    let mut flat_index = 0;
-    let cursor = model.cursor();
-
-    collect_tree_items(
-        model.tree(),
-        flat_items,
+    let ctx = RenderTreeContext {
+        flat_items: model.flat_items(),
         width,
-        cursor,
-        active_window_id,
-        &model.ai.windows,
-        &model.ai.recently_finished,
-        &mut flat_index,
-        &mut rendered,
-    );
+        cursor: model.cursor(),
+        active_window_id: model
+            .sidebar
+            .pending_preview_id
+            .as_deref()
+            .unwrap_or(&model.sidebar.window_id),
+        ai_windows: &model.ai.windows,
+        recently_finished: &model.ai.recently_finished,
+    };
+    let mut rendered = Vec::with_capacity(ctx.flat_items.len());
+    let mut flat_index = 0;
 
-    debug_assert_eq!(flat_index, flat_items.len());
+    ctx.collect_tree_items(model.tree(), &mut flat_index, &mut rendered);
+
+    debug_assert_eq!(flat_index, ctx.flat_items.len());
     rendered
 }
 
@@ -115,113 +110,99 @@ impl SubtreeAiState {
     }
 }
 
-fn collect_tree_items(
-    nodes: &[TreeNode],
-    flat_items: &[FlatItem],
+struct RenderTreeContext<'a> {
+    flat_items: &'a [FlatItem],
     width: usize,
     cursor: usize,
-    active_window_id: &str,
-    ai_windows: &HashSet<String>,
-    recently_finished: &HashMap<String, Instant>,
-    flat_index: &mut usize,
-    out: &mut Vec<ListItem<'static>>,
-) -> SubtreeAiState {
-    let mut subtree = SubtreeAiState::default();
-
-    for node in nodes {
-        subtree.merge(collect_tree_item(
-            node,
-            flat_items,
-            width,
-            cursor,
-            active_window_id,
-            ai_windows,
-            recently_finished,
-            flat_index,
-            out,
-        ));
-    }
-
-    subtree
+    active_window_id: &'a str,
+    ai_windows: &'a HashSet<String>,
+    recently_finished: &'a HashMap<String, Instant>,
 }
 
-fn collect_tree_item(
-    node: &TreeNode,
-    flat_items: &[FlatItem],
-    width: usize,
-    cursor: usize,
-    active_window_id: &str,
-    ai_windows: &HashSet<String>,
-    recently_finished: &HashMap<String, Instant>,
-    flat_index: &mut usize,
-    out: &mut Vec<ListItem<'static>>,
-) -> SubtreeAiState {
-    match node {
-        TreeNode::Folder {
-            name,
-            expanded,
-            children,
-        } => {
-            let Some(item) = flat_items.get(*flat_index) else {
-                debug_assert!(false, "flat/tree mismatch on folder row");
-                return subtree_ai_state(children, ai_windows, recently_finished);
-            };
-            let is_selected = *flat_index == cursor;
-            *flat_index += 1;
+impl RenderTreeContext<'_> {
+    fn collect_tree_items(
+        &self,
+        nodes: &[TreeNode],
+        flat_index: &mut usize,
+        out: &mut Vec<ListItem<'static>>,
+    ) -> SubtreeAiState {
+        let mut subtree = SubtreeAiState::default();
 
-            let rendered_index = out.len();
-            out.push(ListItem::new(String::new()));
-
-            let child_state = if *expanded {
-                collect_tree_items(
-                    children,
-                    flat_items,
-                    width,
-                    cursor,
-                    active_window_id,
-                    ai_windows,
-                    recently_finished,
-                    flat_index,
-                    out,
-                )
-            } else {
-                subtree_ai_state(children, ai_windows, recently_finished)
-            };
-
-            out[rendered_index] = render_folder_item(
-                item,
-                name,
-                *expanded,
-                children.is_empty(),
-                width,
-                is_selected,
-                if *expanded {
-                    AiBadge::None
-                } else {
-                    child_state.badge_for_collapsed_folder()
-                },
-            );
-
-            child_state
+        for node in nodes {
+            subtree.merge(self.collect_tree_item(node, flat_index, out));
         }
-        TreeNode::Window { info } => {
-            let Some(item) = flat_items.get(*flat_index) else {
-                debug_assert!(false, "flat/tree mismatch on window row");
-                return window_ai_state(info.id.as_str(), ai_windows, recently_finished);
-            };
-            let is_selected = *flat_index == cursor;
-            *flat_index += 1;
-            let ai_state = window_ai_state(info.id.as_str(), ai_windows, recently_finished);
-            let badge = ai_state.badge_for_collapsed_folder();
-            out.push(render_window_item(
-                item,
-                info,
-                active_window_id,
-                width,
-                is_selected,
-                badge,
-            ));
-            ai_state
+
+        subtree
+    }
+
+    fn collect_tree_item(
+        &self,
+        node: &TreeNode,
+        flat_index: &mut usize,
+        out: &mut Vec<ListItem<'static>>,
+    ) -> SubtreeAiState {
+        match node {
+            TreeNode::Folder {
+                name,
+                expanded,
+                children,
+            } => {
+                let Some(item) = self.flat_items.get(*flat_index) else {
+                    debug_assert!(false, "flat/tree mismatch on folder row");
+                    return subtree_ai_state(children, self.ai_windows, self.recently_finished);
+                };
+                let is_selected = *flat_index == self.cursor;
+                *flat_index += 1;
+
+                let rendered_index = out.len();
+                out.push(ListItem::new(String::new()));
+
+                let child_state = if *expanded {
+                    self.collect_tree_items(children, flat_index, out)
+                } else {
+                    subtree_ai_state(children, self.ai_windows, self.recently_finished)
+                };
+
+                out[rendered_index] = render_folder_item(
+                    item,
+                    name,
+                    *expanded,
+                    children.is_empty(),
+                    self.width,
+                    is_selected,
+                    if *expanded {
+                        AiBadge::None
+                    } else {
+                        child_state.badge_for_collapsed_folder()
+                    },
+                );
+
+                child_state
+            }
+            TreeNode::Window { info } => {
+                let Some(item) = self.flat_items.get(*flat_index) else {
+                    debug_assert!(false, "flat/tree mismatch on window row");
+                    return window_ai_state(
+                        info.id.as_str(),
+                        self.ai_windows,
+                        self.recently_finished,
+                    );
+                };
+                let is_selected = *flat_index == self.cursor;
+                *flat_index += 1;
+                let ai_state =
+                    window_ai_state(info.id.as_str(), self.ai_windows, self.recently_finished);
+                let badge = ai_state.badge_for_collapsed_folder();
+                out.push(render_window_item(
+                    item,
+                    info,
+                    self.active_window_id,
+                    self.width,
+                    is_selected,
+                    badge,
+                ));
+                ai_state
+            }
         }
     }
 }
