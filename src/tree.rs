@@ -43,38 +43,10 @@ pub struct FlatItem {
 
 pub fn build_tree(windows: &[WindowInfo]) -> Vec<TreeNode> {
     let mut roots: Vec<TreeNode> = Vec::new();
-    let mut folder_positions: HashMap<String, usize> = HashMap::new();
 
     for window in windows {
-        if let Some((folder_name, remainder)) = split_folder_name(&window.name) {
-            let folder_index = ensure_folder_index(
-                &mut roots,
-                &mut folder_positions,
-                folder_name.to_string(),
-                folder_name,
-            );
-
-            if let Some(TreeNode::Folder { children, .. }) = roots.get_mut(folder_index) {
-                // Check for second-level folder: folder:subfolder:tab
-                if let Some((subfolder_name, leaf_name)) = split_folder_name(remainder) {
-                    let sub_key = format!("{}:{}", folder_name, subfolder_name);
-                    let sub_index = ensure_folder_index(
-                        children,
-                        &mut folder_positions,
-                        sub_key,
-                        subfolder_name,
-                    );
-                    if let Some(TreeNode::Folder {
-                        children: sub_children,
-                        ..
-                    }) = children.get_mut(sub_index)
-                    {
-                        push_window_leaf(sub_children, window, leaf_name);
-                    }
-                } else {
-                    push_window_leaf(children, window, remainder);
-                }
-            }
+        if let Some(parts) = split_folder_parts(&window.name) {
+            insert_window_path(&mut roots, window, &parts);
         } else {
             roots.push(TreeNode::Window {
                 info: window.clone(),
@@ -85,23 +57,37 @@ pub fn build_tree(windows: &[WindowInfo]) -> Vec<TreeNode> {
     roots
 }
 
-fn ensure_folder_index(
-    nodes: &mut Vec<TreeNode>,
-    folder_positions: &mut HashMap<String, usize>,
-    key: String,
-    display_name: &str,
-) -> usize {
-    if let Some(&idx) = folder_positions.get(&key) {
-        idx
+fn insert_window_path(nodes: &mut Vec<TreeNode>, window: &WindowInfo, parts: &[&str]) {
+    match parts {
+        [] => nodes.push(TreeNode::Window {
+            info: window.clone(),
+        }),
+        [leaf_name] => push_window_leaf(nodes, window, leaf_name),
+        [folder_name, rest @ ..] => {
+            let folder_index = ensure_folder_index(nodes, folder_name);
+            if let Some(TreeNode::Folder { children, .. }) = nodes.get_mut(folder_index) {
+                insert_window_path(children, window, rest);
+            }
+        }
+    }
+}
+
+fn ensure_folder_index(nodes: &mut Vec<TreeNode>, display_name: &str) -> usize {
+    if let Some(index) = nodes.iter().position(|node| {
+        matches!(
+            node,
+            TreeNode::Folder { name, .. } if name == display_name
+        )
+    }) {
+        index
     } else {
-        let idx = nodes.len();
+        let index = nodes.len();
         nodes.push(TreeNode::Folder {
             name: display_name.to_string(),
             children: Vec::new(),
             expanded: true,
         });
-        folder_positions.insert(key, idx);
-        idx
+        index
     }
 }
 
@@ -325,6 +311,56 @@ pub fn folder_path_for_path(nodes: &[TreeNode], path: &[usize]) -> Result<String
     Ok(parts.join(":"))
 }
 
+pub fn collect_folder_expanded(nodes: &[TreeNode]) -> HashMap<String, bool> {
+    let mut map = HashMap::new();
+    collect_folder_expanded_inner(nodes, None, &mut map);
+    map
+}
+
+pub fn restore_folder_expanded(nodes: &mut [TreeNode], state: &HashMap<String, bool>) {
+    restore_folder_expanded_inner(nodes, None, state);
+}
+
+fn collect_folder_expanded_inner(
+    nodes: &[TreeNode],
+    prefix: Option<&str>,
+    map: &mut HashMap<String, bool>,
+) {
+    for node in nodes {
+        if let TreeNode::Folder {
+            name,
+            expanded,
+            children,
+        } = node
+        {
+            let full_path = join_folder_path(prefix, name);
+            map.insert(full_path.clone(), *expanded);
+            collect_folder_expanded_inner(children, Some(&full_path), map);
+        }
+    }
+}
+
+fn restore_folder_expanded_inner(
+    nodes: &mut [TreeNode],
+    prefix: Option<&str>,
+    state: &HashMap<String, bool>,
+) {
+    for node in nodes {
+        if let TreeNode::Folder {
+            name,
+            expanded,
+            children,
+        } = node
+        {
+            let full_path = join_folder_path(prefix, name);
+            if let Some(&was_expanded) = state.get(full_path.as_str()) {
+                *expanded = was_expanded;
+            }
+            restore_folder_expanded_inner(children, Some(&full_path), state);
+        }
+    }
+}
+
 pub fn window_ids_in_order(nodes: &[TreeNode]) -> Vec<String> {
     fn visit(nodes: &[TreeNode], out: &mut Vec<String>) {
         for node in nodes {
@@ -431,12 +467,19 @@ fn flatten_node(
     }
 }
 
-fn split_folder_name(name: &str) -> Option<(&str, &str)> {
-    let (folder, child) = name.split_once(':')?;
-    if folder.is_empty() || child.is_empty() {
+fn split_folder_parts(name: &str) -> Option<Vec<&str>> {
+    let parts: Vec<&str> = name.split(':').collect();
+    if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
         return None;
     }
-    Some((folder, child))
+    Some(parts)
+}
+
+fn join_folder_path(prefix: Option<&str>, name: &str) -> String {
+    match prefix {
+        Some(prefix) => format!("{prefix}:{name}"),
+        None => name.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -669,6 +712,60 @@ mod tests {
         }
 
         assert_eq!(window_name(&tree[1]), "solo");
+    }
+
+    #[test]
+    fn build_tree_supports_arbitrary_folder_depth() {
+        let windows = vec![
+            w("@1", 1, "proj:api:v1:edit"),
+            w("@2", 2, "proj:api:v1:logs"),
+            w("@3", 3, "proj:web:main"),
+        ];
+
+        let tree = build_tree(&windows);
+
+        match &tree[0] {
+            TreeNode::Folder { name, children, .. } => {
+                assert_eq!(name, "proj");
+
+                match &children[0] {
+                    TreeNode::Folder {
+                        name,
+                        children: api_children,
+                        ..
+                    } => {
+                        assert_eq!(name, "api");
+
+                        match &api_children[0] {
+                            TreeNode::Folder {
+                                name,
+                                children: v1_children,
+                                ..
+                            } => {
+                                assert_eq!(name, "v1");
+                                assert_eq!(window_name(&v1_children[0]), "edit");
+                                assert_eq!(window_name(&v1_children[1]), "logs");
+                            }
+                            _ => panic!("expected third-level folder"),
+                        }
+                    }
+                    _ => panic!("expected second-level folder"),
+                }
+
+                match &children[1] {
+                    TreeNode::Folder {
+                        name,
+                        children: web_children,
+                        ..
+                    } => {
+                        assert_eq!(name, "web");
+                        assert_eq!(window_name(&web_children[0]), "main");
+                    }
+                    _ => panic!("expected sibling folder"),
+                }
+            }
+            _ => panic!("expected root folder"),
+        }
     }
 
     #[test]

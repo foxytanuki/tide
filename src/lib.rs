@@ -1,3 +1,4 @@
+pub mod app;
 pub mod cmd;
 pub mod execute;
 pub mod launcher;

@@ -1,9 +1,7 @@
-use std::collections::HashMap;
-
 use tracing::debug;
 
 use crate::model::Model;
-use crate::tree::{find_parent_folder, get_node, FlatNodeKind, TreeNode};
+use crate::tree::{find_parent_folder, folder_path_for_path, get_node, FlatNodeKind, TreeNode};
 
 pub(super) fn join_folder_path(prefix: Option<&str>, name: &str) -> String {
     match prefix {
@@ -28,14 +26,7 @@ pub(super) fn reconstruct_full_name(model: &Model, flat_idx: usize, leaf_name: &
 }
 
 pub(super) fn reconstruct_folder_full_name(model: &Model, path: &[usize]) -> String {
-    let mut parts = Vec::new();
-    for depth in 0..path.len() {
-        let ancestor_path = &path[..=depth];
-        if let Ok(TreeNode::Folder { name, .. }) = get_node(model.tree(), ancestor_path) {
-            parts.push(name.clone());
-        }
-    }
-    parts.join(":")
+    folder_path_for_path(model.tree(), path).unwrap_or_default()
 }
 
 pub(super) fn collect_window_names(nodes: &[TreeNode]) -> Vec<String> {
@@ -187,56 +178,6 @@ fn collect_folder_children_recursive(
                 let new_prefix = join_folder_path(prefix, name);
                 collect_folder_children_recursive(children, Some(&new_prefix), out);
             }
-        }
-    }
-}
-
-pub(crate) fn collect_folder_expanded(nodes: &[TreeNode]) -> HashMap<String, bool> {
-    let mut map = HashMap::new();
-    collect_folder_expanded_inner(nodes, None, &mut map);
-    map
-}
-
-fn collect_folder_expanded_inner(
-    nodes: &[TreeNode],
-    prefix: Option<&str>,
-    map: &mut HashMap<String, bool>,
-) {
-    for node in nodes {
-        if let TreeNode::Folder {
-            name,
-            expanded,
-            children,
-        } = node
-        {
-            let full_path = join_folder_path(prefix, name);
-            map.insert(full_path.clone(), *expanded);
-            collect_folder_expanded_inner(children, Some(&full_path), map);
-        }
-    }
-}
-
-pub(super) fn restore_folder_expanded(nodes: &mut [TreeNode], state: &HashMap<String, bool>) {
-    restore_folder_expanded_inner(nodes, None, state);
-}
-
-fn restore_folder_expanded_inner(
-    nodes: &mut [TreeNode],
-    prefix: Option<&str>,
-    state: &HashMap<String, bool>,
-) {
-    for node in nodes {
-        if let TreeNode::Folder {
-            name,
-            expanded,
-            children,
-        } = node
-        {
-            let full_path = join_folder_path(prefix, name);
-            if let Some(&was_expanded) = state.get(full_path.as_str()) {
-                *expanded = was_expanded;
-            }
-            restore_folder_expanded_inner(children, Some(&full_path), state);
         }
     }
 }

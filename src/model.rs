@@ -2,10 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::tree::{
-    expand_to_window_by_id, flatten, folder_path_for_path, get_node, next_visible_item, FlatItem,
-    FlatNodeKind, TreeNode, WindowInfo,
+    collect_folder_expanded, expand_to_window_by_id, flatten, folder_path_for_path, get_node,
+    next_visible_item, FlatItem, FlatNodeKind, TreeNode, WindowInfo,
 };
-use crate::update::collect_folder_expanded;
 
 pub struct Model {
     tree: Vec<TreeNode>,

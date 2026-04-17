@@ -4,9 +4,8 @@ use tracing::debug;
 
 use crate::cmd::Cmd;
 use crate::model::{Mode, Model, PreviewState, SelectionTarget};
-use crate::tree::{build_tree, get_node_mut, TreeNode, WindowInfo};
+use crate::tree::{build_tree, get_node_mut, restore_folder_expanded, TreeNode, WindowInfo};
 
-use super::naming::restore_folder_expanded;
 use super::navigation::clear_mode_if_missing_target;
 
 pub(super) fn handle_window_focus_changed(model: &mut Model, window_id: String) -> Vec<Cmd> {
@@ -82,6 +81,9 @@ pub(super) fn handle_window_list_loaded(
 
     let mut selected_target = derive_selected_target(model);
     windows.sort_by_key(|window| window.index);
+    if selected_target.is_none() {
+        selected_target = derive_fallback_selected_target(model, &windows);
+    }
     let windows_by_id: HashMap<&str, &WindowInfo> = windows
         .iter()
         .map(|window| (window.id.as_str(), window))
@@ -184,6 +186,17 @@ fn derive_selected_target(model: &Model) -> Option<SelectionTarget> {
             Mode::Renaming { window_id } => Some(SelectionTarget::Window(window_id.clone())),
             _ => model.selected_selection_target(),
         })
+}
+
+fn derive_fallback_selected_target(
+    model: &Model,
+    windows: &[WindowInfo],
+) -> Option<SelectionTarget> {
+    windows
+        .iter()
+        .find(|window| window.id == model.sidebar.window_id)
+        .or_else(|| windows.iter().find(|window| window.active))
+        .map(|window| SelectionTarget::Window(window.id.clone()))
 }
 
 fn bump_last_pending_if_missing(

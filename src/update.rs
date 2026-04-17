@@ -8,8 +8,6 @@ mod naming;
 mod navigation;
 mod window_list;
 
-pub(crate) use naming::collect_folder_expanded;
-
 use input::*;
 use naming::*;
 use navigation::*;
@@ -222,6 +220,15 @@ mod tests {
         }
     }
 
+    fn active_wi(id: &str, index: usize, name: &str) -> WindowInfo {
+        WindowInfo {
+            id: id.to_string(),
+            index,
+            name: name.to_string(),
+            active: true,
+        }
+    }
+
     fn assert_new_window_name(cmds: &[Cmd], expected: &str) {
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
@@ -372,6 +379,20 @@ mod tests {
             model.selected_window_info().map(|w| w.id.as_str()),
             Some("@2")
         );
+    }
+
+    #[test]
+    fn window_list_loaded_defaults_cursor_to_sidebar_host_window() {
+        let mut model = test_model();
+        let windows = vec![wi("@1", 1, "root-a"), active_wi("@home", 2, "root-b")];
+
+        update(&mut model, Msg::WindowListLoaded(windows));
+
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@home")
+        );
+        assert_eq!(model.cursor(), 1);
     }
 
     #[test]

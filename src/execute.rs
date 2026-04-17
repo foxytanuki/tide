@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::io::Stdout;
 use std::pin::Pin;
@@ -12,9 +12,37 @@ use crate::metrics;
 use crate::model::{Model, PendingRename, PreviewState, SelectionTarget};
 use crate::msg::Msg;
 use crate::tmux::commands;
-use crate::tmux::{quote_tmux, TmuxControl, WindowInfo};
+use crate::tmux::{TmuxControl, WindowInfo};
 use crate::update::update;
 use crate::view::render;
+
+mod ai;
+mod layout;
+
+use self::ai::{check_border, poll_ai_processes, reset_all_borders};
+use self::layout::{
+    apply_layout_helper, choose_home_pane_in_window, choose_leftmost_pane_in_window,
+    cleanup_helper_managed_windows, ensure_sidebar_width, query_window_pane_targets,
+    reapply_helper_layout_if_needed, reconcile_sidebar_state, resolve_new_window_cwd,
+    restore_window_layout, save_window_layout, save_window_layout_without_pane,
+    validate_sidebar_panes,
+};
+
+#[cfg(test)]
+use std::collections::HashMap;
+
+#[cfg(test)]
+use self::ai::{
+    classify_active_panes, find_ai_pane_candidates, is_ai_process_name, read_cpu_ticks,
+    read_cpu_ticks_tree, AiPaneCandidate, AI_CPU_GRACE_POLLS, MIN_OUTPUT_BURST,
+};
+
+#[cfg(test)]
+use self::layout::{
+    build_cd_send_keys_cmd, build_sidebar_main_3x2_layout, build_split_window_cmd,
+    content_pane_ids, layout_without_pane, parse_layout_pane_line, query_layout_root, LayoutKind,
+    LayoutNode, PaneGeom,
+};
 
 pub type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
 const SIDEBAR_WIDTH_CHARS: u16 = 30;
@@ -51,549 +79,6 @@ impl TmuxApi for TmuxControl {
                 .map_err(|err| err.to_string())
         })
     }
-}
-
-/// Query a window's layout string (e.g. "ab12,200x50,0,0{...}").
-/// Returns None on error or empty output.
-async fn query_window_layout<T: TmuxApi>(tmux: &mut T, window_id: &str) -> Option<String> {
-    match tmux
-        .send_command(&format!(
-            "display-message -t {} -p '#{{window_layout}}'",
-            window_id
-        ))
-        .await
-    {
-        Ok(output) => {
-            let layout = output.trim().to_string();
-            if layout.is_empty() {
-                None
-            } else {
-                Some(layout)
-            }
-        }
-        Err(_) => None,
-    }
-}
-
-async fn query_pane_current_path<T: TmuxApi>(tmux: &mut T, pane_id: &str) -> Option<String> {
-    if pane_id.is_empty() {
-        return None;
-    }
-
-    match tmux
-        .send_command(&format!(
-            "display-message -p -t {} '#{{pane_current_path}}'",
-            pane_id
-        ))
-        .await
-    {
-        Ok(output) => {
-            let path = output.trim().to_string();
-            if path.is_empty() {
-                None
-            } else {
-                Some(path)
-            }
-        }
-        Err(_) => None,
-    }
-}
-
-async fn resolve_new_window_cwd<T: TmuxApi>(model: &Model, tmux: &mut T) -> Option<String> {
-    let home_pane_id = model.sidebar.home_pane_id.as_str();
-    if home_pane_id != model.sidebar.pane_id && !home_pane_id.is_empty() {
-        if let Some(path) = query_pane_current_path(tmux, home_pane_id).await {
-            return Some(path);
-        }
-    }
-
-    let fallback_pane_id =
-        choose_home_pane_in_window(tmux, &model.sidebar.window_id, &model.sidebar.pane_id).await;
-    if fallback_pane_id.is_empty()
-        || fallback_pane_id == model.sidebar.pane_id
-        || fallback_pane_id == home_pane_id
-    {
-        return None;
-    }
-
-    query_pane_current_path(tmux, &fallback_pane_id).await
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct WindowPaneTargets {
-    leftmost: String,
-    home: String,
-}
-
-async fn query_window_pane_targets<T: TmuxApi>(
-    tmux: &mut T,
-    window_id: &str,
-    sidebar_pane_id: &str,
-) -> WindowPaneTargets {
-    let pane_list = tmux
-        .send_command(&format!(
-            "list-panes -t {} -F '#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}\t#{{pane_active}}'",
-            window_id
-        ))
-        .await
-        .unwrap_or_default();
-
-    let mut first_non_sidebar = String::new();
-    let mut leftmost: Option<(u16, u16, String)> = None;
-    let mut active = String::new();
-
-    for line in pane_list.lines() {
-        let mut parts = line.split('\t');
-        let pane_id = parts.next().unwrap_or("").trim();
-        let pane_left: u16 = match parts.next().unwrap_or("").trim().parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let pane_top: u16 = match parts.next().unwrap_or("").trim().parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let is_active = parts.next().unwrap_or("").trim() == "1";
-        if pane_id.is_empty() || pane_id == sidebar_pane_id {
-            continue;
-        }
-        if first_non_sidebar.is_empty() {
-            first_non_sidebar = pane_id.to_string();
-        }
-        if is_active {
-            active = pane_id.to_string();
-        }
-
-        match &leftmost {
-            Some((best_left, best_top, _))
-                if pane_left > *best_left || (pane_left == *best_left && pane_top >= *best_top) => {
-            }
-            _ => leftmost = Some((pane_left, pane_top, pane_id.to_string())),
-        }
-    }
-
-    WindowPaneTargets {
-        leftmost: leftmost.map(|(_, _, pane_id)| pane_id).unwrap_or_default(),
-        home: if active.is_empty() {
-            first_non_sidebar
-        } else {
-            active
-        },
-    }
-}
-
-/// Save a window's current layout paired with terminal width.
-async fn save_window_layout<T: TmuxApi>(model: &mut Model, tmux: &mut T, window_id: &str) {
-    if let Some(layout) = query_window_layout(tmux, window_id).await {
-        let (term_w, _) = model.terminal_size;
-        model
-            .sidebar
-            .pane_layouts
-            .insert(window_id.to_string(), (term_w, layout));
-    }
-}
-
-async fn save_window_layout_without_pane<T: TmuxApi>(
-    model: &mut Model,
-    tmux: &mut T,
-    window_id: &str,
-    pane_id: &str,
-) {
-    let Some(layout) = query_window_layout(tmux, window_id).await else {
-        return;
-    };
-    let Some(layout) = layout_without_pane(&layout, pane_id) else {
-        return;
-    };
-
-    let (term_w, _) = model.terminal_size;
-    model
-        .sidebar
-        .pane_layouts
-        .insert(window_id.to_string(), (term_w, layout));
-}
-
-fn cleanup_helper_managed_windows(model: &mut Model, windows: &[WindowInfo]) {
-    let live: HashSet<&str> = windows.iter().map(|window| window.id.as_str()).collect();
-    model
-        .sidebar
-        .helper_managed_windows
-        .retain(|id| live.contains(id.as_str()));
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum LayoutKind {
-    LeftRight,
-    TopBottom,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum LayoutNode {
-    Pane {
-        sx: u32,
-        sy: u32,
-        xoff: u32,
-        yoff: u32,
-        pane_id: u32,
-    },
-    Split {
-        sx: u32,
-        sy: u32,
-        xoff: u32,
-        yoff: u32,
-        kind: LayoutKind,
-        children: Vec<LayoutNode>,
-    },
-}
-
-impl LayoutNode {
-    fn sx(&self) -> u32 {
-        match self {
-            Self::Pane { sx, .. } | Self::Split { sx, .. } => *sx,
-        }
-    }
-
-    fn sy(&self) -> u32 {
-        match self {
-            Self::Pane { sy, .. } | Self::Split { sy, .. } => *sy,
-        }
-    }
-
-    fn set_geometry(&mut self, sx: u32, sy: u32, xoff: u32, yoff: u32) {
-        match self {
-            Self::Pane {
-                sx: node_sx,
-                sy: node_sy,
-                xoff: node_xoff,
-                yoff: node_yoff,
-                ..
-            }
-            | Self::Split {
-                sx: node_sx,
-                sy: node_sy,
-                xoff: node_xoff,
-                yoff: node_yoff,
-                ..
-            } => {
-                *node_sx = sx;
-                *node_sy = sy;
-                *node_xoff = xoff;
-                *node_yoff = yoff;
-            }
-        }
-    }
-
-    fn write_body(&self, out: &mut String) {
-        match self {
-            Self::Pane {
-                sx,
-                sy,
-                xoff,
-                yoff,
-                pane_id,
-            } => {
-                out.push_str(&format!("{sx}x{sy},{xoff},{yoff},{pane_id}"));
-            }
-            Self::Split {
-                sx,
-                sy,
-                xoff,
-                yoff,
-                kind,
-                children,
-            } => {
-                let (open, close) = match kind {
-                    LayoutKind::LeftRight => ('{', '}'),
-                    LayoutKind::TopBottom => ('[', ']'),
-                };
-                out.push_str(&format!("{sx}x{sy},{xoff},{yoff}{open}"));
-                for (index, child) in children.iter().enumerate() {
-                    if index > 0 {
-                        out.push(',');
-                    }
-                    child.write_body(out);
-                }
-                out.push(close);
-            }
-        }
-    }
-}
-
-fn tmux_layout_checksum(layout: &str) -> u16 {
-    let mut checksum = 0u16;
-    for byte in layout.bytes() {
-        checksum = (checksum >> 1) + ((checksum & 1) << 15);
-        checksum = checksum.wrapping_add(byte as u16);
-    }
-    checksum
-}
-
-fn parse_pane_number(pane_id: &str) -> Option<u32> {
-    pane_id.trim().strip_prefix('%')?.parse().ok()
-}
-
-fn parse_layout_number(layout: &str, index: &mut usize) -> Option<u32> {
-    let bytes = layout.as_bytes();
-    let start = *index;
-    while *index < bytes.len() && bytes[*index].is_ascii_digit() {
-        *index += 1;
-    }
-    if *index == start {
-        return None;
-    }
-    layout.get(start..*index)?.parse().ok()
-}
-
-fn parse_layout_node(layout: &str, index: &mut usize) -> Option<LayoutNode> {
-    let sx = parse_layout_number(layout, index)?;
-    if layout.as_bytes().get(*index)? != &b'x' {
-        return None;
-    }
-    *index += 1;
-    let sy = parse_layout_number(layout, index)?;
-    if layout.as_bytes().get(*index)? != &b',' {
-        return None;
-    }
-    *index += 1;
-    let xoff = parse_layout_number(layout, index)?;
-    if layout.as_bytes().get(*index)? != &b',' {
-        return None;
-    }
-    *index += 1;
-    let yoff = parse_layout_number(layout, index)?;
-
-    let mut pane_id = None;
-    if layout.as_bytes().get(*index) == Some(&b',') {
-        let saved_index = *index;
-        *index += 1;
-        if let Some(value) = parse_layout_number(layout, index) {
-            if layout.as_bytes().get(*index) == Some(&b'x') {
-                *index = saved_index;
-            } else {
-                pane_id = Some(value);
-            }
-        } else {
-            *index = saved_index;
-        }
-    }
-
-    match layout.as_bytes().get(*index).copied() {
-        Some(b'{') | Some(b'[') => {
-            let kind = if layout.as_bytes()[*index] == b'{' {
-                LayoutKind::LeftRight
-            } else {
-                LayoutKind::TopBottom
-            };
-            let close = if matches!(kind, LayoutKind::LeftRight) {
-                b'}'
-            } else {
-                b']'
-            };
-            *index += 1;
-            let mut children = Vec::new();
-            loop {
-                children.push(parse_layout_node(layout, index)?);
-                match layout.as_bytes().get(*index).copied() {
-                    Some(b',') => *index += 1,
-                    Some(ch) if ch == close => {
-                        *index += 1;
-                        break;
-                    }
-                    _ => return None,
-                }
-            }
-            Some(LayoutNode::Split {
-                sx,
-                sy,
-                xoff,
-                yoff,
-                kind,
-                children,
-            })
-        }
-        _ => Some(LayoutNode::Pane {
-            sx,
-            sy,
-            xoff,
-            yoff,
-            pane_id: pane_id?,
-        }),
-    }
-}
-
-fn remove_pane_from_layout(node: LayoutNode, pane_id: u32) -> Option<LayoutNode> {
-    match node {
-        LayoutNode::Pane { pane_id: id, .. } if id == pane_id => None,
-        LayoutNode::Pane { .. } => Some(node),
-        LayoutNode::Split {
-            sx,
-            sy,
-            xoff,
-            yoff,
-            kind,
-            children,
-        } => {
-            let mut remaining = children
-                .into_iter()
-                .filter_map(|child| remove_pane_from_layout(child, pane_id))
-                .collect::<Vec<_>>();
-            match remaining.len() {
-                0 => None,
-                1 => remaining.pop(),
-                _ => Some(LayoutNode::Split {
-                    sx,
-                    sy,
-                    xoff,
-                    yoff,
-                    kind,
-                    children: remaining,
-                }),
-            }
-        }
-    }
-}
-
-fn resize_layout(node: &mut LayoutNode, sx: u32, sy: u32, xoff: u32, yoff: u32) {
-    node.set_geometry(sx, sy, xoff, yoff);
-
-    let LayoutNode::Split { kind, children, .. } = node else {
-        return;
-    };
-
-    let child_count = children.len() as u32;
-    if child_count == 0 {
-        return;
-    }
-
-    match kind {
-        LayoutKind::LeftRight => {
-            let content_sx = sx.saturating_sub(child_count.saturating_sub(1));
-            let old_total = children.iter().map(LayoutNode::sx).sum::<u32>().max(1);
-            let mut next_xoff = xoff;
-            let mut remaining_sx = content_sx;
-
-            for (index, child) in children.iter_mut().enumerate() {
-                let child_sx = if index + 1 == child_count as usize {
-                    remaining_sx
-                } else {
-                    let proposed =
-                        ((child.sx() as u64 * content_sx as u64) / old_total as u64).max(1) as u32;
-                    let max_allowed = remaining_sx.saturating_sub(child_count - index as u32 - 1);
-                    proposed.min(max_allowed)
-                };
-                resize_layout(child, child_sx, sy, next_xoff, yoff);
-                next_xoff = next_xoff.saturating_add(child_sx + 1);
-                remaining_sx = remaining_sx.saturating_sub(child_sx);
-            }
-        }
-        LayoutKind::TopBottom => {
-            let content_sy = sy.saturating_sub(child_count.saturating_sub(1));
-            let old_total = children.iter().map(LayoutNode::sy).sum::<u32>().max(1);
-            let mut next_yoff = yoff;
-            let mut remaining_sy = content_sy;
-
-            for (index, child) in children.iter_mut().enumerate() {
-                let child_sy = if index + 1 == child_count as usize {
-                    remaining_sy
-                } else {
-                    let proposed =
-                        ((child.sy() as u64 * content_sy as u64) / old_total as u64).max(1) as u32;
-                    let max_allowed = remaining_sy.saturating_sub(child_count - index as u32 - 1);
-                    proposed.min(max_allowed)
-                };
-                resize_layout(child, sx, child_sy, xoff, next_yoff);
-                next_yoff = next_yoff.saturating_add(child_sy + 1);
-                remaining_sy = remaining_sy.saturating_sub(child_sy);
-            }
-        }
-    }
-}
-
-fn layout_without_pane(layout: &str, pane_id: &str) -> Option<String> {
-    let pane_id = parse_pane_number(pane_id)?;
-    let (_, body) = layout.split_once(',')?;
-    let mut index = 0;
-    let root = parse_layout_node(body, &mut index)?;
-    if index != body.len() {
-        return None;
-    }
-
-    let root_sx = root.sx();
-    let root_sy = root.sy();
-    let mut trimmed = remove_pane_from_layout(root, pane_id)?;
-    resize_layout(&mut trimmed, root_sx, root_sy, 0, 0);
-
-    let mut out = String::new();
-    trimmed.write_body(&mut out);
-    Some(format!("{:04x},{}", tmux_layout_checksum(&out), out))
-}
-
-/// Restore a window's saved layout (fire-and-forget, errors are logged).
-/// Skips restoration if the terminal width changed since save.
-async fn restore_window_layout<T: TmuxApi>(model: &mut Model, tmux: &mut T, window_id: &str) {
-    let layout = match model.sidebar.pane_layouts.get(window_id) {
-        Some((saved_w, layout)) => {
-            let (term_w, _) = model.terminal_size;
-            if *saved_w != term_w {
-                model.sidebar.pane_layouts.remove(window_id);
-                return;
-            }
-            layout.clone()
-        }
-        None => return,
-    };
-    if let Err(err) = tmux
-        .send_command(&format!(
-            "select-layout -t {} {}",
-            window_id,
-            quote_tmux(&layout)
-        ))
-        .await
-    {
-        warn!(%err, window = %window_id, "restore window layout failed (ignored)");
-    }
-}
-
-/// Choose the leftmost non-sidebar pane in a window.
-/// Ties are broken by `pane_top` to prefer top-left.
-async fn choose_leftmost_pane_in_window<T: TmuxApi>(
-    tmux: &mut T,
-    window_id: &str,
-    sidebar_pane_id: &str,
-) -> String {
-    let pane_list = tmux
-        .send_command(&format!(
-            "list-panes -t {} -F '#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}'",
-            window_id
-        ))
-        .await
-        .unwrap_or_default();
-
-    let mut best: Option<(u16, u16, String)> = None;
-    for line in pane_list.lines() {
-        let mut parts = line.split('\t');
-        let pane_id = parts.next().unwrap_or("").trim();
-        let pane_left: u16 = match parts.next().unwrap_or("").trim().parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let pane_top: u16 = match parts.next().unwrap_or("").trim().parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if pane_id.is_empty() || pane_id == sidebar_pane_id {
-            continue;
-        }
-
-        match &best {
-            Some((best_left, best_top, _))
-                if pane_left > *best_left || (pane_left == *best_left && pane_top >= *best_top) => {
-            }
-            _ => best = Some((pane_left, pane_top, pane_id.to_string())),
-        }
-    }
-
-    best.map(|(_, _, pane_id)| pane_id).unwrap_or_default()
 }
 
 pub async fn execute_commands<T: TmuxApi>(
@@ -1195,502 +680,6 @@ async fn handle_follow_to_window<T: TmuxApi>(
     queue.push_front(Cmd::CheckBorder);
 }
 
-async fn ensure_sidebar_width<T: TmuxApi>(model: &Model, tmux: &mut T) {
-    // Query current width to avoid unnecessary resize.
-    // Spurious resize-pane causes SIGWINCH on the right pane,
-    // making the cursor jump/flicker in the user's work area.
-    let width_cmd = commands::pane_width_query(&model.sidebar.pane_id);
-    let needs_resize = match tmux.send_command(&width_cmd).await {
-        Ok(output) => output.trim().parse::<u16>().unwrap_or(0) != SIDEBAR_WIDTH_CHARS,
-        Err(_) => true, // can't check, try resize anyway
-    };
-    if needs_resize {
-        if let Err(err) = tmux
-            .send_command(&commands::resize_pane_width(
-                &model.sidebar.pane_id,
-                SIDEBAR_WIDTH_CHARS,
-            ))
-            .await
-        {
-            warn!(%err, "ensure resize-pane failed");
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PaneGeom {
-    left: u32,
-    top: u32,
-}
-
-fn parse_layout_pane_line(line: &str) -> Option<(String, PaneGeom)> {
-    let mut parts = line.trim().split('\t');
-    let pane_id = parts.next()?.to_string();
-    let left = parts.next()?.parse().ok()?;
-    let top = parts.next()?.parse().ok()?;
-    Some((pane_id, PaneGeom { left, top }))
-}
-
-fn serialize_layout(root: &LayoutNode) -> String {
-    let mut out = String::new();
-    root.write_body(&mut out);
-    format!("{:04x},{}", tmux_layout_checksum(&out), out)
-}
-
-fn query_layout_root(layout: &str) -> Option<LayoutNode> {
-    let (_, body) = layout.split_once(',')?;
-    let mut index = 0;
-    let root = parse_layout_node(body, &mut index)?;
-    if index != body.len() {
-        return None;
-    }
-    Some(root)
-}
-
-fn content_pane_ids(panes: &[(String, PaneGeom)], sidebar_pane_id: &str) -> Vec<String> {
-    let mut content: Vec<(String, PaneGeom)> = panes
-        .iter()
-        .filter(|(id, _)| id != sidebar_pane_id)
-        .map(|(id, geom)| (id.clone(), *geom))
-        .collect();
-    content.sort_by(|(a_id, a_geom), (b_id, b_geom)| {
-        (a_geom.left, a_geom.top, a_id).cmp(&(b_geom.left, b_geom.top, b_id))
-    });
-    content.into_iter().map(|(id, _)| id).collect()
-}
-
-fn build_split_window_cmd(target: &str, current_path: Option<&str>) -> String {
-    match current_path {
-        Some(path) if !path.is_empty() => {
-            format!("split-window -d -t {target} -h -c {}", quote_tmux(path))
-        }
-        _ => format!("split-window -d -t {target} -h"),
-    }
-}
-
-fn shell_quote(input: &str) -> String {
-    format!("'{}'", input.replace('\'', "'\\''"))
-}
-
-fn build_cd_send_keys_cmd(target: &str, current_path: &str) -> String {
-    let command = format!("cd -- {}", shell_quote(current_path));
-    format!("send-keys -t {target} {} C-m", quote_tmux(&command))
-}
-
-fn is_shell_command(current_command: &str) -> bool {
-    let command = current_command.trim();
-    if command.is_empty() {
-        return true;
-    }
-
-    matches!(
-        command,
-        "sh" | "bash" | "zsh" | "fish" | "dash" | "ash" | "ksh" | "csh" | "tcsh" | "nu" | "pwsh"
-    )
-}
-
-fn split_even(total: u32, parts: usize) -> Vec<u32> {
-    let parts = parts as u32;
-    let base = total / parts;
-    let remainder = total % parts;
-    (0..parts)
-        .map(|index| base + u32::from(index < remainder))
-        .collect()
-}
-
-fn build_sidebar_main_3x2_layout(
-    root_sx: u32,
-    root_sy: u32,
-    sidebar_pane_id: u32,
-    content_pane_ids: &[u32],
-) -> Option<String> {
-    if content_pane_ids.len() != 6 || root_sx < 36 || root_sy < 3 {
-        return None;
-    }
-
-    let sidebar_sx = SIDEBAR_WIDTH_CHARS as u32;
-    if root_sx <= sidebar_sx + 3 {
-        return None;
-    }
-
-    let main_sx = root_sx.saturating_sub(sidebar_sx + 1);
-    let column_widths = split_even(main_sx.saturating_sub(2), 3);
-    let row_heights = split_even(root_sy.saturating_sub(1), 2);
-
-    let mut next_xoff = sidebar_sx + 1;
-    let mut columns = Vec::new();
-    for (column_index, width) in column_widths.into_iter().enumerate() {
-        let mut next_yoff = 0;
-        let mut rows = Vec::new();
-        for (row_index, height) in row_heights.iter().copied().enumerate() {
-            let pane_id = content_pane_ids[column_index * 2 + row_index];
-            rows.push(LayoutNode::Pane {
-                sx: width,
-                sy: height,
-                xoff: next_xoff,
-                yoff: next_yoff,
-                pane_id,
-            });
-            next_yoff = next_yoff.saturating_add(height + 1);
-        }
-        columns.push(LayoutNode::Split {
-            sx: width,
-            sy: root_sy,
-            xoff: next_xoff,
-            yoff: 0,
-            kind: LayoutKind::TopBottom,
-            children: rows,
-        });
-        next_xoff = next_xoff.saturating_add(width + 1);
-    }
-
-    let root = LayoutNode::Split {
-        sx: root_sx,
-        sy: root_sy,
-        xoff: 0,
-        yoff: 0,
-        kind: LayoutKind::LeftRight,
-        children: vec![
-            LayoutNode::Pane {
-                sx: sidebar_sx,
-                sy: root_sy,
-                xoff: 0,
-                yoff: 0,
-                pane_id: sidebar_pane_id,
-            },
-            LayoutNode::Split {
-                sx: main_sx,
-                sy: root_sy,
-                xoff: sidebar_sx + 1,
-                yoff: 0,
-                kind: LayoutKind::LeftRight,
-                children: columns,
-            },
-        ],
-    };
-
-    Some(serialize_layout(&root))
-}
-
-async fn reapply_helper_layout_if_needed<T: TmuxApi>(
-    model: &mut Model,
-    tmux: &mut T,
-    window_id: &str,
-) {
-    if !model.sidebar.helper_managed_windows.contains(window_id) {
-        return;
-    }
-
-    let list_cmd = format!(
-        "list-panes -t {} -F '#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}'",
-        window_id
-    );
-    let Ok(output) = tmux.send_command(&list_cmd).await else {
-        return;
-    };
-
-    let panes: Vec<(String, PaneGeom)> =
-        output.lines().filter_map(parse_layout_pane_line).collect();
-    let content_ids = content_pane_ids(&panes, &model.sidebar.pane_id);
-    if content_ids.len() != 6 {
-        return;
-    }
-
-    let Some(layout) = query_window_layout(tmux, window_id).await else {
-        return;
-    };
-    let Some(root) = query_layout_root(&layout) else {
-        return;
-    };
-    let Some(sidebar_pane_id) = parse_pane_number(&model.sidebar.pane_id) else {
-        return;
-    };
-
-    let mut content_pane_numbers = Vec::with_capacity(content_ids.len());
-    for pane_id in &content_ids {
-        let Some(pane_number) = parse_pane_number(pane_id) else {
-            return;
-        };
-        content_pane_numbers.push(pane_number);
-    }
-
-    let Some(explicit_layout) =
-        build_sidebar_main_3x2_layout(root.sx(), root.sy(), sidebar_pane_id, &content_pane_numbers)
-    else {
-        return;
-    };
-
-    suppress_sidebar_layout_validation(model);
-    let _ = tmux
-        .send_command(&format!(
-            "select-layout -t {} {}",
-            window_id,
-            quote_tmux(&explicit_layout)
-        ))
-        .await;
-}
-
-fn suppress_sidebar_layout_validation(model: &mut Model) {
-    model.sidebar.ignore_layout_change_until = Some(
-        std::time::Instant::now() + std::time::Duration::from_millis(LAYOUT_CHANGE_SUPPRESSION_MS),
-    );
-}
-
-async fn validate_sidebar_panes<T: TmuxApi>(
-    model: &Model,
-    tmux: &mut T,
-    queue: &mut VecDeque<Cmd>,
-) {
-    let pane_list = tmux
-        .send_command(&format!(
-            "list-panes -t {} -F '#{{pane_id}}'",
-            model.sidebar.window_id
-        ))
-        .await
-        .unwrap_or_default();
-
-    let has_content = pane_list
-        .lines()
-        .map(|l| l.trim())
-        .any(|l| !l.is_empty() && l != model.sidebar.pane_id);
-
-    if !has_content {
-        debug!(
-            window = %model.sidebar.window_id,
-            "sidebar window lost all content panes, evacuating"
-        );
-        match &model.sidebar.preview {
-            PreviewState::Previewing { .. } => {
-                queue.push_front(Cmd::ListWindows);
-                queue.push_front(Cmd::RestorePreview);
-            }
-            PreviewState::Home => {
-                let sidebar_wid = model.sidebar.window_id.clone();
-                if let Some(other_id) = model.find_another_window_id(&sidebar_wid) {
-                    queue.push_front(Cmd::ListWindows);
-                    queue.push_front(Cmd::FollowToWindow {
-                        window_id: other_id,
-                    });
-                }
-            }
-        }
-    }
-}
-
-async fn apply_layout_helper<T: TmuxApi>(
-    model: &mut Model,
-    tmux: &mut T,
-    queue: &mut VecDeque<Cmd>,
-) {
-    suppress_sidebar_layout_validation(model);
-    let list_cmd = format!(
-        "list-panes -t {} -F '#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}'",
-        model.sidebar.window_id
-    );
-    let Ok(output) = tmux.send_command(&list_cmd).await else {
-        model.error_message = Some("layout helper: list-panes failed".to_string());
-        queue.push_front(Cmd::Render);
-        return;
-    };
-
-    let mut panes: Vec<(String, PaneGeom)> =
-        output.lines().filter_map(parse_layout_pane_line).collect();
-    let initial_content_ids: HashSet<String> = content_pane_ids(&panes, &model.sidebar.pane_id)
-        .into_iter()
-        .collect();
-    let content_count = initial_content_ids.len();
-    if content_count == 0 {
-        model.error_message = Some("layout helper: no content pane".to_string());
-        queue.push_front(Cmd::Render);
-        return;
-    }
-    if content_count > 6 {
-        model.error_message = Some("layout helper: too many panes".to_string());
-        queue.push_front(Cmd::Render);
-        return;
-    }
-
-    let base_pane_id = content_pane_ids(&panes, &model.sidebar.pane_id)
-        .into_iter()
-        .next()
-        .expect("content_count > 0 ensures content pane exists");
-    let base_current_path = query_pane_current_path(tmux, &base_pane_id).await;
-
-    let mut splits_needed = 6usize.saturating_sub(content_count);
-    while splits_needed > 0 {
-        let target = panes
-            .iter()
-            .filter(|(id, _)| id != &model.sidebar.pane_id)
-            .max_by_key(|(_, geom)| (geom.left, geom.top))
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| model.sidebar.pane_id.clone());
-        let split_cmd = build_split_window_cmd(&target, base_current_path.as_deref());
-        if let Err(err) = tmux.send_command(&split_cmd).await {
-            model.error_message = Some(format!("layout helper: {err}"));
-            queue.push_front(Cmd::Render);
-            return;
-        }
-        let Ok(refreshed) = tmux.send_command(&list_cmd).await else {
-            model.error_message = Some("layout helper: refresh failed".to_string());
-            queue.push_front(Cmd::Render);
-            return;
-        };
-        panes = refreshed
-            .lines()
-            .filter_map(parse_layout_pane_line)
-            .collect();
-        splits_needed -= 1;
-    }
-
-    let Some(layout) = query_window_layout(tmux, &model.sidebar.window_id).await else {
-        model.error_message = Some("layout helper: layout query failed".to_string());
-        queue.push_front(Cmd::Render);
-        return;
-    };
-
-    let Some(root) = query_layout_root(&layout) else {
-        model.error_message = Some("layout helper: layout parse failed".to_string());
-        queue.push_front(Cmd::Render);
-        return;
-    };
-
-    let content_ids = content_pane_ids(&panes, &model.sidebar.pane_id);
-    let Some(sidebar_pane_id) = parse_pane_number(&model.sidebar.pane_id) else {
-        model.error_message = Some("layout helper: invalid sidebar pane".to_string());
-        queue.push_front(Cmd::Render);
-        return;
-    };
-    let mut content_pane_numbers = Vec::with_capacity(content_ids.len());
-    for pane_id in &content_ids {
-        let Some(pane_number) = parse_pane_number(pane_id) else {
-            model.error_message = Some("layout helper: invalid pane id".to_string());
-            queue.push_front(Cmd::Render);
-            return;
-        };
-        content_pane_numbers.push(pane_number);
-    }
-    let Some(explicit_layout) =
-        build_sidebar_main_3x2_layout(root.sx(), root.sy(), sidebar_pane_id, &content_pane_numbers)
-    else {
-        model.error_message = Some("layout helper: window too small".to_string());
-        queue.push_front(Cmd::Render);
-        return;
-    };
-
-    if let Err(err) = tmux
-        .send_command(&format!(
-            "select-layout -t {} {}",
-            model.sidebar.window_id,
-            quote_tmux(&explicit_layout)
-        ))
-        .await
-    {
-        model.error_message = Some(format!("layout helper: {err}"));
-        queue.push_front(Cmd::Render);
-        return;
-    }
-
-    let disable_rename = commands::disable_window_rename(&model.sidebar.window_id);
-    if let Err(err) = tmux.send_command(&disable_rename).await {
-        warn!(
-            window_id = %model.sidebar.window_id,
-            %err,
-            "layout helper: failed to disable automatic rename"
-        );
-    }
-
-    let top = &content_ids[4];
-    let bottom = &content_ids[5];
-
-    let helper_already_managed = model
-        .sidebar
-        .helper_managed_windows
-        .contains(&model.sidebar.window_id);
-    let top_is_new = !initial_content_ids.contains(top);
-    let bottom_is_new = !initial_content_ids.contains(bottom);
-    let needs_existing_pane_commands = !helper_already_managed && (!top_is_new || !bottom_is_new);
-    let pane_commands: HashMap<String, String> = if needs_existing_pane_commands {
-        let commands_cmd = format!(
-            "list-panes -t {} -F '#{{pane_id}}\t#{{pane_current_command}}'",
-            model.sidebar.window_id
-        );
-        tmux.send_command(&commands_cmd)
-            .await
-            .ok()
-            .map(|output| {
-                output
-                    .lines()
-                    .filter_map(|line| {
-                        let mut parts = line.trim().split('\t');
-                        Some((parts.next()?.to_string(), parts.next()?.to_string()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
-
-    let can_initialize_existing_pane = |pane_id: &String| {
-        pane_commands
-            .get(pane_id)
-            .is_some_and(|cmd| is_shell_command(cmd))
-    };
-
-    if let Some(base_current_path) = base_current_path.as_deref() {
-        for pane_id in &content_ids {
-            let is_new = !initial_content_ids.contains(pane_id);
-            let is_helper_slot = pane_id == top || pane_id == bottom;
-            let should_send_cd = if is_new {
-                true
-            } else if !helper_already_managed && is_helper_slot {
-                can_initialize_existing_pane(pane_id)
-            } else {
-                false
-            };
-
-            if should_send_cd {
-                let _ = tmux
-                    .send_command(&build_cd_send_keys_cmd(pane_id, base_current_path))
-                    .await;
-            }
-        }
-    }
-
-    if !helper_already_managed {
-        if top_is_new || can_initialize_existing_pane(top) {
-            let _ = tmux
-                .send_command(&format!("send-keys -t {top} lazygit C-m"))
-                .await;
-        }
-        if bottom_is_new || can_initialize_existing_pane(bottom) {
-            let _ = tmux
-                .send_command(&format!("send-keys -t {bottom} yazi C-m"))
-                .await;
-        }
-    }
-    let _ = tmux
-        .send_command(&commands::resize_pane_width(
-            &model.sidebar.pane_id,
-            SIDEBAR_WIDTH_CHARS,
-        ))
-        .await;
-    model.info_message = Some(
-        if helper_already_managed {
-            "layout helper refreshed"
-        } else {
-            "layout helper applied"
-        }
-        .to_string(),
-    );
-    model
-        .sidebar
-        .helper_managed_windows
-        .insert(model.sidebar.window_id.clone());
-    queue.push_front(Cmd::Render);
-    queue.push_front(Cmd::ListWindows);
-}
-
 async fn handle_list_windows<T: TmuxApi>(
     model: &mut Model,
     tmux: &mut T,
@@ -1722,142 +711,9 @@ async fn handle_list_windows<T: TmuxApi>(
     }
 }
 
-async fn poll_ai_processes<T: TmuxApi>(model: &mut Model, tmux: &mut T, queue: &mut VecDeque<Cmd>) {
-    // If suppressing output after window switch, discard counts.
-    if model.ai.output_suppress > 0 {
-        model.ai.output_suppress -= 1;
-        model.ai.output_counts.clear();
-    }
-    if model.ai.poll_skip_ticks > 0 {
-        model.ai.poll_skip_ticks -= 1;
-        return;
-    }
-    let list_cmd = format!(
-        "list-panes -s -t {} -F '#{{window_id}}\t#{{pane_id}}\t#{{pane_current_command}}\t#{{pane_pid}}'",
-        model.session_name
-    );
-    match tmux.send_command(&list_cmd).await {
-        Ok(output) => {
-            let candidates = find_ai_pane_candidates(&output, &model.sidebar.pane_id);
-            if candidates.is_empty() {
-                model.ai.cpu_tracker.clear();
-                model.ai.output_counts.clear();
-                schedule_ai_poll_backoff(model);
-                enqueue_follow_up(
-                    queue,
-                    update(
-                        model,
-                        Msg::AiProcessPollResult {
-                            panes: HashSet::new(),
-                            windows: HashSet::new(),
-                        },
-                    ),
-                );
-                return;
-            }
-
-            let prev_cpu = std::mem::take(&mut model.ai.cpu_tracker);
-            let output_counts = std::mem::take(&mut model.ai.output_counts);
-            let candidate_count = candidates.len();
-            model.ai.idle_polls = 0;
-            model.ai.poll_skip_ticks = 0;
-            let classify_started_at = std::time::Instant::now();
-            match tokio::task::spawn_blocking(move || {
-                let mut prev_cpu = prev_cpu;
-                let mut output_counts = output_counts;
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    classify_active_panes(&candidates, &mut prev_cpu, &mut output_counts)
-                }));
-                match result {
-                    Ok((panes, windows)) => Ok((panes, windows, prev_cpu, output_counts)),
-                    Err(_) => Err((prev_cpu, output_counts)),
-                }
-            })
-            .await
-            {
-                Ok(Ok((panes, windows, prev_cpu, output_counts))) => {
-                    model.ai.cpu_tracker = prev_cpu;
-                    model.ai.output_counts = output_counts;
-                    tracing::trace!(
-                        candidates = candidate_count,
-                        elapsed_us = classify_started_at.elapsed().as_micros() as u64,
-                        "ai classification completed"
-                    );
-                    enqueue_follow_up(
-                        queue,
-                        update(model, Msg::AiProcessPollResult { panes, windows }),
-                    );
-                }
-                Ok(Err((prev_cpu, output_counts))) => {
-                    model.ai.cpu_tracker = prev_cpu;
-                    model.ai.output_counts = output_counts;
-                    warn!("ai classification panicked; restored tracking state");
-                }
-                Err(err) => {
-                    warn!(%err, "ai classification task failed");
-                }
-            }
-        }
-        Err(err) => {
-            debug!(%err, "ai process poll failed");
-        }
-    }
-}
-
-fn schedule_ai_poll_backoff(model: &mut Model) {
-    model.ai.idle_polls = model.ai.idle_polls.saturating_add(1);
-    model.ai.poll_skip_ticks = match model.ai.idle_polls {
-        0..=3 => 0,
-        4..=7 => 1,
-        8..=15 => 2,
-        16..=31 => 4,
-        _ => 8,
-    };
-}
-
 fn enqueue_follow_up(queue: &mut VecDeque<Cmd>, follow_up: Vec<Cmd>) {
     for cmd in follow_up.into_iter().rev() {
         queue.push_front(cmd);
-    }
-}
-
-async fn check_border<T: TmuxApi>(model: &mut Model, tmux: &mut T) {
-    let wanted: HashSet<String> = model.ai.panes.clone();
-    let current = &model.ai.highlighted_panes;
-
-    // Collect all border changes and batch into a single tmux command
-    // to minimize server round-trips and reduce cursor flicker.
-    let to_remove: Vec<String> = current.difference(&wanted).cloned().collect();
-    let to_add: Vec<String> = wanted.difference(current).cloned().collect();
-
-    if !to_remove.is_empty() || !to_add.is_empty() {
-        let mut parts: Vec<String> = Vec::new();
-        for pane_id in &to_remove {
-            parts.push(format!(
-                "set-option -p -t {} -u pane-border-format",
-                pane_id
-            ));
-            debug!(pane = %pane_id, "pane border format reset");
-        }
-        for pane_id in &to_add {
-            parts.push(format!(
-                "set-option -p -t {} pane-border-format \" #{{?pane_active,#[fg=yellow#,bold]● #P: #{{pane_current_command}} #{{pane_current_path}},#[fg=yellow]● #P: #{{pane_current_command}}}} \"",
-                pane_id
-            ));
-            debug!(pane = %pane_id, "pane border format set to AI active");
-        }
-        let batch = parts.join(" ; ");
-        let _ = tmux.send_command(&batch).await;
-    }
-
-    model.ai.highlighted_panes = wanted;
-}
-
-async fn reset_all_borders<T: TmuxApi>(model: &mut Model, tmux: &mut T) {
-    for pane_id in model.ai.highlighted_panes.drain() {
-        let reset_cmd = format!("set-option -p -t {} -u pane-border-format", pane_id);
-        let _ = tmux.send_command(&reset_cmd).await;
-        debug!(pane = %pane_id, "pane border format reset on cleanup");
     }
 }
 
@@ -1925,362 +781,6 @@ async fn send_batch_with_reconcile<T: TmuxApi>(
         return Err(err);
     }
     Ok(())
-}
-
-async fn reconcile_sidebar_state<T: TmuxApi>(model: &mut Model, tmux: &mut T) {
-    let mut window_updated = false;
-    let current_window = tmux
-        .send_command(&format!(
-            "display-message -t {} -p '#{{window_id}}'",
-            model.sidebar.pane_id
-        ))
-        .await
-        .ok()
-        .map(|out| out.trim().to_string())
-        .filter(|v| !v.is_empty());
-
-    if let Some(window_id) = current_window {
-        if model.sidebar.window_id != window_id {
-            info!(
-                old = %model.sidebar.window_id,
-                new = %window_id,
-                "reconcile: sidebar window id updated"
-            );
-        }
-        model.sidebar.window_id = window_id;
-        window_updated = true;
-    }
-
-    let new_home =
-        choose_home_pane_in_window(tmux, &model.sidebar.window_id, &model.sidebar.pane_id).await;
-    if !new_home.is_empty() {
-        if model.sidebar.home_pane_id != new_home {
-            info!(
-                old = %model.sidebar.home_pane_id,
-                new = %new_home,
-                window = %model.sidebar.window_id,
-                "reconcile: home pane id updated"
-            );
-        }
-        model.sidebar.home_pane_id = new_home;
-    } else if window_updated {
-        warn!(
-            window = %model.sidebar.window_id,
-            "reconcile: could not determine non-sidebar home pane"
-        );
-    }
-}
-
-async fn choose_home_pane_in_window<T: TmuxApi>(
-    tmux: &mut T,
-    window_id: &str,
-    sidebar_pane_id: &str,
-) -> String {
-    let pane_list = tmux
-        .send_command(&format!(
-            "list-panes -t {} -F '#{{pane_id}}\t#{{pane_active}}'",
-            window_id
-        ))
-        .await
-        .unwrap_or_default();
-
-    let mut first_non_sidebar = String::new();
-    for line in pane_list.lines() {
-        let mut parts = line.split('\t');
-        let pane_id = parts.next().unwrap_or("").trim();
-        let active = parts.next().unwrap_or("").trim();
-        if pane_id.is_empty() || pane_id == sidebar_pane_id {
-            continue;
-        }
-        if first_non_sidebar.is_empty() {
-            first_non_sidebar = pane_id.to_string();
-        }
-        if active == "1" {
-            return pane_id.to_string();
-        }
-    }
-
-    first_non_sidebar
-}
-
-const AI_PROCESS_NAMES: &[&str] = &["claude", "codex", "gemini", "opencode"];
-
-fn is_ai_process_name(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    AI_PROCESS_NAMES
-        .iter()
-        .any(|ai_name| lower.contains(ai_name))
-}
-
-#[derive(Clone)]
-struct AiPaneCandidate {
-    pane_id: String,
-    window_id: String,
-    pane_pid: u32,
-}
-
-/// Parse tmux list-panes output to find panes running AI processes.
-fn find_ai_pane_candidates(output: &str, sidebar_pane_id: &str) -> Vec<AiPaneCandidate> {
-    let mut candidates = Vec::new();
-    for line in output.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 4 {
-            continue;
-        }
-        let window_id = parts[0].trim();
-        let pane_id = parts[1].trim();
-        let command = parts[2].trim();
-        let pid_str = parts[3].trim();
-
-        if pane_id == sidebar_pane_id {
-            continue;
-        }
-
-        if !is_ai_process_name(command) {
-            continue;
-        }
-
-        if let Ok(pane_pid) = pid_str.parse::<u32>() {
-            candidates.push(AiPaneCandidate {
-                pane_id: pane_id.to_string(),
-                window_id: window_id.to_string(),
-                pane_pid,
-            });
-        }
-    }
-    candidates
-}
-
-/// Number of consecutive idle polls before demoting an AI pane to inactive.
-/// At 500ms poll interval, 6 polls = 3 seconds of grace after last activity.
-/// Grace covers brief pauses between streaming chunks and tool calls.
-/// Thinking phases sustain grace via CPU (delta >= MIN_CPU_DELTA_FOR_GRACE).
-const AI_CPU_GRACE_POLLS: u16 = 6;
-
-/// Minimum %output events per poll interval to count as streaming.
-/// Streaming generates 6-100+ events/s; typing noise is typically 1-4/s
-/// with occasional spikes to 6-8 during fast English input.
-const MIN_OUTPUT_BURST: u32 = 6;
-
-/// Consecutive polls with output bursts required before activating a pane.
-/// Prevents false activation from typing in TUI apps (e.g. Claude Code input
-/// causes brief %output bursts from UI redraws, but doesn't sustain across polls).
-/// AI streaming sustains bursts across many consecutive polls.
-const MIN_CONSECUTIVE_BURSTS: u8 = 2;
-
-/// Minimum CPU delta (ticks/poll) required to sustain grace period.
-/// Must be high enough to filter out warm-idle background CPU (0-15 typical,
-/// spikes to ~50). Active thinking/tool execution drives 100+ consistently.
-const MIN_CPU_DELTA_FOR_GRACE: u64 = 50;
-
-/// Enable verbose per-pane logging in classify_active_panes.
-const AI_DEBUG: bool = false;
-
-/// Maximum depth when walking the process tree to sum CPU ticks.
-/// Prevents runaway traversal on deeply nested process hierarchies.
-const MAX_PROC_TREE_DEPTH: u8 = 8;
-
-/// Determine which AI panes are actively working using %output as the
-/// primary signal and CPU as a secondary grace-sustaining signal.
-///
-/// Design principle: **%output-primary, CPU-secondary**
-/// - Only sustained %output bursts can ACTIVATE a pane (idle → active)
-/// - Activation requires MIN_CONSECUTIVE_BURSTS consecutive polls with bursts
-///   to filter out brief UI redraw noise from typing in TUI apps
-/// - CPU activity can only SUSTAIN an already-active pane during grace
-/// - This prevents warm idle sessions (high background CPU) from false-activating
-///
-/// Activation: consecutive polls with burst >= MIN_CONSECUTIVE_BURSTS
-/// Grace sustain: CPU delta >= MIN_CPU_DELTA_FOR_GRACE (still computing)
-/// Grace expiry: neither signal for AI_CPU_GRACE_POLLS consecutive polls
-///
-/// Output counts are reset after each call (consumed per poll).
-/// Returns (active_pane_ids, active_window_ids).
-fn classify_active_panes(
-    candidates: &[AiPaneCandidate],
-    prev_cpu: &mut HashMap<String, (u32, u64, u16, u8)>,
-    output_counts: &mut HashMap<String, u32>,
-) -> (HashSet<String>, HashSet<String>) {
-    let mut active_panes = HashSet::new();
-    let mut active_windows = HashSet::new();
-    let mut seen_panes = HashSet::new();
-
-    for c in candidates {
-        seen_panes.insert(c.pane_id.clone());
-
-        let ai_pid = find_ai_child_pid(c.pane_pid).unwrap_or(c.pane_pid);
-        let current_cpu = read_cpu_ticks_tree(ai_pid).unwrap_or(0);
-
-        let output_count = output_counts.get(&c.pane_id).copied().unwrap_or(0);
-        let is_burst = output_count >= MIN_OUTPUT_BURST;
-
-        // polls_since_active semantics:
-        //   0 = never been active / fully idle
-        //   1 = active right now (just activated or reactivated by streaming)
-        //   2..=GRACE = was active, grace period counting down
-        //   >GRACE = demoted to idle
-        // consecutive_bursts: how many consecutive polls had output bursts.
-        //   Activation requires >= MIN_CONSECUTIVE_BURSTS to filter out
-        //   brief UI redraw noise from typing in TUI apps.
-        let (is_active, new_polls, new_bursts) =
-            if let Some(&(prev_pid, prev_ticks, polls, bursts)) = prev_cpu.get(&c.pane_id) {
-                if prev_pid != ai_pid {
-                    // PID changed — reset tracking
-                    let b = if is_burst { 1 } else { 0 };
-                    let activated = b >= MIN_CONSECUTIVE_BURSTS;
-                    (activated, if activated { 1 } else { 0 }, b)
-                } else if is_burst {
-                    let b = bursts.saturating_add(1);
-                    if polls >= 1 {
-                        // Already active — sustained streaming resets grace
-                        (true, 1, b)
-                    } else if b >= MIN_CONSECUTIVE_BURSTS {
-                        // Was idle, now enough consecutive bursts to activate
-                        (true, 1, b)
-                    } else {
-                        // Burst seen but not enough consecutive ones yet
-                        (false, 0, b)
-                    }
-                } else if polls == 0 {
-                    (false, 0, 0)
-                } else if polls <= AI_CPU_GRACE_POLLS {
-                    if output_count > 0 {
-                        // Any output sustains an already-active pane (spinner, etc.)
-                        (true, 1, 0)
-                    } else {
-                        let cpu_delta = current_cpu.saturating_sub(prev_ticks);
-                        if cpu_delta >= MIN_CPU_DELTA_FOR_GRACE {
-                            (true, 1, 0)
-                        } else {
-                            let new_polls = polls.saturating_add(1);
-                            (new_polls <= AI_CPU_GRACE_POLLS, new_polls, 0)
-                        }
-                    }
-                } else {
-                    (false, 0, 0)
-                }
-            } else {
-                // First time seeing this pane — start counting
-                let b = if is_burst { 1 } else { 0 };
-                (false, 0, b)
-            };
-
-        if AI_DEBUG {
-            let prev_info = prev_cpu.get(&c.pane_id);
-            let prev_ticks = prev_info.map(|&(_, t, _, _)| t).unwrap_or(0);
-            let prev_polls = prev_info.map(|&(_, _, p, _)| p).unwrap_or(0);
-            let prev_bursts = prev_info.map(|&(_, _, _, b)| b).unwrap_or(0);
-            let cpu_delta = current_cpu.saturating_sub(prev_ticks);
-            let single_cpu = read_cpu_ticks(ai_pid).unwrap_or(0);
-            let single_delta = single_cpu.saturating_sub(prev_ticks);
-            debug!(
-                pane = %c.pane_id,
-                window = %c.window_id,
-                ai_pid,
-                cpu_delta,
-                single_delta,
-                output_count,
-                is_burst,
-                prev_polls,
-                new_polls,
-                prev_bursts,
-                new_bursts,
-                is_active,
-                "ai classify"
-            );
-        }
-
-        prev_cpu.insert(
-            c.pane_id.clone(),
-            (ai_pid, current_cpu, new_polls, new_bursts),
-        );
-
-        if is_active {
-            active_panes.insert(c.pane_id.clone());
-            active_windows.insert(c.window_id.clone());
-        }
-    }
-
-    prev_cpu.retain(|k, _| seen_panes.contains(k));
-    output_counts.clear();
-
-    (active_panes, active_windows)
-}
-
-/// Walk /proc to find the AI process that is a child of the pane's shell.
-fn find_ai_child_pid(pane_pid: u32) -> Option<u32> {
-    let children_path = format!("/proc/{}/task/{}/children", pane_pid, pane_pid);
-    let children = std::fs::read_to_string(&children_path).ok()?;
-    for child_str in children.split_whitespace() {
-        let child_pid: u32 = child_str.parse().ok()?;
-        let comm_path = format!("/proc/{}/comm", child_pid);
-        if let Ok(comm) = std::fs::read_to_string(&comm_path) {
-            if is_ai_process_name(comm.trim()) {
-                return Some(child_pid);
-            }
-        }
-    }
-    None
-}
-
-/// Read CPU time (utime + stime) from /proc/<pid>/stat.
-fn read_cpu_ticks(pid: u32) -> Option<u64> {
-    let path = format!("/proc/{}/stat", pid);
-    let content = std::fs::read_to_string(&path).ok()?;
-    // comm field can contain spaces/parens, so find last ')' first
-    let after_comm = content.rsplit_once(')')?.1;
-    let fields: Vec<&str> = after_comm.split_whitespace().collect();
-    // After ')': [0]=state [1]=ppid ... [11]=utime [12]=stime
-    let utime: u64 = fields.get(11)?.parse().ok()?;
-    let stime: u64 = fields.get(12)?.parse().ok()?;
-    Some(utime + stime)
-}
-
-/// Read aggregate CPU time (utime + stime) across the entire process tree
-/// rooted at `pid`. Walks descendants via `/proc/PID/task/TID/children` to
-/// capture CPU from subprocesses (e.g. Claude Code spawning multiple subagents).
-fn read_cpu_ticks_tree(pid: u32) -> Option<u64> {
-    let root_cpu = read_cpu_ticks(pid)?;
-    let mut total = root_cpu;
-
-    // Iterative BFS with depth limit
-    let mut stack: Vec<(u32, u8)> = vec![(pid, 0)];
-    while let Some((current_pid, depth)) = stack.pop() {
-        if depth >= MAX_PROC_TREE_DEPTH {
-            continue;
-        }
-        // Read children from all TIDs of this process (multi-threaded processes
-        // may have children attached to non-main threads)
-        let task_dir = format!("/proc/{}/task", current_pid);
-        let tasks = match std::fs::read_dir(&task_dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        for task_entry in tasks {
-            let tid = match task_entry {
-                Ok(e) => e.file_name(),
-                Err(_) => continue,
-            };
-            let children_path = format!(
-                "/proc/{}/task/{}/children",
-                current_pid,
-                tid.to_string_lossy()
-            );
-            let children = match std::fs::read_to_string(&children_path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            for child_str in children.split_whitespace() {
-                if let Ok(child_pid) = child_str.parse::<u32>() {
-                    if let Some(child_cpu) = read_cpu_ticks(child_pid) {
-                        total += child_cpu;
-                    }
-                    stack.push((child_pid, depth + 1));
-                }
-            }
-        }
-    }
-    Some(total)
 }
 
 #[cfg(test)]
@@ -2941,8 +1441,7 @@ mod tests {
 
         let mut tmux = FakeTmux::new(vec![
             Err("batch failed".to_string()),
-            Ok("@new\n".to_string()),
-            Ok("%sidebar\t1\n%home_new\t0\n".to_string()),
+            Ok("@new\t%sidebar\t0\n@new\t%home_new\t1\n".to_string()),
         ]);
 
         let err = send_batch_with_reconcile(&mut model, &mut tmux, "join-pane ; resize-pane")
@@ -2952,9 +1451,32 @@ mod tests {
         assert_eq!(err, "batch failed");
         assert_eq!(model.sidebar.window_id, "@new");
         assert_eq!(model.sidebar.home_pane_id, "%home_new");
-        assert_eq!(tmux.commands.len(), 3);
-        assert!(tmux.commands[1].contains("display-message -t %sidebar -p '#{window_id}'"));
-        assert!(tmux.commands[2].contains("list-panes -t @new"));
+        assert_eq!(tmux.commands.len(), 2);
+        assert!(tmux.commands[1].contains("list-panes -s -t s"));
+    }
+
+    #[tokio::test]
+    async fn batch_failure_reconcile_falls_back_when_session_scan_misses_sidebar() {
+        let mut model = test_model();
+
+        let mut tmux = FakeTmux::new(vec![
+            Err("batch failed".to_string()),
+            Ok("@else\t%other\t1\n".to_string()),
+            Ok("@new\n".to_string()),
+            Ok("%sidebar\t0\n%home_new\t1\n".to_string()),
+        ]);
+
+        let err = send_batch_with_reconcile(&mut model, &mut tmux, "join-pane ; resize-pane")
+            .await
+            .expect_err("batch should fail");
+
+        assert_eq!(err, "batch failed");
+        assert_eq!(model.sidebar.window_id, "@new");
+        assert_eq!(model.sidebar.home_pane_id, "%home_new");
+        assert_eq!(tmux.commands.len(), 4);
+        assert!(tmux.commands[1].contains("list-panes -s -t s"));
+        assert!(tmux.commands[2].contains("display-message -t %sidebar -p '#{window_id}'"));
+        assert!(tmux.commands[3].contains("list-panes -t @new"));
     }
 
     #[tokio::test]
@@ -2964,8 +1486,7 @@ mod tests {
             vec![
                 Ok("/work/project\n".to_string()),
                 Err("boom".to_string()),
-                Ok("@new\n".to_string()),
-                Ok("%home_new\t1\n".to_string()),
+                Ok("@new\t%sidebar\t0\n@new\t%home_new\t1\n".to_string()),
             ],
             vec![Ok(vec![wi("@new", 1, "scratch")])],
         );
@@ -2976,7 +1497,7 @@ mod tests {
         assert_eq!(model.error_message.as_deref(), Some("new-window: boom"));
         assert_eq!(model.sidebar.window_id, "@new");
         assert_eq!(model.sidebar.home_pane_id, "%home_new");
-        assert_eq!(tmux.commands.len(), 4);
+        assert_eq!(tmux.commands.len(), 3);
         assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
         assert!(queue.is_empty());
     }
@@ -2988,8 +1509,7 @@ mod tests {
             vec![
                 Ok(String::new()),
                 Err("rename failed".to_string()),
-                Ok("@renamed\n".to_string()),
-                Ok("%home_new\t1\n".to_string()),
+                Ok("@renamed\t%sidebar\t0\n@renamed\t%home_new\t1\n".to_string()),
             ],
             vec![Ok(vec![wi("@renamed", 1, "proj:tab3")])],
         );
@@ -3010,7 +1530,7 @@ mod tests {
         );
         assert_eq!(model.sidebar.window_id, "@renamed");
         assert_eq!(model.sidebar.home_pane_id, "%home_new");
-        assert_eq!(tmux.commands.len(), 4);
+        assert_eq!(tmux.commands.len(), 3);
         assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
         assert!(queue.is_empty());
     }
@@ -3021,8 +1541,7 @@ mod tests {
         let mut tmux = FakeTmux::with_window_lists(
             vec![
                 Err("swap failed".to_string()),
-                Ok("@new\n".to_string()),
-                Ok("%home_new\t1\n".to_string()),
+                Ok("@new\t%sidebar\t0\n@new\t%home_new\t1\n".to_string()),
             ],
             vec![
                 Ok(vec![wi("@1", 1, "proj:edit"), wi("@2", 2, "proj:term")]),
@@ -3047,7 +1566,7 @@ mod tests {
         assert_eq!(model.sidebar.window_id, "@new");
         assert_eq!(model.sidebar.home_pane_id, "%home_new");
         assert_eq!(model.reorder.pending_selection, None);
-        assert_eq!(tmux.commands.len(), 3);
+        assert_eq!(tmux.commands.len(), 2);
         assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
         assert!(queue.is_empty());
     }
@@ -3058,8 +1577,7 @@ mod tests {
         let mut tmux = FakeTmux::with_window_lists(
             vec![
                 Err("kill failed".to_string()),
-                Ok("@new\n".to_string()),
-                Ok("%home_new\t1\n".to_string()),
+                Ok("@new\t%sidebar\t0\n@new\t%home_new\t1\n".to_string()),
             ],
             vec![Ok(vec![wi("@new", 1, "scratch")])],
         );
@@ -3073,7 +1591,7 @@ mod tests {
         );
         assert_eq!(model.sidebar.window_id, "@new");
         assert_eq!(model.sidebar.home_pane_id, "%home_new");
-        assert_eq!(tmux.commands.len(), 3);
+        assert_eq!(tmux.commands.len(), 2);
         assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
         assert!(queue.is_empty());
     }

@@ -1,4 +1,5 @@
 use std::env;
+use std::path::Path;
 
 use anyhow::Result;
 use tokio::process::Command;
@@ -44,6 +45,7 @@ pub async fn launch_if_needed() -> Result<()> {
 async fn launch_from_inside_tmux(session: &str, inner_cmd: &str) -> Result<()> {
     let current_session = detect_session_name().await;
     ensure_session_exists(session)?;
+    replace_existing_sidebars(session)?;
 
     if current_session != session {
         let sidebar_pane = split_sidebar_in_session(session, inner_cmd, true)?;
@@ -58,6 +60,7 @@ async fn launch_from_inside_tmux(session: &str, inner_cmd: &str) -> Result<()> {
 
 fn launch_from_outside_tmux(session: &str, inner_cmd: &str) -> Result<()> {
     ensure_session_exists(session)?;
+    replace_existing_sidebars(session)?;
     let sidebar_pane = split_sidebar_in_session(session, inner_cmd, true)?;
     select_pane(&sidebar_pane)?;
     attach_to_session(session)?;
@@ -201,6 +204,88 @@ fn disable_window_rename_options(target: &str) {
     let _ = set_window_option(target, "allow-rename", "off");
 }
 
+fn replace_existing_sidebars(session: &str) -> Result<()> {
+    let current_pane = env::var("TMUX_PANE").ok();
+    for pane_id in existing_sidebar_panes(session)? {
+        if current_pane.as_deref() == Some(pane_id.as_str()) {
+            continue;
+        }
+
+        let status = tmux_status(&["kill-pane", "-t", &pane_id])?;
+        if !status.success() {
+            anyhow::bail!(
+                "failed to replace existing tide sidebar pane '{}' in session '{}'",
+                pane_id,
+                session
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn existing_sidebar_panes(session: &str) -> Result<Vec<String>> {
+    let exe_name = current_exe_name();
+    let output = std::process::Command::new("tmux")
+        .args([
+            "list-panes",
+            "-s",
+            "-t",
+            session,
+            "-F",
+            "#{pane_id}\t#{pane_current_command}\t#{pane_start_command}",
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        anyhow::bail!("failed to list panes in session '{}'", session);
+    }
+
+    Ok(parse_existing_sidebar_panes(
+        &String::from_utf8_lossy(&output.stdout),
+        exe_name.as_deref(),
+    ))
+}
+
+fn parse_existing_sidebar_panes(output: &str, exe_name: Option<&str>) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| parse_pane_record(line))
+        .filter(|(_, current_command, start_command)| {
+            is_existing_sidebar_command(current_command, start_command, exe_name)
+        })
+        .map(|(pane_id, _, _)| pane_id.to_string())
+        .collect()
+}
+
+fn parse_pane_record(line: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = line.trim().splitn(3, '\t');
+    Some((parts.next()?, parts.next()?, parts.next()?))
+}
+
+fn is_existing_sidebar_command(
+    current_command: &str,
+    start_command: &str,
+    exe_name: Option<&str>,
+) -> bool {
+    if start_command.contains("TIDE_SIDEBAR=1") {
+        return true;
+    }
+
+    exe_name
+        .map(|exe_name| current_command == exe_name || start_command.contains(exe_name))
+        .unwrap_or(false)
+}
+
+fn current_exe_name() -> Option<String> {
+    env::current_exe().ok().and_then(|path| {
+        Path::new(&path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_string())
+    })
+}
+
 fn set_window_option(target: &str, option: &str, value: &str) -> Result<()> {
     let status = tmux_status(&["set-window-option", "-t", target, option, value])?;
     if status.success() {
@@ -250,5 +335,30 @@ mod tests {
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("it's here"), "'it'\\''s here'");
+    }
+
+    #[test]
+    fn parse_existing_sidebar_panes_prefers_tide_sidebar_marker() {
+        let output = concat!(
+            "%1\tbash\tbash\n",
+            "%2\tsh\tsh -c TIDE_SIDEBAR=1 '/tmp/tide' work\n",
+            "%3\ttide\t/home/foxy/bin/tide work\n"
+        );
+
+        assert_eq!(
+            parse_existing_sidebar_panes(output, Some("tide")),
+            vec!["%2".to_string(), "%3".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_existing_sidebar_panes_ignores_unrelated_panes() {
+        let output = concat!(
+            "%1\tbash\tbash\n",
+            "%2\tvim\tvim notes.md\n",
+            "%3\tssh\tssh prod\n"
+        );
+
+        assert!(parse_existing_sidebar_panes(output, Some("tide")).is_empty());
     }
 }
