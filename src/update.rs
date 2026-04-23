@@ -463,6 +463,32 @@ mod tests {
     }
 
     #[test]
+    fn window_list_loaded_does_not_let_stable_pending_rename_hijack_selection() {
+        let mut model = test_model();
+        let before = vec![wi("@1", 1, "dev:new"), wi("@2", 2, "scratch")];
+        update(&mut model, Msg::WindowListLoaded(before));
+        model.set_cursor(2);
+        model.renames.pending.insert(
+            "@1".to_string(),
+            PendingRename {
+                target_name: "dev:new".to_string(),
+                observed_count: 1,
+            },
+        );
+        model.renames.last_window_id = Some("@1".to_string());
+
+        let after = vec![wi("@1", 1, "dev:new"), wi("@2", 2, "scratch")];
+        update(&mut model, Msg::WindowListLoaded(after));
+
+        assert_eq!(
+            model.selected_window_info().map(|w| w.id.as_str()),
+            Some("@2")
+        );
+        assert_eq!(model.cursor(), 2);
+        assert_eq!(model.renames.last_window_id, None);
+    }
+
+    #[test]
     fn new_window_name_uses_pending_rename_folder_when_context_collapses() {
         let mut model = test_model();
         let windows = vec![wi("@1", 1, "new:old"), wi("@2", 2, "dev")];
@@ -535,11 +561,13 @@ mod tests {
                 observed_count: 5,
             },
         );
+        model.renames.last_window_id = Some("@1".to_string());
 
         let stable = vec![wi("@1", 1, "new:new"), wi("@2", 2, "dev")];
         update(&mut model, Msg::WindowListLoaded(stable));
 
         assert!(model.renames.pending.contains_key("@1"));
+        assert_eq!(model.renames.last_window_id, None);
     }
 
     #[test]
@@ -891,6 +919,7 @@ mod tests {
                 observed_count: 3,
             },
         );
+        model.renames.last_window_id = Some("@1".to_string());
 
         let cmds = update(
             &mut model,
@@ -905,6 +934,7 @@ mod tests {
             model.renames.pending.get("@1").map(|p| p.observed_count),
             Some(4)
         );
+        assert_eq!(model.renames.last_window_id, None);
     }
 
     #[test]

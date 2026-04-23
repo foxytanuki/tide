@@ -57,6 +57,9 @@ pub(super) fn handle_window_renamed(
         }
 
         pending.observed_count = pending.observed_count.saturating_add(1);
+        if model.renames.last_window_id.as_deref() == Some(window_id.as_str()) {
+            model.renames.last_window_id = None;
+        }
         debug!(
             id = window_id.as_str(),
             name = name.as_str(),
@@ -178,7 +181,13 @@ fn derive_selected_target(model: &Model) -> Option<SelectionTarget> {
                 .renames
                 .last_window_id
                 .as_ref()
-                .filter(|id| model.renames.pending.contains_key(*id))
+                .filter(|id| {
+                    model
+                        .renames
+                        .pending
+                        .get(*id)
+                        .is_some_and(|pending| pending.observed_count == 0)
+                })
                 .cloned()
                 .map(SelectionTarget::Window)
         })
@@ -258,6 +267,9 @@ fn reconcile_pending_renames(
                 pending.observed_count = 0;
             } else {
                 pending.observed_count = pending.observed_count.saturating_add(1);
+                if model.renames.last_window_id.as_deref() == Some(id.as_str()) {
+                    model.renames.last_window_id = None;
+                }
                 debug!(
                     id = id,
                     name = current.name.as_str(),

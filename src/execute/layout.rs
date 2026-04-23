@@ -4,7 +4,7 @@ use tracing::{debug, info, warn};
 
 use super::{TmuxApi, LAYOUT_CHANGE_SUPPRESSION_MS, SIDEBAR_WIDTH_CHARS};
 use crate::cmd::Cmd;
-use crate::model::{Model, PreviewState};
+use crate::model::{Model, PendingRename, PreviewState};
 use crate::tmux::commands;
 use crate::tmux::{quote_tmux, WindowInfo};
 
@@ -916,6 +916,23 @@ pub(super) async fn apply_layout_helper<T: TmuxApi>(
     tmux: &mut T,
     queue: &mut VecDeque<Cmd>,
 ) {
+    let preserved_window_name = model.window_list_snapshot.as_ref().and_then(|windows| {
+        windows
+            .iter()
+            .find(|window| window.id == model.sidebar.window_id)
+            .map(|window| window.name.clone())
+    });
+
+    debug!(
+        window = %model.sidebar.window_id,
+        sidebar_pane = %model.sidebar.pane_id,
+        mode = ?model.mode,
+        cursor = model.cursor(),
+        selection = ?model.selected_selection_target(),
+        preserved_window_name = ?preserved_window_name.as_deref(),
+        "layout helper starting"
+    );
+
     suppress_sidebar_layout_validation(model);
     let list_cmd = format!(
         "list-panes -t {} -F '#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}'",
@@ -1033,6 +1050,22 @@ pub(super) async fn apply_layout_helper<T: TmuxApi>(
         );
     }
 
+    if let Some(name) = preserved_window_name {
+        debug!(
+            window = %model.sidebar.window_id,
+            target_name = %name,
+            "layout helper preserving window name as pending rename"
+        );
+        model.renames.pending.insert(
+            model.sidebar.window_id.clone(),
+            PendingRename {
+                target_name: name,
+                observed_count: 0,
+            },
+        );
+        model.renames.last_window_id = Some(model.sidebar.window_id.clone());
+    }
+
     let top = &content_ids[4];
     let bottom = &content_ids[5];
 
@@ -1109,6 +1142,22 @@ pub(super) async fn apply_layout_helper<T: TmuxApi>(
             SIDEBAR_WIDTH_CHARS,
         ))
         .await;
+    match tmux
+        .send_command(&commands::select_pane(&model.sidebar.pane_id))
+        .await
+    {
+        Ok(_) => debug!(
+            window = %model.sidebar.window_id,
+            sidebar_pane = %model.sidebar.pane_id,
+            "layout helper reselected sidebar pane"
+        ),
+        Err(err) => warn!(
+            window = %model.sidebar.window_id,
+            sidebar_pane = %model.sidebar.pane_id,
+            %err,
+            "layout helper: failed to reselect sidebar pane"
+        ),
+    }
     model.info_message = Some(
         if helper_already_managed {
             "layout helper refreshed"
@@ -1121,6 +1170,14 @@ pub(super) async fn apply_layout_helper<T: TmuxApi>(
         .sidebar
         .helper_managed_windows
         .insert(model.sidebar.window_id.clone());
+    debug!(
+        window = %model.sidebar.window_id,
+        helper_already_managed,
+        content_panes = ?content_ids,
+        top = %top,
+        bottom = %bottom,
+        "layout helper completed"
+    );
     queue.push_front(Cmd::Render);
     queue.push_front(Cmd::ListWindows);
 }

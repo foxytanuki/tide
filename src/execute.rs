@@ -1706,6 +1706,7 @@ mod tests {
     async fn apply_layout_helper_launches_helper_apps_on_first_apply() {
         let mut model = test_model();
         model.sidebar.pane_id = "%9".to_string();
+        model.set_window_list_snapshot(vec![wi("@old", 1, "proj:main")]);
 
         let layout = build_sidebar_main_3x2_layout(120, 40, 9, &[2, 3, 4, 5, 6, 7])
             .expect("layout should build");
@@ -1720,6 +1721,7 @@ mod tests {
             Ok(String::new()),
             Ok(String::new()),
             Ok("%2\tbash\n%3\tbash\n%4\tbash\n%5\tbash\n%6\tbash\n%7\tbash\n".to_string()),
+            Ok(String::new()),
             Ok(String::new()),
             Ok(String::new()),
             Ok(String::new()),
@@ -1758,10 +1760,20 @@ mod tests {
             .commands
             .iter()
             .any(|cmd| cmd.starts_with("select-layout -t @old ")));
+        assert!(tmux.commands.iter().any(|cmd| cmd == "select-pane -t %9"));
         assert!(model
             .sidebar
             .helper_managed_windows
             .contains(&model.sidebar.window_id));
+        assert_eq!(
+            model
+                .renames
+                .pending
+                .get("@old")
+                .map(|pending| pending.target_name.as_str()),
+            Some("proj:main")
+        );
+        assert_eq!(model.renames.last_window_id.as_deref(), Some("@old"));
         assert_eq!(model.info_message.as_deref(), Some("layout helper applied"));
     }
 
@@ -1788,6 +1800,7 @@ mod tests {
             Ok(String::new()),
             Ok(String::new()),
             Ok(String::new()),
+            Ok(String::new()),
         ]);
 
         let mut queue = VecDeque::new();
@@ -1805,6 +1818,7 @@ mod tests {
             .commands
             .iter()
             .any(|cmd| cmd == "set-window-option -t @old automatic-rename off ; set-window-option -t @old allow-rename off"));
+        assert!(tmux.commands.iter().any(|cmd| cmd == "select-pane -t %9"));
         assert!(!tmux.commands.iter().any(|cmd| cmd.contains(" lazygit C-m")));
         assert!(!tmux.commands.iter().any(|cmd| cmd.contains(" yazi C-m")));
         assert!(!tmux.commands.iter().any(|cmd| cmd.contains("cd -- ")));

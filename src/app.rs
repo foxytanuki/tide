@@ -1,10 +1,12 @@
 use std::env;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::cursor::Hide as CursorHide;
-use crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::EnterAlternateScreen;
 use ratatui::backend::CrosstermBackend;
@@ -29,13 +31,35 @@ const AI_POLL_INTERVAL_MS: u64 = 500;
 const PREVIEW_DEBOUNCE_MS: u64 = 50;
 const INPUT_POLL_MS: u64 = 100;
 const MAX_TMUX_EVENTS_PER_BATCH: usize = 64;
+const TERMINAL_RESPONSE_FILTER_MS: u64 = 2_000;
+
+#[derive(Debug, Default)]
+struct InputFilterState {
+    terminal_response: Option<TerminalResponseKind>,
+    terminal_response_armed_until: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct UiInteractionState {
+    pending_preview: Option<String>,
+    input_filter: InputFilterState,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TerminalResponseKind {
+    Apc,
+    Dcs,
+    Osc,
+    Pm,
+    Sos,
+}
 
 struct App {
     model: Model,
     tmux: TmuxControl,
     terminal: AppTerminal,
     ui_rx: mpsc::UnboundedReceiver<Event>,
-    pending_preview: Option<String>,
+    ui: UiInteractionState,
 }
 
 impl App {
@@ -81,7 +105,7 @@ impl App {
                 tmux,
                 terminal,
                 ui_rx,
-                pending_preview: None,
+                ui: UiInteractionState::default(),
             },
             prev_f_binding,
         ))
@@ -133,19 +157,19 @@ impl App {
                         &mut self.terminal,
                         &mut self.ui_rx,
                         maybe_ui,
-                        &mut self.pending_preview,
+                        &mut self.ui,
                         preview_sleep.as_mut(),
                     ).await {
                         break;
                     }
                 }
 
-                () = &mut preview_sleep, if self.pending_preview.is_some() => {
+                () = &mut preview_sleep, if self.ui.pending_preview.is_some() => {
                     if !handle_preview_tick(
                         &mut self.model,
                         &mut self.tmux,
                         &mut self.terminal,
-                        &mut self.pending_preview,
+                        &mut self.ui.pending_preview,
                     ).await {
                         break;
                     }
@@ -359,7 +383,15 @@ fn spawn_input_thread(tx: mpsc::UnboundedSender<Event>) {
     });
 }
 
-fn process_ui_event(model: &mut Model, event: Event) -> Vec<Cmd> {
+fn process_ui_event(
+    model: &mut Model,
+    input_filter: &mut InputFilterState,
+    event: Event,
+) -> Vec<Cmd> {
+    if should_drop_ui_event(input_filter, &event) {
+        return Vec::new();
+    }
+
     match event {
         Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
             update(model, Msg::Key(key))
@@ -382,16 +414,24 @@ fn process_ui_event(model: &mut Model, event: Event) -> Vec<Cmd> {
 
 fn process_ui_batch(
     model: &mut Model,
+    input_filter: &mut InputFilterState,
     ui_rx: &mut mpsc::UnboundedReceiver<Event>,
     first_event: Event,
 ) -> Vec<Cmd> {
-    let mut cmds = process_ui_event(model, first_event);
+    let mut cmds = process_ui_event(model, input_filter, first_event);
+    let mut processed_events = 1usize;
 
-    while let Ok(event) = ui_rx.try_recv() {
-        cmds.extend(process_ui_event(model, event));
+    while !contains_layout_helper(&cmds) {
+        let Ok(event) = ui_rx.try_recv() else {
+            break;
+        };
+        cmds.extend(process_ui_event(model, input_filter, event));
+        processed_events += 1;
     }
 
-    coalesce_commands(cmds)
+    let coalesced = coalesce_commands(cmds);
+    debug!(processed_events, cmds = ?coalesced, "ui batch processed");
+    coalesced
 }
 
 async fn handle_ui_tick(
@@ -400,7 +440,7 @@ async fn handle_ui_tick(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ui_rx: &mut mpsc::UnboundedReceiver<Event>,
     maybe_ui: Option<Event>,
-    pending_preview: &mut Option<String>,
+    ui: &mut UiInteractionState,
     preview_sleep: std::pin::Pin<&mut tokio::time::Sleep>,
 ) -> bool {
     let Some(event) = maybe_ui else {
@@ -408,9 +448,15 @@ async fn handle_ui_tick(
         return false;
     };
 
-    let mut cmds = process_ui_batch(model, ui_rx, event);
-    apply_preview_debounce(&mut cmds, pending_preview, preview_sleep);
-    execute_if_any(model, tmux, terminal, cmds).await
+    let mut cmds = process_ui_batch(model, &mut ui.input_filter, ui_rx, event);
+    let ran_layout_helper = contains_layout_helper(&cmds);
+    apply_preview_debounce(&mut cmds, &mut ui.pending_preview, preview_sleep);
+    let should_continue = execute_if_any(model, tmux, terminal, cmds).await;
+    if should_continue && ran_layout_helper {
+        arm_terminal_response_filter(&mut ui.input_filter);
+        drain_pending_ui_events(ui_rx, &mut ui.input_filter, "layout helper completed");
+    }
+    should_continue
 }
 
 async fn handle_preview_tick(
@@ -461,6 +507,105 @@ fn apply_preview_debounce(
     }
 }
 
+fn contains_layout_helper(cmds: &[Cmd]) -> bool {
+    cmds.iter().any(|cmd| matches!(cmd, Cmd::ApplyLayoutHelper))
+}
+
+fn arm_terminal_response_filter(input_filter: &mut InputFilterState) {
+    input_filter.terminal_response_armed_until =
+        Some(Instant::now() + Duration::from_millis(TERMINAL_RESPONSE_FILTER_MS));
+}
+
+fn should_drop_ui_event(input_filter: &mut InputFilterState, event: &Event) -> bool {
+    let Event::Key(key) = event else {
+        return false;
+    };
+
+    if let Some(kind) = input_filter.terminal_response {
+        if !is_terminal_response_filter_armed(input_filter) {
+            debug!(?kind, ?key, "terminal response filter expired");
+            input_filter.terminal_response = None;
+            return false;
+        }
+
+        if is_terminal_response_end(key) {
+            debug!(?kind, ?key, "dropping terminal response terminator");
+            input_filter.terminal_response = None;
+        } else {
+            debug!(?kind, ?key, "dropping terminal response input");
+        }
+        return true;
+    }
+
+    if !is_terminal_response_filter_armed(input_filter) {
+        return false;
+    }
+
+    if let Some(kind) = terminal_response_start(key) {
+        debug!(?kind, ?key, "dropping terminal response start");
+        input_filter.terminal_response = Some(kind);
+        input_filter.terminal_response_armed_until =
+            Some(Instant::now() + Duration::from_millis(TERMINAL_RESPONSE_FILTER_MS));
+        return true;
+    }
+
+    false
+}
+
+fn is_terminal_response_filter_armed(input_filter: &mut InputFilterState) -> bool {
+    let Some(deadline) = input_filter.terminal_response_armed_until else {
+        return false;
+    };
+
+    if Instant::now() <= deadline {
+        true
+    } else {
+        input_filter.terminal_response_armed_until = None;
+        false
+    }
+}
+
+fn terminal_response_start(key: &KeyEvent) -> Option<TerminalResponseKind> {
+    if !key.modifiers.contains(KeyModifiers::ALT) {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Char('_') => Some(TerminalResponseKind::Apc),
+        KeyCode::Char('P') | KeyCode::Char('p') => Some(TerminalResponseKind::Dcs),
+        KeyCode::Char(']') => Some(TerminalResponseKind::Osc),
+        KeyCode::Char('^') => Some(TerminalResponseKind::Pm),
+        KeyCode::Char('X') | KeyCode::Char('x') => Some(TerminalResponseKind::Sos),
+        _ => None,
+    }
+}
+
+fn is_terminal_response_end(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('\\'))
+}
+
+fn drain_pending_ui_events(
+    ui_rx: &mut mpsc::UnboundedReceiver<Event>,
+    input_filter: &mut InputFilterState,
+    reason: &str,
+) -> usize {
+    let mut dropped = 0usize;
+    while let Ok(event) = ui_rx.try_recv() {
+        let terminal_response = should_drop_ui_event(input_filter, &event);
+        debug!(
+            ?event,
+            reason = %reason,
+            terminal_response,
+            "dropping queued ui event"
+        );
+        dropped += 1;
+    }
+    if dropped > 0 {
+        debug!(dropped, reason = %reason, "dropped queued ui events");
+    }
+    dropped
+}
+
 fn process_tmux_event(model: &mut Model, tmux_event: TmuxEvent) -> Vec<Cmd> {
     match tmux_event {
         TmuxEvent::WindowAdd(_) | TmuxEvent::WindowClose(_) => update(model, Msg::WindowChanged),
@@ -475,11 +620,14 @@ fn process_tmux_event(model: &mut Model, tmux_event: TmuxEvent) -> Vec<Cmd> {
         TmuxEvent::LayoutChange(window_id) if window_id == model.sidebar.window_id => {
             if let Some(deadline) = model.sidebar.ignore_layout_change_until {
                 if std::time::Instant::now() < deadline {
-                    return vec![Cmd::EnsureSidebarWidth];
+                    vec![Cmd::EnsureSidebarWidth]
+                } else {
+                    model.sidebar.ignore_layout_change_until = None;
+                    vec![Cmd::EnsureSidebarWidth, Cmd::ValidateSidebarPanes]
                 }
-                model.sidebar.ignore_layout_change_until = None;
+            } else {
+                vec![Cmd::EnsureSidebarWidth, Cmd::ValidateSidebarPanes]
             }
-            vec![Cmd::EnsureSidebarWidth, Cmd::ValidateSidebarPanes]
         }
         TmuxEvent::LayoutChange(_) => Vec::new(),
         TmuxEvent::SessionWindowChanged(_, _) => Vec::new(),
@@ -594,6 +742,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::model::Mode;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     fn test_model() -> Model {
@@ -613,6 +762,10 @@ mod tests {
             name: name.to_string(),
             active: false,
         }
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
     }
 
     #[test]
@@ -659,8 +812,10 @@ mod tests {
         tx.send(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
             .unwrap();
 
+        let mut input_filter = InputFilterState::default();
         let cmds = process_ui_batch(
             &mut model,
+            &mut input_filter,
             &mut rx,
             Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
         );
@@ -669,6 +824,155 @@ mod tests {
         assert!(matches!(cmds[0], Cmd::PreviewWindow { ref id } if id == "@3"));
         assert!(matches!(cmds[1], Cmd::Render));
         assert_eq!(model.cursor(), 2);
+    }
+
+    #[test]
+    fn process_ui_batch_stops_draining_after_layout_helper() {
+        let mut model = test_model();
+        let _ = update(
+            &mut model,
+            Msg::WindowListLoaded(vec![window("@1", 1, "tab1")]),
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Event::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+
+        let mut input_filter = InputFilterState::default();
+        let cmds = process_ui_batch(
+            &mut model,
+            &mut input_filter,
+            &mut rx,
+            Event::Key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE)),
+        );
+
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::ApplyLayoutHelper));
+        assert_eq!(model.mode, Mode::Normal);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn armed_terminal_response_filter_drops_dcs_and_apc_payloads() {
+        let mut model = test_model();
+        let _ = update(
+            &mut model,
+            Msg::WindowListLoaded(vec![
+                window("@0", 0, "general"),
+                window("@44", 44, "target"),
+                window("@8", 8, "other"),
+            ]),
+        );
+        model.set_cursor(1);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let events = [
+            key(KeyCode::Char('G'), KeyModifiers::SHIFT),
+            key(KeyCode::Char('i'), KeyModifiers::NONE),
+            key(KeyCode::Char('='), KeyModifiers::NONE),
+            key(KeyCode::Char('3'), KeyModifiers::NONE),
+            key(KeyCode::Char('1'), KeyModifiers::NONE),
+            key(KeyCode::Char(';'), KeyModifiers::NONE),
+            key(KeyCode::Char('O'), KeyModifiers::SHIFT),
+            key(KeyCode::Char('K'), KeyModifiers::SHIFT),
+            key(KeyCode::Char('\\'), KeyModifiers::ALT),
+            key(KeyCode::Char('P'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+            key(KeyCode::Char('>'), KeyModifiers::NONE),
+            key(KeyCode::Char('|'), KeyModifiers::NONE),
+            key(KeyCode::Char('W'), KeyModifiers::SHIFT),
+            key(KeyCode::Char('e'), KeyModifiers::NONE),
+            key(KeyCode::Char('z'), KeyModifiers::NONE),
+            key(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            key(KeyCode::Char('e'), KeyModifiers::NONE),
+            key(KeyCode::Char('r'), KeyModifiers::NONE),
+            key(KeyCode::Char('m'), KeyModifiers::NONE),
+            key(KeyCode::Char(' '), KeyModifiers::NONE),
+            key(KeyCode::Char('2'), KeyModifiers::NONE),
+            key(KeyCode::Char('\\'), KeyModifiers::ALT),
+        ];
+        for event in events {
+            tx.send(event).unwrap();
+        }
+
+        let mut input_filter = InputFilterState::default();
+        arm_terminal_response_filter(&mut input_filter);
+        let cmds = process_ui_batch(
+            &mut model,
+            &mut input_filter,
+            &mut rx,
+            key(KeyCode::Char('_'), KeyModifiers::ALT),
+        );
+
+        assert!(cmds.is_empty());
+        assert_eq!(model.mode, Mode::Normal);
+        assert_eq!(model.cursor(), 1);
+        assert!(model.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn drain_pending_ui_events_clears_queued_events() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(Event::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        tx.send(Event::Resize(120, 40)).unwrap();
+
+        let mut input_filter = InputFilterState::default();
+        assert_eq!(
+            drain_pending_ui_events(&mut rx, &mut input_filter, "test"),
+            2,
+            "both queued events should be dropped"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn drain_pending_ui_events_tracks_partial_terminal_response() {
+        let mut model = test_model();
+        let _ = update(
+            &mut model,
+            Msg::WindowListLoaded(vec![window("@1", 1, "tab1")]),
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(key(KeyCode::Char('_'), KeyModifiers::ALT)).unwrap();
+
+        let mut input_filter = InputFilterState::default();
+        arm_terminal_response_filter(&mut input_filter);
+
+        assert_eq!(
+            drain_pending_ui_events(&mut rx, &mut input_filter, "test"),
+            1
+        );
+        assert!(matches!(
+            input_filter.terminal_response,
+            Some(TerminalResponseKind::Apc)
+        ));
+
+        tx.send(key(KeyCode::Char('r'), KeyModifiers::NONE))
+            .unwrap();
+        tx.send(key(KeyCode::Char('m'), KeyModifiers::NONE))
+            .unwrap();
+        tx.send(key(KeyCode::Char('\\'), KeyModifiers::ALT))
+            .unwrap();
+
+        let cmds = process_ui_batch(
+            &mut model,
+            &mut input_filter,
+            &mut rx,
+            key(KeyCode::Char('2'), KeyModifiers::NONE),
+        );
+
+        assert!(cmds.is_empty());
+        assert_eq!(model.mode, Mode::Normal);
+        assert_eq!(model.cursor(), 0);
+        assert!(model.input_buffer.is_empty());
+        assert!(input_filter.terminal_response.is_none());
     }
 
     #[test]
