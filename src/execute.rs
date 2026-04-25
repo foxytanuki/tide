@@ -203,10 +203,6 @@ async fn handle_preview_window<T: TmuxApi>(
         } => (original_window_id.clone(), original_home_pane_id.clone()),
     };
 
-    // suppress 2 events: join-pane + select-window.
-    model.sidebar.ignore_window_changes = 2;
-    model.sidebar.pending_internal_focus_window = Some(target_window_id.clone());
-
     // Query phase: find join target.
     // Always target the leftmost pane so sidebar stays at far left.
     let target_panes =
@@ -228,6 +224,10 @@ async fn handle_preview_window<T: TmuxApi>(
     // -l {SIDEBAR_WIDTH_CHARS} sets sidebar width at join time to avoid intermediate resize.
     let batch =
         join_batch_with_window_select(&model.sidebar.pane_id, &join_target, &target_window_id);
+
+    // Suppress the next expected focus notification from this internal move.
+    model.sidebar.ignore_window_changes = 1;
+    model.sidebar.pending_internal_focus_window = Some(target_window_id.clone());
 
     if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
         warn!(%err, "preview batch failed");
@@ -290,10 +290,6 @@ async fn handle_restore_preview<T: TmuxApi>(
         let orig_panes =
             query_window_pane_targets(tmux, &orig_window, &model.sidebar.pane_id).await;
 
-        // Suppress session-window-changed events from join-pane + select-window.
-        model.sidebar.ignore_window_changes = 2;
-        model.sidebar.pending_internal_focus_window = Some(orig_window.clone());
-
         // Save orig_window's layout before sidebar re-joins it.
         save_window_layout(model, tmux, &orig_window).await;
         let leaving_window = snapshot_leaving_window_layout(model, tmux).await;
@@ -311,6 +307,10 @@ async fn handle_restore_preview<T: TmuxApi>(
             &orig_window,
         );
 
+        // Suppress the next expected focus notification from this internal move.
+        model.sidebar.ignore_window_changes = 1;
+        model.sidebar.pending_internal_focus_window = Some(orig_window.clone());
+
         let restored = if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
             warn!(%err, "restore batch failed, trying fallback");
             // Fallback: retry join to leftmost pane (re-query, because pane IDs may have changed).
@@ -320,6 +320,8 @@ async fn handle_restore_preview<T: TmuxApi>(
                 warn!("restore fallback: no leftmost pane available");
                 false
             } else {
+                model.sidebar.ignore_window_changes = 1;
+                model.sidebar.pending_internal_focus_window = Some(orig_window.clone());
                 let fallback = join_batch_with_window_select(
                     &model.sidebar.pane_id,
                     &fallback_leftmost,
@@ -623,10 +625,6 @@ async fn handle_follow_to_window<T: TmuxApi>(
 
     info!(target = %target_window_id, "following to window");
 
-    // suppress 1 event: join-pane only (no select-window in follow path).
-    model.sidebar.ignore_window_changes = 1;
-    model.sidebar.pending_internal_focus_window = Some(target_window_id.clone());
-
     // Query phase.
     // Always target the leftmost pane so sidebar stays at far left.
     let target_panes =
@@ -645,6 +643,10 @@ async fn handle_follow_to_window<T: TmuxApi>(
 
     // Action phase: batch join.
     let batch = join_batch_without_window_select(&model.sidebar.pane_id, &join_target);
+
+    // Suppress the next expected focus notification from this internal move.
+    model.sidebar.ignore_window_changes = 1;
+    model.sidebar.pending_internal_focus_window = Some(target_window_id.clone());
 
     if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
         warn!(%err, "follow batch failed");
@@ -1907,6 +1909,95 @@ mod tests {
             .commands
             .iter()
             .any(|cmd| cmd.starts_with("select-layout -t @new ")));
+    }
+
+    #[tokio::test]
+    async fn follow_to_window_query_failure_does_not_set_window_change_suppression() {
+        let mut model = test_model();
+        let mut queue = VecDeque::new();
+        let mut tmux = FakeTmux::new(vec![Ok("%sidebar\t0\t0\t1\n".to_string())]);
+
+        handle_follow_to_window(&mut model, &mut tmux, &mut queue, "@new".to_string()).await;
+
+        assert_eq!(model.sidebar.ignore_window_changes, 0);
+        assert_eq!(model.sidebar.pending_internal_focus_window, None);
+        assert_eq!(
+            model.error_message.as_deref(),
+            Some("follow: could not resolve leftmost pane")
+        );
+        assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
+        assert!(queue.is_empty());
+        assert_eq!(tmux.commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn follow_to_window_batch_failure_clears_window_change_suppression() {
+        let mut model = test_model();
+        let mut queue = VecDeque::new();
+        let mut tmux = FakeTmux::new(vec![
+            Ok("%2\t0\t0\t1\n%sidebar\t31\t0\t0\n".to_string()),
+            Ok("9999,200x80,0,0{30x80,0,0,2,70x80,31,0[70x39,31,0,3,70x40,31,39,4]}".to_string()),
+            Ok("9999,200x80,0,0{30x80,0,0,2,70x80,31,0[70x39,31,0,3,70x40,31,39,4]}".to_string()),
+            Err("join failed".to_string()),
+            Ok("@old\t%old\t1\n@old\t%1\t0\n%sidebar\t0\t0\n".to_string()),
+            Ok("@old\t0\t0\n".to_string()),
+            Ok("@old\t%old\t1\n@old\t%1\t0\n%sidebar\t0\t0\n".to_string()),
+            Ok("@old\n".to_string()),
+        ]);
+
+        handle_follow_to_window(&mut model, &mut tmux, &mut queue, "@new".to_string()).await;
+
+        assert_eq!(model.sidebar.ignore_window_changes, 0);
+        assert_eq!(model.sidebar.pending_internal_focus_window, None);
+        assert_eq!(model.error_message.as_deref(), Some("follow: join failed"));
+        assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn preview_window_query_failure_does_not_set_window_change_suppression() {
+        let mut model = test_model();
+        let mut queue = VecDeque::new();
+        let mut tmux = FakeTmux::new(vec![Ok("%sidebar\t0\t0\t1\n".to_string())]);
+
+        handle_preview_window(&mut model, &mut tmux, &mut queue, "@new".to_string()).await;
+
+        assert_eq!(model.sidebar.ignore_window_changes, 0);
+        assert_eq!(model.sidebar.pending_internal_focus_window, None);
+        assert_eq!(
+            model.error_message.as_deref(),
+            Some("preview: could not resolve leftmost pane")
+        );
+        assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
+        assert!(queue.is_empty());
+        assert_eq!(tmux.commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn preview_window_batch_failure_clears_window_change_suppression() {
+        let mut model = test_model();
+        let mut queue = VecDeque::new();
+        let mut tmux = FakeTmux::new(vec![
+            Ok("%2\t0\t0\t1\n%sidebar\t31\t0\t0\n".to_string()),
+            Ok("9999,200x80,0,0{30x80,0,0,2,70x80,31,0[70x39,31,0,3,70x40,31,39,4]}".to_string()),
+            Ok("9999,200x80,0,0{30x80,0,0,2,70x80,31,0[70x39,31,0,3,70x40,31,39,4]}".to_string()),
+            Err("preview join failed".to_string()),
+            Ok("@old\t%old\t1\n@old\t%1\t0\n%sidebar\t0\t0\n".to_string()),
+            Ok("@old\t0\t0\n".to_string()),
+            Ok("@old\t%old\t1\n@old\t%1\t0\n%sidebar\t0\t0\n".to_string()),
+            Ok("@old\n".to_string()),
+        ]);
+
+        handle_preview_window(&mut model, &mut tmux, &mut queue, "@new".to_string()).await;
+
+        assert_eq!(model.sidebar.ignore_window_changes, 0);
+        assert_eq!(model.sidebar.pending_internal_focus_window, None);
+        assert_eq!(
+            model.error_message.as_deref(),
+            Some("preview: preview join failed")
+        );
+        assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
+        assert!(queue.is_empty());
     }
 
     #[tokio::test]

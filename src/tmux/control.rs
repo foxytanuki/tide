@@ -33,12 +33,14 @@ impl Drop for ChildGuard {
 
 struct WaiterState {
     queue: VecDeque<oneshot::Sender<Result<String>>>,
-    /// Number of responses to silently discard (from timed-out commands whose
-    /// %end has not yet arrived).
-    skip_responses: usize,
+    /// Set when a command timed out and the stream could not be brought back to
+    /// a known response boundary. Further commands would risk receiving a stale
+    /// response, so fail fast instead.
+    response_stream_poisoned: bool,
 }
 
 const COMMAND_TIMEOUT_SECS: u64 = 5;
+const RESPONSE_RECOVERY_READS: usize = 3;
 
 pub struct TmuxControl {
     stdin: tokio::fs::File,
@@ -86,7 +88,7 @@ impl TmuxControl {
         let (event_tx, event_rx) = mpsc::channel::<super::TmuxEvent>(256);
         let waiters: Arc<Mutex<WaiterState>> = Arc::new(Mutex::new(WaiterState {
             queue: VecDeque::new(),
-            skip_responses: 0,
+            response_stream_poisoned: false,
         }));
 
         let waiters_for_task = Arc::clone(&waiters);
@@ -105,6 +107,11 @@ impl TmuxControl {
 
     pub async fn send_command(&mut self, cmd: &str) -> Result<String> {
         let cmd = validate_single_line_command(cmd)?;
+        if self.waiters.lock().await.response_stream_poisoned {
+            return Err(anyhow!(
+                "tmux response stream desynchronized after timeout; restart required"
+            ));
+        }
         if !command_expects_response(cmd) {
             self.write_command_line(cmd).await?;
             return Ok(String::new());
@@ -199,15 +206,59 @@ impl TmuxControl {
     }
 
     async fn handle_response_timeout(&mut self) -> Result<String> {
-        let mut state = self.waiters.lock().await;
-        // Only increment skip_responses if our waiter is still in the queue.
-        // If the reader already consumed it (race between response arrival and
-        // timeout), the queue is empty and we must not bump skip_responses —
-        // doing so would discard the next legitimate response.
-        if state.queue.pop_back().is_some() {
-            state.skip_responses += 1;
+        {
+            let mut state = self.waiters.lock().await;
+            // Remove the timed-out waiter if the reader has not already consumed
+            // it in the small race window around the timeout.
+            state.queue.pop_back();
         }
+
+        if let Err(err) = self.recover_response_stream_after_timeout().await {
+            self.waiters.lock().await.response_stream_poisoned = true;
+            return Err(anyhow!(
+                "timed out waiting for tmux response; failed to resynchronize response stream: {err}"
+            ));
+        }
+
         Err(anyhow!("timed out waiting for tmux response"))
+    }
+
+    async fn recover_response_stream_after_timeout(&mut self) -> Result<()> {
+        let token = format!("__tide_sync_{}__", std::process::id());
+        let mut response_rx = self.enqueue_response_waiter().await;
+        self.write_command_line(&format!("display-message -p {token}"))
+            .await?;
+
+        for read_attempt in 0..RESPONSE_RECOVERY_READS {
+            match timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS), response_rx).await {
+                Ok(Ok(Ok(response))) if response.trim() == token => {
+                    self.waiters.lock().await.response_stream_poisoned = false;
+                    tracing::warn!(read_attempt, "recovered tmux response stream after timeout");
+                    return Ok(());
+                }
+                Ok(Ok(Ok(stale_response))) => {
+                    tracing::warn!(
+                        read_attempt,
+                        response = stale_response.trim(),
+                        "discarded stale tmux response while recovering after timeout"
+                    );
+                    response_rx = self.enqueue_response_waiter().await;
+                }
+                Ok(Ok(Err(err))) => {
+                    tracing::warn!(read_attempt, %err, "tmux recovery command failed");
+                    response_rx = self.enqueue_response_waiter().await;
+                }
+                Ok(Err(_)) => {
+                    return Err(anyhow!("tmux recovery response channel closed"));
+                }
+                Err(_) => {
+                    self.waiters.lock().await.queue.pop_back();
+                    return Err(anyhow!("tmux recovery command timed out"));
+                }
+            }
+        }
+
+        Err(anyhow!("recovery token was not observed"))
     }
 }
 
@@ -292,9 +343,7 @@ async fn handle_control_marker(
 async fn begin_response_block(in_progress: &mut Option<String>, waiters: &Arc<Mutex<WaiterState>>) {
     if let Some(old_data) = in_progress.take() {
         let mut state = waiters.lock().await;
-        if state.skip_responses > 0 {
-            state.skip_responses -= 1;
-        } else if let Some(waiter) = state.queue.pop_front() {
+        if let Some(waiter) = state.queue.pop_front() {
             let _ = waiter.send(Err(anyhow!(
                 "response block interrupted by new %begin (data: {})",
                 old_data.trim()
@@ -312,10 +361,6 @@ async fn end_response_block(
     match in_progress.take() {
         Some(data) => {
             let mut state = waiters.lock().await;
-            if state.skip_responses > 0 {
-                state.skip_responses -= 1;
-                return;
-            }
             while let Some(waiter) = state.queue.pop_front() {
                 let result = if is_error {
                     let err_msg = data.trim().to_string();
@@ -349,14 +394,11 @@ fn handle_line_inside_response_block(
     pending_resync_event: &mut bool,
 ) -> bool {
     // If inside a response block, non-marker lines are response data.
-    // %-prefixed lines that match a known notification are emitted as
-    // events and NOT appended to the response. Unrecognized %-lines
-    // (e.g. pane IDs like %0, %1) ARE kept as response data.
-    if line.starts_with('%') {
-        if let Some(event) = parse_line(line) {
-            return send_event(event_tx, event, pending_resync_event);
-        }
-        // Unrecognized %-line: fall through to append as response data
+    // Lines that match a known notification are emitted as events and NOT
+    // appended to the response. `parse_line` also strips tmux DCS/APC wrappers,
+    // so do not guard this on the raw line starting with `%`.
+    if let Some(event) = parse_line(line) {
+        return send_event(event_tx, event, pending_resync_event);
     }
     in_progress_data.push_str(line);
     in_progress_data.push('\n');
@@ -368,11 +410,10 @@ fn handle_line_outside_response_block(
     event_tx: &mpsc::Sender<super::TmuxEvent>,
     pending_resync_event: &mut bool,
 ) -> bool {
-    // Outside a response block, %-prefixed lines are events.
-    if line.starts_with('%') {
-        if let Some(event) = parse_line(line) {
-            return send_event(event_tx, event, pending_resync_event);
-        }
+    // Outside a response block, known notifications are events. `parse_line`
+    // handles raw `%...` lines and DCS/APC-wrapped control-mode lines.
+    if let Some(event) = parse_line(line) {
+        return send_event(event_tx, event, pending_resync_event);
     }
     true
 }
@@ -662,6 +703,46 @@ mod tests {
         assert!(command_expects_response(
             "display-message -p '#{session_id}'"
         ));
+    }
+
+    #[test]
+    fn wrapped_event_outside_response_block_is_emitted() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut pending_resync = false;
+
+        let ok = handle_line_outside_response_block(
+            "\u{1b}P1000p%window-add @7\u{1b}\\",
+            &tx,
+            &mut pending_resync,
+        );
+
+        assert!(ok);
+        assert!(!pending_resync);
+        assert_eq!(
+            rx.try_recv().expect("expected wrapped event"),
+            super::super::TmuxEvent::WindowAdd("@7".to_string())
+        );
+    }
+
+    #[test]
+    fn wrapped_event_inside_response_block_is_not_appended_to_response() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut pending_resync = false;
+        let mut response_data = String::new();
+
+        let ok = handle_line_inside_response_block(
+            "\u{1b}P1000p%window-close @7\u{1b}\\",
+            &mut response_data,
+            &tx,
+            &mut pending_resync,
+        );
+
+        assert!(ok);
+        assert!(response_data.is_empty());
+        assert_eq!(
+            rx.try_recv().expect("expected wrapped event"),
+            super::super::TmuxEvent::WindowClose("@7".to_string())
+        );
     }
 
     #[test]

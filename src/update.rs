@@ -14,6 +14,7 @@ use navigation::*;
 use window_list::*;
 
 const MISSING_PENDING_RENAME_THRESHOLD: u8 = 6;
+const STABLE_PENDING_RENAME_THRESHOLD: u8 = 2;
 
 pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
     // Clear error on any user action (exclude background events)
@@ -335,21 +336,13 @@ mod tests {
     }
 
     #[test]
-    fn expected_focus_change_consumes_suppression_counter() {
+    fn expected_focus_change_clears_suppression() {
         let mut model = test_model();
         model.sidebar.ignore_window_changes = 2;
         model.sidebar.pending_internal_focus_window = Some("@target".to_string());
 
-        let first = update(&mut model, Msg::WindowFocusChanged("@target".to_string()));
-        assert_ensure_only(&first);
-        assert_eq!(model.sidebar.ignore_window_changes, 1);
-        assert_eq!(
-            model.sidebar.pending_internal_focus_window.as_deref(),
-            Some("@target")
-        );
-
-        let second = update(&mut model, Msg::WindowFocusChanged("@target".to_string()));
-        assert_ensure_only(&second);
+        let cmds = update(&mut model, Msg::WindowFocusChanged("@target".to_string()));
+        assert_ensure_only(&cmds);
         assert_eq!(model.sidebar.ignore_window_changes, 0);
         assert_eq!(model.sidebar.pending_internal_focus_window, None);
     }
@@ -550,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn window_list_loaded_keeps_pending_rename_when_target_name_stable() {
+    fn window_list_loaded_clears_pending_rename_when_target_name_stable() {
         let mut model = test_model();
         let initial = vec![wi("@1", 1, "new:new"), wi("@2", 2, "dev")];
         update(&mut model, Msg::WindowListLoaded(initial));
@@ -566,7 +559,7 @@ mod tests {
         let stable = vec![wi("@1", 1, "new:new"), wi("@2", 2, "dev")];
         update(&mut model, Msg::WindowListLoaded(stable));
 
-        assert!(model.renames.pending.contains_key("@1"));
+        assert!(!model.renames.pending.contains_key("@1"));
         assert_eq!(model.renames.last_window_id, None);
     }
 
@@ -905,7 +898,7 @@ mod tests {
         ));
         assert_eq!(
             model.renames.pending.get("@1").map(|p| p.observed_count),
-            Some(0)
+            Some(4)
         );
     }
 
@@ -930,10 +923,60 @@ mod tests {
         );
 
         assert!(cmds.is_empty());
+        assert!(!model.renames.pending.contains_key("@1"));
+        assert_eq!(model.renames.last_window_id, None);
+    }
+
+    #[test]
+    fn window_renamed_pending_match_waits_for_stable_observation() {
+        let mut model = test_model();
+        model.renames.pending.insert(
+            "@1".to_string(),
+            PendingRename {
+                target_name: "new:new".to_string(),
+                observed_count: 0,
+            },
+        );
+        model.renames.last_window_id = Some("@1".to_string());
+
+        let cmds = update(
+            &mut model,
+            Msg::WindowRenamed {
+                window_id: "@1".to_string(),
+                name: "new:new".to_string(),
+            },
+        );
+
+        assert!(cmds.is_empty());
         assert_eq!(
             model.renames.pending.get("@1").map(|p| p.observed_count),
-            Some(4)
+            Some(1)
         );
+        assert_eq!(model.renames.last_window_id.as_deref(), Some("@1"));
+    }
+
+    #[test]
+    fn window_renamed_pending_mismatch_clears_after_threshold() {
+        let mut model = test_model();
+        model.renames.pending.insert(
+            "@1".to_string(),
+            PendingRename {
+                target_name: "new:new".to_string(),
+                observed_count: MISSING_PENDING_RENAME_THRESHOLD - 1,
+            },
+        );
+
+        let cmds = update(
+            &mut model,
+            Msg::WindowRenamed {
+                window_id: "@1".to_string(),
+                name: "dev".to_string(),
+            },
+        );
+
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::ListWindows));
+        assert!(!model.renames.pending.contains_key("@1"));
         assert_eq!(model.renames.last_window_id, None);
     }
 
