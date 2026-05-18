@@ -33,8 +33,8 @@ use std::collections::HashMap;
 
 #[cfg(test)]
 use self::ai::{
-    classify_active_panes, find_ai_pane_candidates, is_ai_process_name, read_cpu_ticks,
-    read_cpu_ticks_tree, AiPaneCandidate, AI_CPU_GRACE_POLLS, MIN_OUTPUT_BURST,
+    classify_active_panes, find_ai_pane_candidates, is_ai_host_name, is_ai_process_name,
+    read_cpu_ticks, read_cpu_ticks_tree, AiPaneCandidate, AI_CPU_GRACE_POLLS, MIN_OUTPUT_BURST,
 };
 
 #[cfg(test)]
@@ -880,6 +880,27 @@ mod tests {
         assert!(is_ai_process_name("OpenCode"));
         assert!(is_ai_process_name("claude-code"));
         assert!(!is_ai_process_name("bash"));
+    }
+
+    #[test]
+    fn is_ai_host_name_matches_node_and_bun() {
+        assert!(is_ai_host_name("node"));
+        assert!(is_ai_host_name("Node"));
+        assert!(is_ai_host_name("bun"));
+        assert!(is_ai_host_name("deno"));
+        assert!(is_ai_host_name("npx"));
+        assert!(!is_ai_host_name("nodejs"));
+        assert!(!is_ai_host_name("bash"));
+        assert!(!is_ai_host_name("claude"));
+    }
+
+    #[test]
+    fn find_ai_pane_candidates_rejects_host_without_ai_descendant() {
+        // pane_current_command is `node` (an AI runtime host), but the bogus
+        // PID has no /proc entry, so no AI descendant can be found.
+        let output = "@1\t%10\tnode\t4294967295\n";
+        let candidates = find_ai_pane_candidates(output, "%sidebar");
+        assert!(candidates.is_empty());
     }
 
     #[test]

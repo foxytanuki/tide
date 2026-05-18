@@ -163,12 +163,64 @@ pub(super) async fn reset_all_borders<T: TmuxApi>(model: &mut Model, tmux: &mut 
 }
 
 const AI_PROCESS_NAMES: &[&str] = &["claude", "codex", "gemini", "opencode"];
+const AI_HOST_NAMES: &[&str] = &["node", "bun", "deno", "npx"];
 
 pub(super) fn is_ai_process_name(name: &str) -> bool {
     let lower = name.to_lowercase();
     AI_PROCESS_NAMES
         .iter()
         .any(|ai_name| lower.contains(ai_name))
+}
+
+pub(super) fn is_ai_host_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    AI_HOST_NAMES.iter().any(|host| lower == *host)
+}
+
+/// Walks the /proc descendant tree under `pane_pid` looking for a process whose
+/// `comm` matches an AI CLI. Returns the first matching PID, or `None`.
+///
+/// Bounded by [`MAX_PROC_TREE_DEPTH`] to keep poll cost predictable.
+pub(super) fn find_ai_descendant_pid(pane_pid: u32) -> Option<u32> {
+    let mut stack: Vec<(u32, u8)> = vec![(pane_pid, 0)];
+    while let Some((current_pid, depth)) = stack.pop() {
+        if depth >= MAX_PROC_TREE_DEPTH {
+            continue;
+        }
+        let task_dir = format!("/proc/{}/task", current_pid);
+        let tasks = match std::fs::read_dir(&task_dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for task_entry in tasks {
+            let tid = match task_entry {
+                Ok(entry) => entry.file_name(),
+                Err(_) => continue,
+            };
+            let children_path = format!(
+                "/proc/{}/task/{}/children",
+                current_pid,
+                tid.to_string_lossy()
+            );
+            let children = match std::fs::read_to_string(&children_path) {
+                Ok(children) => children,
+                Err(_) => continue,
+            };
+            for child_str in children.split_whitespace() {
+                let Ok(child_pid) = child_str.parse::<u32>() else {
+                    continue;
+                };
+                let comm_path = format!("/proc/{}/comm", child_pid);
+                if let Ok(comm) = std::fs::read_to_string(&comm_path) {
+                    if is_ai_process_name(comm.trim()) {
+                        return Some(child_pid);
+                    }
+                }
+                stack.push((child_pid, depth + 1));
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone)]
@@ -194,16 +246,31 @@ pub(super) fn find_ai_pane_candidates(output: &str, sidebar_pane_id: &str) -> Ve
             continue;
         }
 
-        if !is_ai_process_name(command) {
+        let Ok(pane_pid) = pid_str.parse::<u32>() else {
             continue;
-        }
+        };
 
-        if let Ok(pane_pid) = pid_str.parse::<u32>() {
+        if is_ai_process_name(command) {
             candidates.push(AiPaneCandidate {
                 pane_id: pane_id.to_string(),
                 window_id: window_id.to_string(),
                 pane_pid,
             });
+            continue;
+        }
+
+        // pane_current_command often reports the runtime (e.g. `node`) when an
+        // AI CLI is launched through a wrapper script. Scan descendants so that
+        // tools like opencode (run via `node /path/to/opencode`) are still
+        // detected as active.
+        if is_ai_host_name(command) {
+            if let Some(ai_pid) = find_ai_descendant_pid(pane_pid) {
+                candidates.push(AiPaneCandidate {
+                    pane_id: pane_id.to_string(),
+                    window_id: window_id.to_string(),
+                    pane_pid: ai_pid,
+                });
+            }
         }
     }
     candidates
