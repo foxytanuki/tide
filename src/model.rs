@@ -146,6 +146,24 @@ pub enum PreviewState {
         original_window_id: String,
         original_home_pane_id: String,
     },
+    Moving {
+        target_window_id: String,
+        original_window_id: String,
+        original_home_pane_id: String,
+    },
+    Restoring {
+        destination_window_id: String,
+        destination_home_pane_id: String,
+    },
+    RestoringForClose {
+        closing_window_id: String,
+        original_window_id: String,
+        original_home_pane_id: String,
+    },
+    EvacuatingForClose {
+        closing_window_id: String,
+        destination_window_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

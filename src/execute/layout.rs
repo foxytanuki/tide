@@ -890,11 +890,14 @@ pub(super) async fn validate_sidebar_panes<T: TmuxApi>(
             "sidebar window lost all content panes, evacuating"
         );
         match &model.sidebar.preview {
-            PreviewState::Previewing { .. } => {
+            PreviewState::Previewing { .. }
+            | PreviewState::Moving { .. }
+            | PreviewState::Restoring { .. }
+            | PreviewState::RestoringForClose { .. } => {
                 queue.push_front(Cmd::ListWindows);
                 queue.push_front(Cmd::RestorePreview);
             }
-            PreviewState::Home => {
+            PreviewState::Home | PreviewState::EvacuatingForClose { .. } => {
                 let sidebar_window_id = model.sidebar.window_id.clone();
                 if let Some(other_id) = model.find_another_window_id(&sidebar_window_id) {
                     queue.push_front(Cmd::ListWindows);

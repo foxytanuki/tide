@@ -201,6 +201,27 @@ async fn handle_preview_window<T: TmuxApi>(
             original_window_id,
             original_home_pane_id,
         } => (original_window_id.clone(), original_home_pane_id.clone()),
+        PreviewState::Moving {
+            original_window_id,
+            original_home_pane_id,
+            ..
+        } => (original_window_id.clone(), original_home_pane_id.clone()),
+        PreviewState::Restoring {
+            destination_window_id,
+            destination_home_pane_id,
+        } => (
+            destination_window_id.clone(),
+            destination_home_pane_id.clone(),
+        ),
+        PreviewState::RestoringForClose {
+            original_window_id,
+            original_home_pane_id,
+            ..
+        } => (original_window_id.clone(), original_home_pane_id.clone()),
+        PreviewState::EvacuatingForClose { .. } => (
+            model.sidebar.window_id.clone(),
+            model.sidebar.home_pane_id.clone(),
+        ),
     };
 
     // Query phase: find join target.
@@ -224,6 +245,11 @@ async fn handle_preview_window<T: TmuxApi>(
     // -l {SIDEBAR_WIDTH} sets sidebar width at join time to avoid intermediate resize.
     let batch =
         join_batch_with_window_select(&model.sidebar.pane_id, &join_target, &target_window_id);
+    model.sidebar.preview = PreviewState::Moving {
+        target_window_id: target_window_id.clone(),
+        original_window_id: orig_window.clone(),
+        original_home_pane_id: orig_home.clone(),
+    };
 
     // Suppress the next expected focus notification from this internal move.
     model.sidebar.ignore_window_changes = 1;
@@ -280,10 +306,24 @@ async fn handle_restore_preview<T: TmuxApi>(
     if let PreviewState::Previewing {
         ref original_window_id,
         ref original_home_pane_id,
+    }
+    | PreviewState::Moving {
+        ref original_window_id,
+        ref original_home_pane_id,
+        ..
+    }
+    | PreviewState::RestoringForClose {
+        ref original_window_id,
+        ref original_home_pane_id,
+        ..
     } = model.sidebar.preview
     {
         let orig_window = original_window_id.clone();
         let orig_home = original_home_pane_id.clone();
+        model.sidebar.preview = PreviewState::Restoring {
+            destination_window_id: orig_window.clone(),
+            destination_home_pane_id: orig_home.clone(),
+        };
 
         debug!(orig_window = %orig_window, "restoring preview");
 
@@ -546,7 +586,26 @@ async fn handle_close_window<T: TmuxApi>(
     // Never kill the window hosting the sidebar.
     if model.sidebar.window_id == id {
         match &model.sidebar.preview {
-            PreviewState::Previewing { .. } => {
+            PreviewState::Previewing {
+                original_window_id,
+                original_home_pane_id,
+            }
+            | PreviewState::Moving {
+                original_window_id,
+                original_home_pane_id,
+                ..
+            }
+            | PreviewState::Restoring {
+                destination_window_id: original_window_id,
+                destination_home_pane_id: original_home_pane_id,
+            }
+            | PreviewState::RestoringForClose {
+                original_window_id,
+                original_home_pane_id,
+                ..
+            } => {
+                let original_window_id = original_window_id.clone();
+                let original_home_pane_id = original_home_pane_id.clone();
                 if model.sidebar.close_restore_attempted {
                     // Circuit breaker: already tried restore once, don't loop.
                     model.sidebar.close_restore_attempted = false;
@@ -559,12 +618,17 @@ async fn handle_close_window<T: TmuxApi>(
                     return;
                 }
                 model.sidebar.close_restore_attempted = true;
+                model.sidebar.preview = PreviewState::RestoringForClose {
+                    closing_window_id: id.clone(),
+                    original_window_id,
+                    original_home_pane_id,
+                };
                 debug!(id, "closing previewed window, restoring first");
                 queue.push_front(Cmd::CloseWindow { id });
                 queue.push_front(Cmd::RestorePreview);
                 return;
             }
-            PreviewState::Home => {
+            PreviewState::Home | PreviewState::EvacuatingForClose { .. } => {
                 if model.sidebar.close_restore_attempted {
                     model.sidebar.close_restore_attempted = false;
                     warn!(
@@ -578,6 +642,10 @@ async fn handle_close_window<T: TmuxApi>(
                 // Find another window to evacuate sidebar to.
                 if let Some(other_id) = model.find_another_window_id(&id) {
                     model.sidebar.close_restore_attempted = true;
+                    model.sidebar.preview = PreviewState::EvacuatingForClose {
+                        closing_window_id: id.clone(),
+                        destination_window_id: other_id.clone(),
+                    };
                     debug!(id, other = %other_id, "evacuating sidebar before close");
                     queue.push_front(Cmd::CloseWindow { id });
                     queue.push_front(Cmd::FollowToWindow {
@@ -637,6 +705,11 @@ async fn handle_follow_to_window<T: TmuxApi>(
 
     // Action phase: batch join.
     let batch = join_batch_without_window_select(&model.sidebar.pane_id, &join_target);
+    model.sidebar.preview = PreviewState::Moving {
+        target_window_id: target_window_id.clone(),
+        original_window_id: model.sidebar.window_id.clone(),
+        original_home_pane_id: model.sidebar.home_pane_id.clone(),
+    };
 
     // Suppress the next expected focus notification from this internal move.
     model.sidebar.ignore_window_changes = 1;
