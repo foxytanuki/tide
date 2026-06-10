@@ -6,8 +6,42 @@ use anyhow::{anyhow, Result};
 pub struct WindowInfo {
     pub id: String,
     pub index: usize,
+    pub tmux_name: String,
+    pub tide_name: Option<String>,
+    /// Logical tide name used for tree construction.
     pub name: String,
     pub active: bool,
+}
+
+impl WindowInfo {
+    pub fn new(id: &str, index: usize, name: &str, active: bool) -> Self {
+        Self {
+            id: id.to_string(),
+            index,
+            tmux_name: name.to_string(),
+            tide_name: None,
+            name: name.to_string(),
+            active,
+        }
+    }
+
+    pub fn with_tide_name(
+        id: &str,
+        index: usize,
+        tmux_name: &str,
+        tide_name: Option<&str>,
+        active: bool,
+    ) -> Self {
+        let logical_name = tide_name.unwrap_or(tmux_name).to_string();
+        Self {
+            id: id.to_string(),
+            index,
+            tmux_name: tmux_name.to_string(),
+            tide_name: tide_name.map(str::to_string),
+            name: logical_name,
+            active,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,12 +520,7 @@ mod tests {
     use super::*;
 
     fn w(id: &str, index: usize, name: &str) -> WindowInfo {
-        WindowInfo {
-            id: id.to_string(),
-            index,
-            name: name.to_string(),
-            active: false,
-        }
+        WindowInfo::new(id, index, name, false)
     }
 
     #[test]

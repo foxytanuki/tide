@@ -7,17 +7,15 @@ use tide::view::build_tree_items;
 
 fn fixture_windows(count: usize) -> Vec<WindowInfo> {
     (0..count)
-        .map(|idx| WindowInfo {
-            id: format!("@{}", idx + 1),
-            index: idx + 1,
-            name: match idx % 5 {
+        .map(|idx| {
+            let name = match idx % 5 {
                 0 => format!("proj{}:api:tab{}", idx % 25, idx),
                 1 => format!("proj{}:ui:tab{}", idx % 25, idx),
                 2 => format!("proj{}:ops:tab{}", idx % 25, idx),
                 3 => format!("proj{}:tab{}", idx % 25, idx),
                 _ => format!("scratch-{}", idx),
-            },
-            active: idx == 0,
+            };
+            WindowInfo::new(&format!("@{}", idx + 1), idx + 1, &name, idx == 0)
         })
         .collect()
 }
@@ -37,22 +35,24 @@ fn fixture_model(count: usize) -> Model {
 fn rename_only_windows(count: usize) -> Vec<WindowInfo> {
     let mut windows = fixture_windows(count);
     if let Some(first) = windows.first_mut() {
-        first.name = match first.name.rsplit_once(':') {
+        let name = match first.name.rsplit_once(':') {
             Some((folder, _)) => format!("{folder}:renamed"),
             None => "renamed".to_string(),
         };
+        first.name = name.clone();
+        first.tide_name = Some(name);
     }
     windows
 }
 
 fn add_only_windows(count: usize) -> Vec<WindowInfo> {
     let mut windows = fixture_windows(count);
-    windows.push(WindowInfo {
-        id: format!("@{}", count + 1),
-        index: count + 1,
-        name: format!("proj{}:added", count % 25),
-        active: false,
-    });
+    windows.push(WindowInfo::new(
+        &format!("@{}", count + 1),
+        count + 1,
+        &format!("proj{}:added", count % 25),
+        false,
+    ));
     windows
 }
 

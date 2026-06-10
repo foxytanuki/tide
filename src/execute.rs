@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::cmd::Cmd;
 use crate::metrics;
-use crate::model::{Model, PendingRename, PreviewState, SelectionTarget};
+use crate::model::{Model, PreviewState, SelectionTarget};
 use crate::msg::Msg;
 use crate::tmux::commands;
 use crate::tmux::{TmuxControl, WindowInfo, SIDEBAR_WIDTH};
@@ -393,21 +393,8 @@ async fn handle_new_window<T: TmuxApi>(
         Ok(output) => {
             let window_id = output.trim();
             if !window_id.is_empty() {
+                set_tide_name(model, tmux, window_id, &name).await;
                 disable_window_rename(model, tmux, window_id, "new window").await;
-
-                model.renames.pending.insert(
-                    window_id.to_string(),
-                    PendingRename {
-                        target_name: name.clone(),
-                        observed_count: 0,
-                    },
-                );
-                model.renames.last_window_id = Some(window_id.to_string());
-                debug!(
-                    id = %window_id,
-                    name = %name,
-                    "tracking new window for rename stabilization"
-                );
                 queue.push_front(Cmd::Render);
                 queue.push_front(Cmd::PreviewWindow {
                     id: window_id.to_string(),
@@ -431,6 +418,7 @@ async fn handle_rename_window<T: TmuxApi>(
     name: String,
 ) {
     debug!(id, name, "renaming window");
+    set_tide_name(model, tmux, &id, &name).await;
     disable_window_rename(model, tmux, &id, "before rename").await;
     let cmd_str = commands::rename_window(&id, &name);
     if let Err(err) = tmux.send_command(&cmd_str).await {
@@ -438,6 +426,16 @@ async fn handle_rename_window<T: TmuxApi>(
     } else {
         disable_window_rename(model, tmux, &id, "after rename").await;
         queue.push_front(Cmd::ListWindows);
+    }
+}
+
+async fn set_tide_name<T: TmuxApi>(model: &mut Model, tmux: &mut T, window_id: &str, name: &str) {
+    if let Err(err) = tmux
+        .send_command(&commands::set_tide_name(window_id, name))
+        .await
+    {
+        warn!(%window_id, %name, %err, "failed to persist tide window name");
+        model.error_message = Some(format!("set tide name: {err}"));
     }
 }
 
@@ -822,12 +820,7 @@ mod tests {
     }
 
     fn wi(id: &str, index: usize, name: &str) -> WindowInfo {
-        WindowInfo {
-            id: id.to_string(),
-            index,
-            name: name.to_string(),
-            active: false,
-        }
+        WindowInfo::new(id, index, name, false)
     }
 
     fn track(
@@ -1541,6 +1534,7 @@ mod tests {
             vec![
                 Ok(String::new()),
                 Ok(String::new()),
+                Ok(String::new()),
                 Err("rename failed".to_string()),
                 Ok("@renamed\t%sidebar\t0\n@renamed\t%home_new\t1\n".to_string()),
             ],
@@ -1563,7 +1557,7 @@ mod tests {
         );
         assert_eq!(model.sidebar.window_id, "@renamed");
         assert_eq!(model.sidebar.home_pane_id, "%home_new");
-        assert_eq!(tmux.commands.len(), 4);
+        assert_eq!(tmux.commands.len(), 5);
         assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
         assert!(queue.is_empty());
     }
@@ -1637,6 +1631,7 @@ mod tests {
             Ok("@new\n".to_string()),
             Ok(String::new()),
             Ok(String::new()),
+            Ok(String::new()),
         ]);
         let mut queue = VecDeque::new();
 
@@ -1662,6 +1657,7 @@ mod tests {
             Err("stale pane".to_string()),
             Ok("%sidebar\t1\n".to_string()),
             Ok("@new\n".to_string()),
+            Ok(String::new()),
             Ok(String::new()),
             Ok(String::new()),
         ]);

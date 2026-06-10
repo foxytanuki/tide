@@ -774,12 +774,7 @@ mod tests {
     }
 
     fn window(id: &str, index: usize, name: &str) -> WindowInfo {
-        WindowInfo {
-            id: id.to_string(),
-            index,
-            name: name.to_string(),
-            active: false,
-        }
+        WindowInfo::new(id, index, name, false)
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {

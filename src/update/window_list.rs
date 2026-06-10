@@ -37,45 +37,9 @@ pub(super) fn handle_window_renamed(
     window_id: String,
     name: String,
 ) -> Vec<Cmd> {
-    if let Some(pending) = model.renames.pending.get_mut(&window_id) {
-        let expected_name = pending.target_name.clone();
-        if name != expected_name {
-            pending.observed_count = pending.observed_count.saturating_add(1);
-            debug!(
-                id = window_id.as_str(),
-                current = name.as_str(),
-                expected = expected_name.as_str(),
-                observed = pending.observed_count,
-                "pending rename mismatch from event, correcting immediately"
-            );
-
-            if pending.observed_count >= super::MISSING_PENDING_RENAME_THRESHOLD {
-                clear_pending_rename(model, &window_id);
-                return vec![Cmd::Resync];
-            }
-
-            model.renames.last_window_id = Some(window_id.clone());
-            return vec![Cmd::RenameWindow {
-                id: window_id,
-                name: expected_name,
-            }];
-        }
-
-        pending.observed_count = pending.observed_count.saturating_add(1);
-        debug!(
-            id = window_id.as_str(),
-            name = name.as_str(),
-            observed = pending.observed_count,
-            "pending rename observed from event"
-        );
-
-        if pending.observed_count >= super::STABLE_PENDING_RENAME_THRESHOLD {
-            clear_pending_rename(model, &window_id);
-        }
-        Vec::new()
-    } else {
-        vec![Cmd::Resync]
-    }
+    debug!(%window_id, %name, "physical window rename observed; resyncing logical names");
+    model.renames.pending.remove(&window_id);
+    vec![Cmd::Resync]
 }
 
 pub(super) fn handle_window_list_loaded(
@@ -303,13 +267,6 @@ fn reconcile_pending_renames(
     }
 
     (followup_cmds, stale_pending_ids)
-}
-
-fn clear_pending_rename(model: &mut Model, window_id: &str) {
-    model.renames.pending.remove(window_id);
-    if model.renames.last_window_id.as_deref() == Some(window_id) {
-        model.renames.last_window_id = None;
-    }
 }
 
 fn clear_stale_pending_renames(model: &mut Model, stale_pending_ids: Vec<String>) {

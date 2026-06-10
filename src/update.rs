@@ -174,21 +174,11 @@ mod tests {
     }
 
     fn wi(id: &str, index: usize, name: &str) -> WindowInfo {
-        WindowInfo {
-            id: id.to_string(),
-            index,
-            name: name.to_string(),
-            active: false,
-        }
+        WindowInfo::new(id, index, name, false)
     }
 
     fn active_wi(id: &str, index: usize, name: &str) -> WindowInfo {
-        WindowInfo {
-            id: id.to_string(),
-            index,
-            name: name.to_string(),
-            active: true,
-        }
+        WindowInfo::new(id, index, name, true)
     }
 
     fn assert_new_window_name(cmds: &[Cmd], expected: &str) {
@@ -853,14 +843,8 @@ mod tests {
         );
 
         assert_eq!(cmds.len(), 1);
-        assert!(matches!(
-            &cmds[0],
-            Cmd::RenameWindow { id, name } if id == "@1" && name == "new:new"
-        ));
-        assert_eq!(
-            model.renames.pending.get("@1").map(|p| p.observed_count),
-            Some(4)
-        );
+        assert!(matches!(cmds[0], Cmd::Resync));
+        assert!(!model.renames.pending.contains_key("@1"));
     }
 
     #[test]
@@ -883,9 +867,9 @@ mod tests {
             },
         );
 
-        assert!(cmds.is_empty());
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::Resync));
         assert!(!model.renames.pending.contains_key("@1"));
-        assert_eq!(model.renames.last_window_id, None);
     }
 
     #[test]
@@ -908,12 +892,9 @@ mod tests {
             },
         );
 
-        assert!(cmds.is_empty());
-        assert_eq!(
-            model.renames.pending.get("@1").map(|p| p.observed_count),
-            Some(1)
-        );
-        assert_eq!(model.renames.last_window_id.as_deref(), Some("@1"));
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::Resync));
+        assert!(!model.renames.pending.contains_key("@1"));
     }
 
     #[test]

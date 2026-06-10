@@ -134,7 +134,7 @@ impl TmuxControl {
     pub async fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
         let response = self
             .send_command(
-                "list-windows -F '#{window_id} #{window_index} #{window_name} #{window_active}'",
+                "list-windows -F '#{window_id}\t#{window_index}\t#{window_name}\t#{@tide_name}\t#{window_active}'",
             )
             .await?;
 
@@ -651,27 +651,18 @@ fn send_event(
 }
 
 fn parse_window_line(line: &str) -> Result<WindowInfo> {
-    let mut left = line.splitn(3, ' ');
-    let id = left
-        .next()
-        .ok_or_else(|| anyhow!("missing window_id"))?
-        .to_string();
-
-    let index = left
+    let mut parts = line.splitn(5, '\t');
+    let id = parts.next().ok_or_else(|| anyhow!("missing window_id"))?;
+    let index = parts
         .next()
         .ok_or_else(|| anyhow!("missing window_index"))?
         .parse::<usize>()
         .context("invalid window_index")?;
-
-    let rest = left
-        .next()
-        .ok_or_else(|| anyhow!("missing window_name/window_active"))?;
-
-    let mut right = rest.rsplitn(2, ' ');
-    let active_raw = right
+    let tmux_name = parts.next().ok_or_else(|| anyhow!("missing window_name"))?;
+    let tide_name_raw = parts.next().ok_or_else(|| anyhow!("missing tide_name"))?;
+    let active_raw = parts
         .next()
         .ok_or_else(|| anyhow!("missing window_active"))?;
-    let name = right.next().unwrap_or("").to_string();
 
     let active = match active_raw {
         "1" => true,
@@ -679,12 +670,10 @@ fn parse_window_line(line: &str) -> Result<WindowInfo> {
         other => return Err(anyhow!("invalid window_active value: {other}")),
     };
 
-    Ok(WindowInfo {
-        id,
-        index,
-        name,
-        active,
-    })
+    let tide_name = (!tide_name_raw.is_empty()).then_some(tide_name_raw);
+    Ok(WindowInfo::with_tide_name(
+        id, index, tmux_name, tide_name, active,
+    ))
 }
 
 #[cfg(test)]

@@ -30,6 +30,13 @@ pub fn rename_window(window_id: &str, name: &str) -> String {
     format!("rename-window -t {window_id} {}", quote_tmux(name))
 }
 
+pub fn set_tide_name(window_id: &str, name: &str) -> String {
+    format!(
+        "set-option -w -t {window_id} @tide_name {}",
+        quote_tmux(name)
+    )
+}
+
 pub fn swap_window(source_window_id: &str, target_window_id: &str) -> String {
     format!("swap-window -s {source_window_id} -t {target_window_id}")
 }
