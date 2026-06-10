@@ -2,6 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::io::Stdout;
 use std::pin::Pin;
+use std::time::Instant;
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -227,6 +228,7 @@ async fn handle_preview_window<T: TmuxApi>(
     // Suppress the next expected focus notification from this internal move.
     model.sidebar.ignore_window_changes = 1;
     model.sidebar.pending_internal_focus_window = Some(target_window_id.clone());
+    model.expect_focus_window(target_window_id.clone(), Instant::now());
 
     if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
         warn!(%err, "preview batch failed");
@@ -309,6 +311,7 @@ async fn handle_restore_preview<T: TmuxApi>(
         // Suppress the next expected focus notification from this internal move.
         model.sidebar.ignore_window_changes = 1;
         model.sidebar.pending_internal_focus_window = Some(orig_window.clone());
+        model.expect_focus_window(orig_window.clone(), Instant::now());
 
         let restored = if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
             warn!(%err, "restore batch failed, trying fallback");
@@ -321,6 +324,7 @@ async fn handle_restore_preview<T: TmuxApi>(
             } else {
                 model.sidebar.ignore_window_changes = 1;
                 model.sidebar.pending_internal_focus_window = Some(orig_window.clone());
+                model.expect_focus_window(orig_window.clone(), Instant::now());
                 let fallback = join_batch_with_window_select(
                     &model.sidebar.pane_id,
                     &fallback_leftmost,
@@ -637,6 +641,7 @@ async fn handle_follow_to_window<T: TmuxApi>(
     // Suppress the next expected focus notification from this internal move.
     model.sidebar.ignore_window_changes = 1;
     model.sidebar.pending_internal_focus_window = Some(target_window_id.clone());
+    model.expect_focus_window(target_window_id.clone(), Instant::now());
 
     if let Err(err) = send_batch_with_reconcile(model, tmux, &batch).await {
         warn!(%err, "follow batch failed");

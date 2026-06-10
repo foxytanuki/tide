@@ -9,6 +9,12 @@ use crate::tree::{build_tree, get_node_mut, restore_folder_expanded, TreeNode, W
 use super::navigation::clear_mode_if_missing_target;
 
 pub(super) fn handle_window_focus_changed(model: &mut Model, window_id: String) -> Vec<Cmd> {
+    if model.consume_expected_focus_window(&window_id) {
+        model.sidebar.ignore_window_changes = 0;
+        model.sidebar.pending_internal_focus_window = None;
+        return vec![Cmd::EnsureSidebarWidth];
+    }
+
     if model.sidebar.ignore_window_changes > 0 {
         let expected = model.sidebar.pending_internal_focus_window.as_deref();
         if expected == Some(window_id.as_str()) {
@@ -25,6 +31,7 @@ pub(super) fn handle_window_focus_changed(model: &mut Model, window_id: String) 
     model.sidebar.preview = PreviewState::Home;
     model.sidebar.ignore_window_changes = 0;
     model.sidebar.pending_internal_focus_window = None;
+    model.pending_effects.clear();
     vec![
         Cmd::FollowToWindow { window_id },
         Cmd::EnsureSidebarWidth,

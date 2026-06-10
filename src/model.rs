@@ -28,6 +28,7 @@ pub struct Model {
     pub renames: RenameState,
     pub reorder: ReorderState,
     pub ai: AiState,
+    pub pending_effects: Vec<PendingEffect>,
     /// Terminal size for mouse hit-testing (width, height).
     pub terminal_size: (u16, u16),
 }
@@ -72,6 +73,17 @@ pub struct ReorderState {
 pub struct ReorderSnapshot {
     pub tree: Vec<TreeNode>,
     pub cursor: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingEffectKind {
+    FocusWindow(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingEffect {
+    pub kind: PendingEffectKind,
+    pub expires_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,8 +212,34 @@ impl Model {
                 poll_skip_ticks: 0,
                 recently_finished: HashMap::new(),
             },
+            pending_effects: Vec::new(),
             terminal_size: (80, 24),
         }
+    }
+
+    pub fn expect_focus_window(&mut self, window_id: String, now: Instant) {
+        self.pending_effects.push(PendingEffect {
+            kind: PendingEffectKind::FocusWindow(window_id),
+            expires_at: now + std::time::Duration::from_secs(2),
+        });
+    }
+
+    pub fn consume_expected_focus_window(&mut self, window_id: &str) -> bool {
+        if let Some(index) = self.pending_effects.iter().position(|effect| {
+            matches!(&effect.kind, PendingEffectKind::FocusWindow(expected) if expected == window_id)
+        }) {
+            self.pending_effects.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn expire_pending_effects(&mut self, now: Instant) -> bool {
+        let before = self.pending_effects.len();
+        self.pending_effects
+            .retain(|effect| effect.expires_at > now);
+        self.pending_effects.len() != before
     }
 
     pub fn tree(&self) -> &[TreeNode] {

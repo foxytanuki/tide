@@ -672,6 +672,9 @@ fn process_tmux_batch(
 ) -> Vec<Cmd> {
     debug!(?first_event, "received tmux event");
     let mut cmds = process_tmux_event(model, first_event);
+    if model.expire_pending_effects(Instant::now()) {
+        cmds.push(Cmd::Resync);
+    }
     let mut processed_events = 1;
 
     while processed_events < MAX_TMUX_EVENTS_PER_BATCH {
