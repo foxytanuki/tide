@@ -641,10 +641,10 @@ fn process_tmux_event(model: &mut Model, tmux_event: TmuxEvent) -> Vec<Cmd> {
                     vec![Cmd::EnsureSidebarWidth]
                 } else {
                     model.sidebar.ignore_layout_change_until = None;
-                    vec![Cmd::EnsureSidebarWidth, Cmd::ValidateSidebarPanes]
+                    vec![Cmd::ReconcileSidebar]
                 }
             } else {
-                vec![Cmd::EnsureSidebarWidth, Cmd::ValidateSidebarPanes]
+                vec![Cmd::ReconcileSidebar]
             }
         }
         TmuxEvent::LayoutChange(_) => Vec::new(),
@@ -719,6 +719,13 @@ fn coalesce_commands(cmds: Vec<Cmd>) -> Vec<Cmd> {
             Cmd::EnsureSidebarWidth => {
                 if !has_ensure_sidebar_width {
                     has_ensure_sidebar_width = true;
+                    result.push(cmd);
+                }
+            }
+            Cmd::ReconcileSidebar => {
+                if !has_ensure_sidebar_width && !has_validate_sidebar_panes {
+                    has_ensure_sidebar_width = true;
+                    has_validate_sidebar_panes = true;
                     result.push(cmd);
                 }
             }
@@ -804,9 +811,8 @@ mod tests {
 
         let cmds = process_tmux_event(&mut model, TmuxEvent::LayoutChange("@home".to_string()));
 
-        assert_eq!(cmds.len(), 2);
-        assert!(matches!(cmds[0], Cmd::EnsureSidebarWidth));
-        assert!(matches!(cmds[1], Cmd::ValidateSidebarPanes));
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::ReconcileSidebar));
         assert!(model.sidebar.ignore_layout_change_until.is_none());
     }
 
@@ -1037,9 +1043,8 @@ mod tests {
             TmuxEvent::LayoutChange("@home".to_string()),
         );
 
-        assert_eq!(cmds.len(), 2);
-        assert!(matches!(cmds[0], Cmd::EnsureSidebarWidth));
-        assert!(matches!(cmds[1], Cmd::ValidateSidebarPanes));
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::ReconcileSidebar));
     }
 
     #[test]

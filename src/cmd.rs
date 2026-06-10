@@ -26,6 +26,7 @@ pub enum Cmd {
         window_id: String,
     },
     EnsureSidebarWidth,
+    ReconcileSidebar,
     ListWindows,
     Resync,
     ApplyLayoutHelper,

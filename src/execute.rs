@@ -24,9 +24,9 @@ use self::ai::{check_border, poll_ai_processes, reset_all_borders};
 use self::layout::{
     apply_layout_helper, choose_home_pane_in_window, choose_leftmost_pane_in_window,
     cleanup_helper_managed_windows, ensure_sidebar_width, query_window_pane_targets,
-    reapply_helper_layout_if_needed, reconcile_sidebar_state, resolve_new_window_cwd,
-    restore_window_layout, save_window_layout, save_window_layout_without_pane,
-    validate_sidebar_panes,
+    reapply_helper_layout_if_needed, reconcile_sidebar_placement, reconcile_sidebar_state,
+    resolve_new_window_cwd, restore_window_layout, save_window_layout,
+    save_window_layout_without_pane, validate_sidebar_panes,
 };
 
 #[cfg(test)]
@@ -110,6 +110,7 @@ pub async fn execute_commands<T: TmuxApi>(
                 window_id: target_window_id,
             } => handle_follow_to_window(model, tmux, &mut queue, target_window_id).await,
             Cmd::EnsureSidebarWidth => ensure_sidebar_width(model, tmux).await,
+            Cmd::ReconcileSidebar => reconcile_sidebar_placement(model, tmux, &mut queue).await,
             Cmd::ValidateSidebarPanes => validate_sidebar_panes(model, tmux, &mut queue).await,
             Cmd::ListWindows | Cmd::Resync => handle_list_windows(model, tmux, &mut queue).await,
             Cmd::PollAiProcesses => poll_ai_processes(model, tmux, &mut queue).await,

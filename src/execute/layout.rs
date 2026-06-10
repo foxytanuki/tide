@@ -8,6 +8,39 @@ use crate::model::{Model, PendingRename, PreviewState};
 use crate::tmux::commands;
 use crate::tmux::{quote_tmux, shell_quote, WindowInfo, SIDEBAR_WIDTH};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarDesiredState {
+    window_id: String,
+    pane_id: String,
+    width: u16,
+}
+
+impl SidebarDesiredState {
+    fn from_model(model: &Model) -> Self {
+        Self {
+            window_id: model.sidebar.window_id.clone(),
+            pane_id: model.sidebar.pane_id.clone(),
+            width: SIDEBAR_WIDTH,
+        }
+    }
+}
+
+pub(super) async fn reconcile_sidebar_placement<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    queue: &mut VecDeque<Cmd>,
+) {
+    let desired = SidebarDesiredState::from_model(model);
+    debug!(
+        window = %desired.window_id,
+        pane = %desired.pane_id,
+        width = desired.width,
+        "reconciling sidebar placement"
+    );
+    ensure_sidebar_width(model, tmux).await;
+    validate_sidebar_panes(model, tmux, queue).await;
+}
+
 async fn query_window_layout<T: TmuxApi>(tmux: &mut T, window_id: &str) -> Option<String> {
     match tmux
         .send_command(&format!(
