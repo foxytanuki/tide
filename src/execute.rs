@@ -393,17 +393,7 @@ async fn handle_new_window<T: TmuxApi>(
         Ok(output) => {
             let window_id = output.trim();
             if !window_id.is_empty() {
-                let disable_rename = commands::disable_window_rename(window_id);
-                if let Err(err) = tmux.send_command(&disable_rename).await {
-                    warn!(
-                        id = %window_id,
-                        name = %name,
-                        %err,
-                        "failed to disable rename updates for new window"
-                    );
-                } else {
-                    debug!(id = %window_id, "disabled automatic/allow-rename for new window");
-                }
+                disable_window_rename(model, tmux, window_id, "new window").await;
 
                 model.renames.pending.insert(
                     window_id.to_string(),
@@ -441,27 +431,30 @@ async fn handle_rename_window<T: TmuxApi>(
     name: String,
 ) {
     debug!(id, name, "renaming window");
-    let disable_rename = commands::disable_window_rename(&id);
-    if let Err(err) = tmux.send_command(&disable_rename).await {
-        warn!(%id, %err, "failed to disable automatic-rename before rename");
-    } else {
-        debug!(%id, "disabled rename options before rename");
-    }
+    disable_window_rename(model, tmux, &id, "before rename").await;
     let cmd_str = commands::rename_window(&id, &name);
     if let Err(err) = tmux.send_command(&cmd_str).await {
         reconcile_after_command_failure(model, tmux, queue, "rename-window", &err, true).await;
     } else {
-        if let Err(err) = tmux.send_command(&disable_rename).await {
-            warn!(
-                %id,
-                %err,
-                "failed to keep rename updates disabled after rename"
-            );
-        } else {
-            debug!(%id, "kept rename options disabled after rename");
-        }
+        disable_window_rename(model, tmux, &id, "after rename").await;
         queue.push_front(Cmd::ListWindows);
     }
+}
+
+async fn disable_window_rename<T: TmuxApi>(
+    model: &mut Model,
+    tmux: &mut T,
+    window_id: &str,
+    context: &str,
+) {
+    for cmd in commands::disable_window_rename(window_id) {
+        if let Err(err) = tmux.send_command(&cmd).await {
+            warn!(%window_id, %context, %err, "failed to disable window rename option");
+            model.error_message = Some(format!("disable rename: {err}"));
+            return;
+        }
+    }
+    debug!(%window_id, %context, "disabled window rename options");
 }
 
 async fn handle_reorder_windows<T: TmuxApi>(
@@ -1547,6 +1540,7 @@ mod tests {
         let mut tmux = FakeTmux::with_window_lists(
             vec![
                 Ok(String::new()),
+                Ok(String::new()),
                 Err("rename failed".to_string()),
                 Ok("@renamed\t%sidebar\t0\n@renamed\t%home_new\t1\n".to_string()),
             ],
@@ -1569,7 +1563,7 @@ mod tests {
         );
         assert_eq!(model.sidebar.window_id, "@renamed");
         assert_eq!(model.sidebar.home_pane_id, "%home_new");
-        assert_eq!(tmux.commands.len(), 3);
+        assert_eq!(tmux.commands.len(), 4);
         assert!(matches!(queue.pop_front(), Some(Cmd::Render)));
         assert!(queue.is_empty());
     }
@@ -1642,6 +1636,7 @@ mod tests {
             Ok("/work/project\n".to_string()),
             Ok("@new\n".to_string()),
             Ok(String::new()),
+            Ok(String::new()),
         ]);
         let mut queue = VecDeque::new();
 
@@ -1667,6 +1662,7 @@ mod tests {
             Err("stale pane".to_string()),
             Ok("%sidebar\t1\n".to_string()),
             Ok("@new\n".to_string()),
+            Ok(String::new()),
             Ok(String::new()),
         ]);
         let mut queue = VecDeque::new();
@@ -1759,6 +1755,7 @@ mod tests {
             Ok(format!("1234,{}", layout.split_once(',').unwrap().1)),
             Ok(String::new()),
             Ok(String::new()),
+            Ok(String::new()),
             Ok("%2\tbash\n%3\tbash\n%4\tbash\n%5\tbash\n%6\tbash\n%7\tbash\n".to_string()),
             Ok(String::new()),
             Ok(String::new()),
@@ -1779,8 +1776,12 @@ mod tests {
         let disable_idx = tmux
             .commands
             .iter()
-            .position(|cmd| cmd == "set-window-option -t @old automatic-rename off ; set-window-option -t @old allow-rename off")
+            .position(|cmd| cmd == "set-window-option -t @old automatic-rename off")
             .expect("layout helper should disable window rename");
+        assert!(tmux
+            .commands
+            .iter()
+            .any(|cmd| cmd == "set-window-option -t @old allow-rename off"));
         let lazygit_idx = tmux
             .commands
             .iter()
@@ -1856,7 +1857,11 @@ mod tests {
         assert!(tmux
             .commands
             .iter()
-            .any(|cmd| cmd == "set-window-option -t @old automatic-rename off ; set-window-option -t @old allow-rename off"));
+            .any(|cmd| cmd == "set-window-option -t @old automatic-rename off"));
+        assert!(tmux
+            .commands
+            .iter()
+            .any(|cmd| cmd == "set-window-option -t @old allow-rename off"));
         assert!(tmux.commands.iter().any(|cmd| cmd == "select-pane -t %9"));
         assert!(!tmux.commands.iter().any(|cmd| cmd.contains(" lazygit C-m")));
         assert!(!tmux.commands.iter().any(|cmd| cmd.contains(" yazi C-m")));

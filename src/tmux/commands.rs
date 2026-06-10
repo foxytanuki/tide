@@ -38,11 +38,11 @@ pub fn kill_window(window_id: &str) -> String {
     format!("kill-window -t {window_id}")
 }
 
-pub fn disable_window_rename(window_id: &str) -> String {
-    format!(
-        "set-window-option -t {} automatic-rename off ; set-window-option -t {} allow-rename off",
-        window_id, window_id
-    )
+pub fn disable_window_rename(window_id: &str) -> [String; 2] {
+    [
+        format!("set-window-option -t {window_id} automatic-rename off"),
+        format!("set-window-option -t {window_id} allow-rename off"),
+    ]
 }
 
 #[cfg(test)]

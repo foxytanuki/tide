@@ -1037,13 +1037,15 @@ pub(super) async fn apply_layout_helper<T: TmuxApi>(
         return;
     }
 
-    let disable_rename = commands::disable_window_rename(&model.sidebar.window_id);
-    if let Err(err) = tmux.send_command(&disable_rename).await {
-        warn!(
-            window_id = %model.sidebar.window_id,
-            %err,
-            "layout helper: failed to disable automatic rename"
-        );
+    for cmd in commands::disable_window_rename(&model.sidebar.window_id) {
+        if let Err(err) = tmux.send_command(&cmd).await {
+            warn!(
+                window_id = %model.sidebar.window_id,
+                %err,
+                "layout helper: failed to disable window rename option"
+            );
+            break;
+        }
     }
 
     if let Some(name) = preserved_window_name {
