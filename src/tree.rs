@@ -146,10 +146,6 @@ pub fn visible_item_indices(flat: &[FlatItem]) -> Vec<usize> {
         .collect()
 }
 
-pub fn visible_item_number(flat: &[FlatItem], index: usize) -> Option<usize> {
-    flat.get(index)?.visible_number
-}
-
 pub fn next_visible_item(flat: &[FlatItem], current: usize) -> Option<usize> {
     if current >= flat.len() {
         return None;
@@ -376,7 +372,9 @@ pub fn window_ids_in_order(nodes: &[TreeNode]) -> Vec<String> {
     out
 }
 
-pub fn find_folder_flat_index_by_path(
+/// Return the flat index for a folder path in a freshly supplied tree/flat slice.
+/// Prefer `Model`'s cached lookup methods when using the model's current tree.
+pub(crate) fn find_folder_flat_index_by_path(
     flat_items: &[FlatItem],
     nodes: &[TreeNode],
     folder_path: &str,
@@ -392,8 +390,9 @@ pub fn find_folder_flat_index_by_path(
     None
 }
 
-/// Return the flat index for a window id, if present in the current tree.
-pub fn find_window_flat_index_by_id(
+/// Return the flat index for a window id in a freshly supplied tree/flat slice.
+/// Prefer `Model`'s cached lookup methods when using the model's current tree.
+pub(crate) fn find_window_flat_index_by_id(
     flat_items: &[FlatItem],
     nodes: &[TreeNode],
     window_id: &str,
@@ -475,7 +474,7 @@ fn split_folder_parts(name: &str) -> Option<Vec<&str>> {
     Some(parts)
 }
 
-fn join_folder_path(prefix: Option<&str>, name: &str) -> String {
+pub(crate) fn join_folder_path(prefix: Option<&str>, name: &str) -> String {
     match prefix {
         Some(prefix) => format!("{prefix}:{name}"),
         None => name.to_string(),
@@ -665,13 +664,10 @@ mod tests {
 
         assert!(expand_to_window_by_id(tree.as_mut_slice(), "@1"));
 
-        assert_eq!(
-            match &tree[0] {
-                TreeNode::Folder { expanded, .. } => *expanded,
-                _ => false,
-            },
-            true
-        );
+        assert!(match &tree[0] {
+            TreeNode::Folder { expanded, .. } => *expanded,
+            _ => false,
+        });
         assert!(!expand_to_window_by_id(tree.as_mut_slice(), "@missing"));
     }
 

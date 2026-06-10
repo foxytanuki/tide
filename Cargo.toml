@@ -12,7 +12,6 @@ categories = ["command-line-utilities"]
 ratatui = "0.30"
 crossterm = "0.29"
 tokio = { version = "1", features = ["full"] }
-tui-tree-widget = "0.24"
 unicode-width = "0.2.2"
 anyhow = "1"
 libc = "0.2"

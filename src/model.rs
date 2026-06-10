@@ -74,6 +74,14 @@ pub struct ReorderSnapshot {
     pub cursor: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiPaneTrack {
+    pub ai_pid: u32,
+    pub last_cpu_ticks: u64,
+    pub polls_since_active: u16,
+    pub consecutive_bursts: u8,
+}
+
 pub struct AiState {
     /// Pane IDs currently running AI processes (actively working).
     pub panes: HashSet<String>,
@@ -82,8 +90,7 @@ pub struct AiState {
     /// Pane IDs currently highlighted with AI background.
     pub highlighted_panes: HashSet<String>,
     /// AI process CPU tracking for activity detection.
-    /// Maps pane_id → (ai_pid, last_cpu_ticks, polls_since_active, consecutive_bursts).
-    pub cpu_tracker: HashMap<String, (u32, u64, u16, u8)>,
+    pub cpu_tracker: HashMap<String, AiPaneTrack>,
     /// Count of %output events per pane since last poll (for streaming detection).
     /// Reset to 0 after each classify_active_panes call.
     pub output_counts: HashMap<String, u32>,
@@ -207,6 +214,26 @@ impl Model {
 
     pub fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    /// Hit-test a terminal row against the rendered tree area.
+    pub fn item_at_row(&self, row: u16) -> Option<usize> {
+        let footer_height: u16 = match self.mode {
+            Mode::Renaming { .. } | Mode::RenamingFolder { .. } | Mode::CreatingProject => 2,
+            _ => 1,
+        };
+        let tree_y = 1;
+        let tree_height = self
+            .terminal_size
+            .1
+            .saturating_sub(2)
+            .saturating_sub(footer_height);
+
+        if row < tree_y || row >= tree_y + tree_height {
+            return None;
+        }
+        let index = (row - tree_y) as usize;
+        (index < self.flat_items.len()).then_some(index)
     }
 
     pub fn set_cursor(&mut self, idx: usize) {

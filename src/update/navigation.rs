@@ -2,12 +2,13 @@ use crate::cmd::Cmd;
 use crate::model::{Mode, Model, MoveSubject, SelectionTarget};
 use crate::tree::{
     find_folder_flat_index_by_path, find_parent_folder, find_window_flat_index_by_id, flatten,
-    get_node, get_node_mut, move_node_to_position, next_visible_item, prev_visible_item,
-    toggle_expand, visible_item_indices, window_ids_in_order, FlatNodeKind, TreeNode, WindowInfo,
+    get_node, get_node_mut, join_folder_path, move_node_to_position, next_visible_item,
+    prev_visible_item, toggle_expand, visible_item_indices, window_ids_in_order, FlatNodeKind,
+    TreeNode, WindowInfo,
 };
 
 use super::input::{clear_input, set_input};
-use super::naming::{join_folder_path, reconstruct_folder_full_name, reconstruct_full_name};
+use super::naming::{reconstruct_folder_full_name, reconstruct_full_name};
 
 pub(super) fn reset_to_normal_mode(model: &mut Model) {
     model.mode = Mode::Normal;

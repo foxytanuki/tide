@@ -49,14 +49,20 @@ crossterm key events ──────┘                                     �
 
 | Module | Role |
 |--------|------|
-| `main.rs` | Bootstrap (launcher), event loop (`tokio::select!`), cleanup |
+| `main.rs` | Binary bootstrap and restart handoff |
+| `app.rs` | Runtime event loop (`tokio::select!`), command dispatch, cleanup |
 | `msg.rs` | `Msg` enum — all events (keys, tmux notifications) |
 | `cmd.rs` | `Cmd` enum — all side effects (tmux commands, render, quit) |
 | `model.rs` | `Model` struct — application state (tree, cursor, mode, preview) |
-| `update.rs` | Pure `update(model, msg) → Vec<Cmd>` — core logic |
+| `update.rs` | Pure dispatcher for `update(model, msg) → Vec<Cmd>` |
+| `update/{window_list,navigation,input,naming}.rs` | Pure update handlers by feature area |
 | `view.rs` | ratatui rendering (header + tree + footer) |
 | `execute.rs` | Command execution, batch orchestration, error reconciliation |
+| `execute/layout.rs` | Sidebar/content pane layout and tmux layout command construction |
+| `execute/ai.rs` | AI pane discovery, process polling, and activity classification |
 | `tree.rs` | `TreeNode` / `FlatItem`, `build_tree()` (`:` grouping), `flatten()` |
+| `metrics.rs` | Runtime counters and timing snapshots |
+| `tmux/commands.rs` | Small typed builders for common tmux command strings |
 | `tmux/control.rs` | PTY allocation, `tmux -CC attach`, async event stream, command queue |
 | `tmux/parser.rs` | Parse control mode events (`%window-add`, `%begin`/`%end`, etc.) |
 | `launcher.rs` | Session bootstrap, sidebar pane creation, re-entry guard (`TIDE_SIDEBAR=1`) |

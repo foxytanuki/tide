@@ -4,8 +4,9 @@ use std::path::Path;
 use anyhow::Result;
 use tokio::process::Command;
 
+use crate::tmux::{shell_quote, SIDEBAR_WIDTH};
+
 pub const DEFAULT_SESSION_NAME: &str = "tide";
-const SIDEBAR_WIDTH_CHARS: &str = "30";
 const INITIAL_WINDOW_NAME: &str = "general:tab1";
 const FALLBACK_SESSION_NAME: &str = "main";
 
@@ -89,10 +90,6 @@ pub async fn detect_session_name() -> String {
     }
 }
 
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 fn build_sidebar_inner_cmd() -> String {
     let exe = env::current_exe()
         .unwrap_or_else(|_| "tide".into())
@@ -142,11 +139,12 @@ fn split_sidebar_in_session(session: &str, inner_cmd: &str, detached: bool) -> R
     if detached {
         cmd.arg("-d");
     }
+    let sidebar_width = SIDEBAR_WIDTH.to_string();
     let output = cmd
         .args([
             "-fhb",
             "-l",
-            SIDEBAR_WIDTH_CHARS,
+            sidebar_width.as_str(),
             "-P",
             "-F",
             "#{pane_id}",

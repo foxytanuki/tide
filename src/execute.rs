@@ -12,7 +12,7 @@ use crate::metrics;
 use crate::model::{Model, PendingRename, PreviewState, SelectionTarget};
 use crate::msg::Msg;
 use crate::tmux::commands;
-use crate::tmux::{TmuxControl, WindowInfo};
+use crate::tmux::{TmuxControl, WindowInfo, SIDEBAR_WIDTH};
 use crate::update::update;
 use crate::view::render;
 
@@ -45,7 +45,6 @@ use self::layout::{
 };
 
 pub type AppTerminal = Terminal<CrosstermBackend<Stdout>>;
-const SIDEBAR_WIDTH_CHARS: u16 = 30;
 const LAYOUT_CHANGE_SUPPRESSION_MS: u64 = 500;
 
 pub trait TmuxApi {
@@ -132,14 +131,14 @@ fn join_batch_with_window_select(
 ) -> String {
     format!(
         "join-pane -dfhb -l {} -s {} -t {} ; select-window -t {} ; select-pane -t {}",
-        SIDEBAR_WIDTH_CHARS, sidebar_pane_id, join_target, window_id, sidebar_pane_id,
+        SIDEBAR_WIDTH, sidebar_pane_id, join_target, window_id, sidebar_pane_id,
     )
 }
 
 fn join_batch_without_window_select(sidebar_pane_id: &str, join_target: &str) -> String {
     format!(
         "join-pane -dfhb -l {} -s {} -t {}",
-        SIDEBAR_WIDTH_CHARS, sidebar_pane_id, join_target,
+        SIDEBAR_WIDTH, sidebar_pane_id, join_target,
     )
 }
 
@@ -221,7 +220,7 @@ async fn handle_preview_window<T: TmuxApi>(
 
     // Action phase: batch all visual tmux operations into a single
     // command so tmux processes them in one server tick (no flicker).
-    // -l {SIDEBAR_WIDTH_CHARS} sets sidebar width at join time to avoid intermediate resize.
+    // -l {SIDEBAR_WIDTH} sets sidebar width at join time to avoid intermediate resize.
     let batch =
         join_batch_with_window_select(&model.sidebar.pane_id, &join_target, &target_window_id);
 
@@ -790,6 +789,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+    use crate::model::AiPaneTrack;
 
     struct FakeTmux {
         responses: VecDeque<Result<String, String>>,
@@ -834,6 +834,20 @@ mod tests {
             index,
             name: name.to_string(),
             active: false,
+        }
+    }
+
+    fn track(
+        ai_pid: u32,
+        last_cpu_ticks: u64,
+        polls_since_active: u16,
+        consecutive_bursts: u8,
+    ) -> AiPaneTrack {
+        AiPaneTrack {
+            ai_pid,
+            last_cpu_ticks,
+            polls_since_active,
+            consecutive_bursts,
         }
     }
 
@@ -1058,7 +1072,7 @@ mod tests {
         }];
         // polls=0 (never active), even with high CPU — should stay idle
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, 0u16, 0u8));
+        prev.insert("%10".to_string(), track(99999, 50000, 0, 0));
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
         assert!(
@@ -1086,7 +1100,7 @@ mod tests {
             "single burst should not activate first-seen pane"
         );
         assert!(counts.is_empty(), "counts should be reset after poll");
-        let &(_, _, _, bursts) = prev.get("%10").unwrap();
+        let bursts = prev.get("%10").unwrap().consecutive_bursts;
         assert_eq!(bursts, 1, "should have recorded 1 consecutive burst");
     }
 
@@ -1113,7 +1127,7 @@ mod tests {
             panes.contains("%10"),
             "consecutive bursts should activate pane"
         );
-        let &(_, _, polls, _) = prev.get("%10").unwrap();
+        let polls = prev.get("%10").unwrap().polls_since_active;
         assert_eq!(polls, 1, "polls should be 1 after activation");
     }
 
@@ -1126,7 +1140,7 @@ mod tests {
         }];
         // Existing pane with baseline (polls=0, never active)
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, 0u16, 0u8));
+        prev.insert("%10".to_string(), track(99999, 50000, 0, 0));
 
         let mut counts = HashMap::new();
         counts.insert("%10".to_string(), MIN_OUTPUT_BURST);
@@ -1136,7 +1150,9 @@ mod tests {
             !panes.contains("%10"),
             "single burst should not activate idle pane"
         );
-        let &(_, _, polls, bursts) = prev.get("%10").unwrap();
+        let track = prev.get("%10").unwrap();
+        let polls = track.polls_since_active;
+        let bursts = track.consecutive_bursts;
         assert_eq!(polls, 0, "should stay idle");
         assert_eq!(bursts, 1, "should record 1 consecutive burst");
     }
@@ -1160,7 +1176,7 @@ mod tests {
         // Gap (no burst)
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut counts);
         assert!(!panes.contains("%10"));
-        let &(_, _, _, bursts) = prev.get("%10").unwrap();
+        let bursts = prev.get("%10").unwrap().consecutive_bursts;
         assert_eq!(bursts, 0, "burst counter should reset on gap");
 
         // Another burst — starts counting from 1 again
@@ -1180,7 +1196,7 @@ mod tests {
         let mut prev = HashMap::new();
         prev.insert(
             "%10".to_string(),
-            (99999u32, 50000u64, AI_CPU_GRACE_POLLS, 0u8),
+            track(99999, 50000, AI_CPU_GRACE_POLLS, 0),
         );
 
         // Output burst on already-active pane should reset grace (no consecutive requirement)
@@ -1192,7 +1208,7 @@ mod tests {
             panes.contains("%10"),
             "output burst should reset grace timer"
         );
-        let &(_, _, polls, _) = prev.get("%10").unwrap();
+        let polls = prev.get("%10").unwrap().polls_since_active;
         assert_eq!(polls, 1, "polls should reset to 1");
     }
 
@@ -1206,7 +1222,7 @@ mod tests {
         // polls=1 means just activated by streaming, now no output but CPU still working
         // Since fake PID won't have /proc entry, cpu_delta=0, so grace counts down
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, 1u16, 0u8));
+        prev.insert("%10".to_string(), track(99999, 50000, 1, 0));
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
         // With fake PID, cpu_delta=0, so grace counts down (polls 1→2)
@@ -1216,7 +1232,7 @@ mod tests {
             "should stay active within grace period"
         );
 
-        let &(_, _, polls, _) = prev.get("%10").unwrap();
+        let polls = prev.get("%10").unwrap().polls_since_active;
         assert_eq!(
             polls, 2,
             "polls counter should increment (no CPU activity from fake pid)"
@@ -1234,7 +1250,7 @@ mod tests {
         let mut prev = HashMap::new();
         prev.insert(
             "%10".to_string(),
-            (99999u32, 50000u64, AI_CPU_GRACE_POLLS, 0u8),
+            track(99999, 50000, AI_CPU_GRACE_POLLS, 0),
         );
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
@@ -1253,7 +1269,7 @@ mod tests {
         }];
         // polls=2 means was active, been quiet for 2 polls — still within 3s grace
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, 2u16, 0u8));
+        prev.insert("%10".to_string(), track(99999, 50000, 2, 0));
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
         assert!(
@@ -1266,7 +1282,7 @@ mod tests {
     fn classify_active_panes_cleans_stale_entries() {
         let candidates = vec![]; // no AI panes
         let mut prev = HashMap::new();
-        prev.insert("%gone".to_string(), (123u32, 50000u64, 0u16, 0u8));
+        prev.insert("%gone".to_string(), track(123, 50000, 0, 0));
 
         let _ = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());
         assert!(prev.is_empty(), "stale entries should be cleaned");
@@ -1302,7 +1318,7 @@ mod tests {
         let mut prev = HashMap::new();
         prev.insert(
             "%10".to_string(),
-            (99999u32, 50000u64, AI_CPU_GRACE_POLLS + 1, 0u8),
+            track(99999, 50000, AI_CPU_GRACE_POLLS + 1, 0),
         );
 
         // No streaming — should demote to idle
@@ -1339,7 +1355,7 @@ mod tests {
         }];
         // polls=2 means active, been quiet for 2 polls — within grace
         let mut prev = HashMap::new();
-        prev.insert("%10".to_string(), (99999u32, 50000u64, 2u16, 0u8));
+        prev.insert("%10".to_string(), track(99999, 50000, 2, 0));
 
         // Even 1 output event (spinner) should sustain grace
         let mut counts = HashMap::new();
@@ -1351,7 +1367,7 @@ mod tests {
             "any output should sustain grace period"
         );
 
-        let &(_, _, polls, _) = prev.get("%10").unwrap();
+        let polls = prev.get("%10").unwrap().polls_since_active;
         assert_eq!(
             polls, 1,
             "polls should reset to 1 when output sustains grace"
@@ -1369,7 +1385,7 @@ mod tests {
         let mut prev = HashMap::new();
         prev.insert(
             "%10".to_string(),
-            (99999u32, 50000u64, AI_CPU_GRACE_POLLS, 0u8),
+            track(99999, 50000, AI_CPU_GRACE_POLLS, 0),
         );
 
         let (panes, _) = classify_active_panes(&candidates, &mut prev, &mut HashMap::new());

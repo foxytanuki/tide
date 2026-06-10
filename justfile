@@ -4,7 +4,7 @@ build:
 
 # Run clippy with warnings as errors
 check:
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets -- -D warnings
 
 # Build and install tide
 install:

@@ -761,7 +761,7 @@ mod tests {
         assert!(ok);
         assert!(!pending_resync);
         let after = snapshot_tmux_metrics();
-        assert!(after.pane_output_dropped >= before.pane_output_dropped + 1);
+        assert!(after.pane_output_dropped > before.pane_output_dropped);
 
         let evt = rx.try_recv().expect("expected prefilled event");
         assert_eq!(evt, super::super::TmuxEvent::WindowAdd("@1".to_string()));
@@ -783,13 +783,13 @@ mod tests {
         assert!(ok);
         assert!(pending_resync);
         let deferred = snapshot_tmux_metrics();
-        assert!(deferred.coalesced_resync_deferred >= before.coalesced_resync_deferred + 1);
+        assert!(deferred.coalesced_resync_deferred > before.coalesced_resync_deferred);
 
         let _ = rx.try_recv().expect("expected prefilled event");
         assert!(flush_pending_resync_event(&tx, &mut pending_resync));
         assert!(!pending_resync);
         let flushed = snapshot_tmux_metrics();
-        assert!(flushed.coalesced_resync_flushed >= before.coalesced_resync_flushed + 1);
+        assert!(flushed.coalesced_resync_flushed > before.coalesced_resync_flushed);
 
         let evt = rx.try_recv().expect("expected deferred resync event");
         assert_eq!(

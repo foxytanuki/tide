@@ -1,13 +1,14 @@
 use crate::cmd::Cmd;
 use crate::model::{Mode, Model};
 use crate::msg::Msg;
-use crate::view::tree_item_at;
 
+mod ai;
 mod input;
 mod naming;
 mod navigation;
 mod window_list;
 
+use ai::*;
 use input::*;
 use naming::*;
 use navigation::*;
@@ -57,53 +58,13 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         Msg::WindowRenamed { window_id, name } => handle_window_renamed(model, window_id, name),
         Msg::WindowListLoaded(windows) => handle_window_list_loaded(model, windows),
         Msg::AiProcessPollResult { panes, windows } => {
-            use std::time::Instant;
-
-            const RECENTLY_FINISHED_TIMEOUT: std::time::Duration =
-                std::time::Duration::from_secs(5 * 60);
-
-            let now = Instant::now();
-            let mut recently_changed = false;
-
-            // Detect windows that just finished AI (were active, now gone)
-            for old_win in &model.ai.windows {
-                if !windows.contains(old_win) {
-                    model.ai.recently_finished.insert(old_win.clone(), now);
-                    recently_changed = true;
-                }
-            }
-            // Remove windows that became active again
-            for new_win in &windows {
-                if model.ai.recently_finished.remove(new_win).is_some() {
-                    recently_changed = true;
-                }
-            }
-            // Expire old entries
-            let before_len = model.ai.recently_finished.len();
-            model.ai.recently_finished.retain(|_, finished_at| {
-                now.duration_since(*finished_at) < RECENTLY_FINISHED_TIMEOUT
-            });
-            if model.ai.recently_finished.len() != before_len {
-                recently_changed = true;
-            }
-
-            let ai_changed = panes != model.ai.panes || windows != model.ai.windows;
-            model.ai.panes = panes;
-            model.ai.windows = windows;
-
-            if ai_changed {
-                vec![Cmd::CheckBorder, Cmd::Render]
-            } else if recently_changed {
-                vec![Cmd::Render]
-            } else {
-                vec![]
-            }
+            handle_ai_process_poll_result(model, panes, windows)
         }
         Msg::MouseClick { row } => {
             if !matches!(model.mode, Mode::Normal) {
                 return vec![];
             }
-            match tree_item_at(model, row) {
+            match model.item_at_row(row) {
                 Some(index) => handle_mouse_click(model, index),
                 None => vec![],
             }

@@ -4,7 +4,7 @@ use tracing::{debug, warn};
 
 use super::{enqueue_follow_up, TmuxApi};
 use crate::cmd::Cmd;
-use crate::model::Model;
+use crate::model::{AiPaneTrack, Model};
 use crate::msg::Msg;
 use crate::update::update;
 
@@ -285,7 +285,7 @@ const MAX_PROC_TREE_DEPTH: u8 = 8;
 
 pub(super) fn classify_active_panes(
     candidates: &[AiPaneCandidate],
-    prev_cpu: &mut HashMap<String, (u32, u64, u16, u8)>,
+    prev_cpu: &mut HashMap<String, AiPaneTrack>,
     output_counts: &mut HashMap<String, u32>,
 ) -> (HashSet<String>, HashSet<String>) {
     let mut active_panes = HashSet::new();
@@ -301,51 +301,46 @@ pub(super) fn classify_active_panes(
         let output_count = output_counts.get(&candidate.pane_id).copied().unwrap_or(0);
         let is_burst = output_count >= MIN_OUTPUT_BURST;
 
-        let (is_active, new_polls, new_bursts) = if let Some(&(
-            prev_pid,
-            prev_ticks,
-            polls,
-            bursts,
-        )) = prev_cpu.get(&candidate.pane_id)
-        {
-            if prev_pid != ai_pid {
-                let bursts = if is_burst { 1 } else { 0 };
-                let activated = bursts >= MIN_CONSECUTIVE_BURSTS;
-                (activated, if activated { 1 } else { 0 }, bursts)
-            } else if is_burst {
-                let bursts = bursts.saturating_add(1);
-                if polls >= 1 || bursts >= MIN_CONSECUTIVE_BURSTS {
-                    (true, 1, bursts)
-                } else {
-                    (false, 0, bursts)
-                }
-            } else if polls == 0 {
-                (false, 0, 0)
-            } else if polls <= AI_CPU_GRACE_POLLS {
-                if output_count > 0 {
-                    (true, 1, 0)
-                } else {
-                    let cpu_delta = current_cpu.saturating_sub(prev_ticks);
-                    if cpu_delta >= MIN_CPU_DELTA_FOR_GRACE {
+        let (is_active, new_polls, new_bursts) =
+            if let Some(prev) = prev_cpu.get(&candidate.pane_id) {
+                if prev.ai_pid != ai_pid {
+                    let bursts = if is_burst { 1 } else { 0 };
+                    let activated = bursts >= MIN_CONSECUTIVE_BURSTS;
+                    (activated, if activated { 1 } else { 0 }, bursts)
+                } else if is_burst {
+                    let bursts = prev.consecutive_bursts.saturating_add(1);
+                    if prev.polls_since_active >= 1 || bursts >= MIN_CONSECUTIVE_BURSTS {
+                        (true, 1, bursts)
+                    } else {
+                        (false, 0, bursts)
+                    }
+                } else if prev.polls_since_active == 0 {
+                    (false, 0, 0)
+                } else if prev.polls_since_active <= AI_CPU_GRACE_POLLS {
+                    if output_count > 0 {
                         (true, 1, 0)
                     } else {
-                        let new_polls = polls.saturating_add(1);
-                        (new_polls <= AI_CPU_GRACE_POLLS, new_polls, 0)
+                        let cpu_delta = current_cpu.saturating_sub(prev.last_cpu_ticks);
+                        if cpu_delta >= MIN_CPU_DELTA_FOR_GRACE {
+                            (true, 1, 0)
+                        } else {
+                            let new_polls = prev.polls_since_active.saturating_add(1);
+                            (new_polls <= AI_CPU_GRACE_POLLS, new_polls, 0)
+                        }
                     }
+                } else {
+                    (false, 0, 0)
                 }
             } else {
-                (false, 0, 0)
-            }
-        } else {
-            let bursts = if is_burst { 1 } else { 0 };
-            (false, 0, bursts)
-        };
+                let bursts = if is_burst { 1 } else { 0 };
+                (false, 0, bursts)
+            };
 
         if AI_DEBUG {
             let prev_info = prev_cpu.get(&candidate.pane_id);
-            let prev_ticks = prev_info.map(|&(_, ticks, _, _)| ticks).unwrap_or(0);
-            let prev_polls = prev_info.map(|&(_, _, polls, _)| polls).unwrap_or(0);
-            let prev_bursts = prev_info.map(|&(_, _, _, bursts)| bursts).unwrap_or(0);
+            let prev_ticks = prev_info.map(|info| info.last_cpu_ticks).unwrap_or(0);
+            let prev_polls = prev_info.map(|info| info.polls_since_active).unwrap_or(0);
+            let prev_bursts = prev_info.map(|info| info.consecutive_bursts).unwrap_or(0);
             let cpu_delta = current_cpu.saturating_sub(prev_ticks);
             let single_cpu = read_cpu_ticks(ai_pid).unwrap_or(0);
             let single_delta = single_cpu.saturating_sub(prev_ticks);
@@ -368,7 +363,12 @@ pub(super) fn classify_active_panes(
 
         prev_cpu.insert(
             candidate.pane_id.clone(),
-            (ai_pid, current_cpu, new_polls, new_bursts),
+            AiPaneTrack {
+                ai_pid,
+                last_cpu_ticks: current_cpu,
+                polls_since_active: new_polls,
+                consecutive_bursts: new_bursts,
+            },
         );
 
         if is_active {

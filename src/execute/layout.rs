@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use tracing::{debug, info, warn};
 
-use super::{TmuxApi, LAYOUT_CHANGE_SUPPRESSION_MS, SIDEBAR_WIDTH_CHARS};
+use super::{TmuxApi, LAYOUT_CHANGE_SUPPRESSION_MS};
 use crate::cmd::Cmd;
 use crate::model::{Model, PendingRename, PreviewState};
 use crate::tmux::commands;
-use crate::tmux::{quote_tmux, WindowInfo};
+use crate::tmux::{quote_tmux, shell_quote, WindowInfo, SIDEBAR_WIDTH};
 
 async fn query_window_layout<T: TmuxApi>(tmux: &mut T, window_id: &str) -> Option<String> {
     match tmux
@@ -635,14 +635,14 @@ pub(super) async fn choose_home_pane_in_window<T: TmuxApi>(
 pub(super) async fn ensure_sidebar_width<T: TmuxApi>(model: &Model, tmux: &mut T) {
     let width_cmd = commands::pane_width_query(&model.sidebar.pane_id);
     let needs_resize = match tmux.send_command(&width_cmd).await {
-        Ok(output) => output.trim().parse::<u16>().unwrap_or(0) != SIDEBAR_WIDTH_CHARS,
+        Ok(output) => output.trim().parse::<u16>().unwrap_or(0) != SIDEBAR_WIDTH,
         Err(_) => true,
     };
     if needs_resize {
         if let Err(err) = tmux
             .send_command(&commands::resize_pane_width(
                 &model.sidebar.pane_id,
-                SIDEBAR_WIDTH_CHARS,
+                SIDEBAR_WIDTH,
             ))
             .await
         {
@@ -702,10 +702,6 @@ pub(super) fn build_split_window_cmd(target: &str, current_path: Option<&str>) -
     }
 }
 
-fn shell_quote(input: &str) -> String {
-    format!("'{}'", input.replace('\'', "'\\''"))
-}
-
 pub(super) fn build_cd_send_keys_cmd(target: &str, current_path: &str) -> String {
     let command = format!("cd -- {}", shell_quote(current_path));
     format!("send-keys -t {target} {} C-m", quote_tmux(&command))
@@ -742,7 +738,7 @@ pub(super) fn build_sidebar_main_3x2_layout(
         return None;
     }
 
-    let sidebar_sx = SIDEBAR_WIDTH_CHARS as u32;
+    let sidebar_sx = SIDEBAR_WIDTH as u32;
     if root_sx <= sidebar_sx + 3 {
         return None;
     }
@@ -1139,7 +1135,7 @@ pub(super) async fn apply_layout_helper<T: TmuxApi>(
     let _ = tmux
         .send_command(&commands::resize_pane_width(
             &model.sidebar.pane_id,
-            SIDEBAR_WIDTH_CHARS,
+            SIDEBAR_WIDTH,
         ))
         .await;
     match tmux

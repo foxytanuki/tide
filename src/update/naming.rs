@@ -1,14 +1,9 @@
 use tracing::debug;
 
 use crate::model::Model;
-use crate::tree::{find_parent_folder, folder_path_for_path, get_node, FlatNodeKind, TreeNode};
-
-pub(super) fn join_folder_path(prefix: Option<&str>, name: &str) -> String {
-    match prefix {
-        Some(p) => format!("{}:{}", p, name),
-        None => name.to_string(),
-    }
-}
+use crate::tree::{
+    find_parent_folder, folder_path_for_path, get_node, join_folder_path, FlatNodeKind, TreeNode,
+};
 
 pub(super) fn reconstruct_full_name(model: &Model, flat_idx: usize, leaf_name: &str) -> String {
     let mut parts = vec![leaf_name.to_string()];
