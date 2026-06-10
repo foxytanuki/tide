@@ -110,7 +110,7 @@ pub async fn execute_commands<T: TmuxApi>(
             } => handle_follow_to_window(model, tmux, &mut queue, target_window_id).await,
             Cmd::EnsureSidebarWidth => ensure_sidebar_width(model, tmux).await,
             Cmd::ValidateSidebarPanes => validate_sidebar_panes(model, tmux, &mut queue).await,
-            Cmd::ListWindows => handle_list_windows(model, tmux, &mut queue).await,
+            Cmd::ListWindows | Cmd::Resync => handle_list_windows(model, tmux, &mut queue).await,
             Cmd::PollAiProcesses => poll_ai_processes(model, tmux, &mut queue).await,
             Cmd::ApplyLayoutHelper => apply_layout_helper(model, tmux, &mut queue).await,
             Cmd::CheckBorder => check_border(model, tmux).await,

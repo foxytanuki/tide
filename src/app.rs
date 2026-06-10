@@ -32,6 +32,7 @@ const PREVIEW_DEBOUNCE_MS: u64 = 50;
 const INPUT_POLL_MS: u64 = 100;
 const MAX_TMUX_EVENTS_PER_BATCH: usize = 64;
 const TERMINAL_RESPONSE_FILTER_MS: u64 = 2_000;
+const RESYNC_INTERVAL_SECS: u64 = 7;
 
 #[derive(Debug, Default)]
 struct InputFilterState {
@@ -140,6 +141,10 @@ impl App {
         ai_poll_interval.reset();
         ai_poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        let mut resync_interval = tokio::time::interval(Duration::from_secs(RESYNC_INTERVAL_SECS));
+        resync_interval.reset();
+        resync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         let preview_sleep = tokio::time::sleep(Duration::from_secs(86400));
         tokio::pin!(preview_sleep);
 
@@ -195,6 +200,19 @@ impl App {
 
                 _ = ai_poll_interval.tick() => {
                     if !handle_ai_poll_tick(&mut self.model, &mut self.tmux, &mut self.terminal).await {
+                        break;
+                    }
+                }
+
+                _ = resync_interval.tick() => {
+                    if self.ui.pending_preview.is_none()
+                        && !execute_if_any(
+                            &mut self.model,
+                            &mut self.tmux,
+                            &mut self.terminal,
+                            vec![Cmd::Resync],
+                        ).await
+                    {
                         break;
                     }
                 }
@@ -631,7 +649,7 @@ fn process_tmux_event(model: &mut Model, tmux_event: TmuxEvent) -> Vec<Cmd> {
         }
         TmuxEvent::LayoutChange(_) => Vec::new(),
         TmuxEvent::SessionWindowChanged(_, _) => Vec::new(),
-        TmuxEvent::SessionChanged(_, _) => vec![Cmd::ListWindows],
+        TmuxEvent::SessionChanged(_, _) => vec![Cmd::Resync],
         TmuxEvent::PaneOutput(pane_id) => {
             // High-frequency %output stays on the runtime fast path to avoid
             // pushing every pane redraw through the full Msg -> Cmd cycle.
@@ -675,7 +693,7 @@ fn coalesce_commands(cmds: Vec<Cmd>) -> Vec<Cmd> {
 
     let mut result = Vec::new();
     let mut has_render = false;
-    let mut has_list_windows = false;
+    let mut has_resync = false;
     let mut has_ensure_sidebar_width = false;
     let mut has_validate_sidebar_panes = false;
 
@@ -689,9 +707,9 @@ fn coalesce_commands(cmds: Vec<Cmd>) -> Vec<Cmd> {
             Cmd::Render => {
                 has_render = true;
             }
-            Cmd::ListWindows => {
-                if !has_list_windows {
-                    has_list_windows = true;
+            Cmd::ListWindows | Cmd::Resync => {
+                if !has_resync {
+                    has_resync = true;
                     result.push(cmd);
                 }
             }
@@ -1005,7 +1023,7 @@ mod tests {
         let cmds = process_tmux_batch(&mut model, &mut rx, TmuxEvent::WindowAdd("@1".to_string()));
 
         assert_eq!(cmds.len(), 1);
-        assert!(matches!(cmds[0], Cmd::ListWindows));
+        assert!(matches!(cmds[0], Cmd::Resync));
     }
 
     #[test]
@@ -1075,7 +1093,7 @@ mod tests {
         let cmds = process_tmux_batch(&mut model, &mut rx, TmuxEvent::WindowAdd("@2".to_string()));
 
         assert_eq!(cmds.len(), 1);
-        assert!(matches!(cmds[0], Cmd::ListWindows));
+        assert!(matches!(cmds[0], Cmd::Resync));
     }
 
     #[test]
@@ -1108,6 +1126,6 @@ mod tests {
         );
 
         assert_eq!(cmds.len(), 1);
-        assert!(matches!(cmds[0], Cmd::ListWindows));
+        assert!(matches!(cmds[0], Cmd::Resync));
     }
 }

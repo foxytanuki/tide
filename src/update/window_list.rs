@@ -28,7 +28,7 @@ pub(super) fn handle_window_focus_changed(model: &mut Model, window_id: String) 
     vec![
         Cmd::FollowToWindow { window_id },
         Cmd::EnsureSidebarWidth,
-        Cmd::ListWindows,
+        Cmd::Resync,
     ]
 }
 
@@ -51,7 +51,7 @@ pub(super) fn handle_window_renamed(
 
             if pending.observed_count >= super::MISSING_PENDING_RENAME_THRESHOLD {
                 clear_pending_rename(model, &window_id);
-                return vec![Cmd::ListWindows];
+                return vec![Cmd::Resync];
             }
 
             model.renames.last_window_id = Some(window_id.clone());
@@ -74,7 +74,7 @@ pub(super) fn handle_window_renamed(
         }
         Vec::new()
     } else {
-        vec![Cmd::ListWindows]
+        vec![Cmd::Resync]
     }
 }
 

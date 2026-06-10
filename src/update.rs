@@ -54,7 +54,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Cmd> {
         Msg::CloseWindow => handle_close_window(model),
         Msg::ApplyLayoutHelper => vec![Cmd::ApplyLayoutHelper],
         Msg::WindowFocusChanged(window_id) => handle_window_focus_changed(model, window_id),
-        Msg::WindowChanged => vec![Cmd::ListWindows],
+        Msg::WindowChanged => vec![Cmd::Resync],
         Msg::WindowRenamed { window_id, name } => handle_window_renamed(model, window_id, name),
         Msg::WindowListLoaded(windows) => handle_window_list_loaded(model, windows),
         Msg::AiProcessPollResult { panes, windows } => {
@@ -121,7 +121,7 @@ mod tests {
             Cmd::FollowToWindow { window_id: id } if id == window_id
         ));
         assert!(matches!(cmds[1], Cmd::EnsureSidebarWidth));
-        assert!(matches!(cmds[2], Cmd::ListWindows));
+        assert!(matches!(cmds[2], Cmd::Resync));
     }
 
     fn assert_ensure_only(cmds: &[Cmd]) {
@@ -155,9 +155,9 @@ mod tests {
         let second = update(&mut model, Msg::WindowChanged);
 
         assert_eq!(first.len(), 1);
-        assert!(matches!(first[0], Cmd::ListWindows));
+        assert!(matches!(first[0], Cmd::Resync));
         assert_eq!(second.len(), 1);
-        assert!(matches!(second[0], Cmd::ListWindows));
+        assert!(matches!(second[0], Cmd::Resync));
     }
 
     #[test]
@@ -936,7 +936,7 @@ mod tests {
         );
 
         assert_eq!(cmds.len(), 1);
-        assert!(matches!(cmds[0], Cmd::ListWindows));
+        assert!(matches!(cmds[0], Cmd::Resync));
         assert!(!model.renames.pending.contains_key("@1"));
         assert_eq!(model.renames.last_window_id, None);
     }
@@ -953,7 +953,7 @@ mod tests {
         );
 
         assert_eq!(cmds.len(), 1);
-        assert!(matches!(cmds[0], Cmd::ListWindows));
+        assert!(matches!(cmds[0], Cmd::Resync));
     }
 
     #[test]
