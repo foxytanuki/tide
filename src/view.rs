@@ -17,7 +17,7 @@ pub fn render(model: &Model, frame: &mut Frame) {
     frame.render_widget(outer, area);
 
     let footer_height: u16 = match model.mode {
-        Mode::Renaming { .. } | Mode::RenamingFolder { .. } | Mode::CreatingProject => 2,
+        Mode::Renaming { .. } | Mode::RenamingFolder { .. } | Mode::CreatingProject | Mode::Searching => 2,
         _ => 1,
     };
 
@@ -25,7 +25,11 @@ pub fn render(model: &Model, frame: &mut Frame) {
         Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).split(inner);
 
     // Tree area
-    let tree_items = build_tree_items(model, chunks[0].width as usize);
+    let tree_items = if matches!(model.mode, Mode::Searching) {
+        build_search_items(model, chunks[0].width as usize)
+    } else {
+        build_tree_items(model, chunks[0].width as usize)
+    };
 
     frame.render_widget(List::new(tree_items), chunks[0]);
 
@@ -75,6 +79,81 @@ pub fn build_tree_items(model: &Model, width: usize) -> Vec<ListItem<'static>> {
 
     debug_assert_eq!(flat_index, ctx.flat_items.len());
     rendered
+}
+
+pub fn build_search_items(model: &Model, width: usize) -> Vec<ListItem<'static>> {
+    let Some(state) = &model.search_state else {
+        return vec![];
+    };
+    let active_id = model
+        .sidebar
+        .pending_preview_id
+        .as_deref()
+        .unwrap_or(&model.sidebar.window_id);
+
+    state
+        .matches
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| {
+            let selected = idx == state.selection;
+            let is_active = m.window_id == active_id;
+
+            let indices_set: std::collections::HashSet<u32> = m.indices.iter().copied().collect();
+
+            let display_chars: Vec<char> = m.display.chars().collect();
+            let mut base_style = Style::default();
+            if is_active {
+                base_style = base_style.fg(Color::Yellow);
+            }
+            if selected {
+                base_style = base_style.add_modifier(Modifier::REVERSED);
+            }
+
+            let prefix = if is_active { "* " } else { "  " };
+            let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix.to_string(), base_style)];
+
+            let mut current_text = String::new();
+            let mut current_highlighted = false;
+
+            for (char_idx, ch) in display_chars.iter().enumerate() {
+                let is_match = indices_set.contains(&(char_idx as u32));
+                if is_match != current_highlighted {
+                    if !current_text.is_empty() {
+                        let style = if current_highlighted {
+                            base_style
+                                .fg(if selected { Color::White } else { Color::Yellow })
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            base_style
+                        };
+                        spans.push(Span::styled(current_text.clone(), style));
+                        current_text.clear();
+                    }
+                    current_highlighted = is_match;
+                }
+                current_text.push(*ch);
+            }
+            if !current_text.is_empty() {
+                let style = if current_highlighted {
+                    base_style
+                        .fg(if selected { Color::White } else { Color::Yellow })
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    base_style
+                };
+                spans.push(Span::styled(current_text, style));
+            }
+
+            let line_text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            let truncated = truncate(&line_text, width);
+            if truncated == line_text {
+                ListItem::new(Line::from(spans))
+            } else {
+                ListItem::new(truncated).style(base_style)
+            }
+        })
+        .collect()
 }
 
 /// Badge state for a tree item's AI activity indicator.
@@ -370,6 +449,11 @@ fn build_footer_text(model: &Model, width: usize) -> String {
             let line2 = truncate("[enter] ok [esc] cancel", width);
             format!("{}\n{}", line1, line2)
         }
+        Mode::Searching => {
+            let line1 = truncate(&format!("/ {}", model.input_buffer), width);
+            let line2 = truncate("[enter] follow [esc] cancel", width);
+            format!("{}\n{}", line1, line2)
+        }
         Mode::Moving { .. } => truncate("Move: [↑/↓] place [enter] ok [esc] cancel", width),
         Mode::ConfirmClose { .. } => truncate("Close window? [y/n]", width),
     }
@@ -426,6 +510,7 @@ fn input_prefix_len(mode: &Mode) -> Option<u16> {
     match mode {
         Mode::Renaming { .. } | Mode::RenamingFolder { .. } => Some("Rename: ".len() as u16),
         Mode::CreatingProject => Some("Project: ".len() as u16),
+        Mode::Searching => Some("/ ".len() as u16),
         _ => None,
     }
 }

@@ -50,12 +50,24 @@ Launch inside any tmux session. tide creates a 25-column sidebar and takes over 
 | `Enter` / `l` | Select window / expand folder |
 | `h` | Collapse folder / go to parent |
 | `Space` | Toggle folder expand/collapse |
+| `/` | Fuzzy search windows |
 | `c` | Create window |
 | `C` | Create project (folder + window) |
 | `r` | Rename window |
 | `x` | Close window (with confirmation) |
 | `Esc` | Focus right pane |
 | `q` | Quit tide |
+
+### Fuzzy search
+
+Press `/` to fuzzy-search all windows, including ones inside collapsed folders. Matching uses fzf-style scoring against the full window path (e.g. `myapp:editor`).
+
+| Key | Action |
+|-----|--------|
+| (type) | Filter windows |
+| `↑` / `↓`, `Ctrl-p` / `Ctrl-n` | Move selection (live preview) |
+| `Enter` | Follow to the selected window |
+| `Esc` | Cancel and restore the previous window |
 
 ### Window naming convention
 

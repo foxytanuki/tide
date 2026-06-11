@@ -6,6 +6,19 @@ use crate::tree::{
     next_visible_item, FlatItem, FlatNodeKind, TreeNode, WindowInfo,
 };
 
+pub struct SearchMatch {
+    pub window_id: String,
+    pub display: String,
+    pub score: u32,
+    pub indices: Vec<u32>,
+}
+
+pub struct SearchState {
+    pub matches: Vec<SearchMatch>,
+    pub selection: usize,
+    pub pre_search_window_id: Option<String>,
+}
+
 pub struct Model {
     tree: Vec<TreeNode>,
     flat_items: Vec<FlatItem>,
@@ -28,6 +41,7 @@ pub struct Model {
     pub renames: RenameState,
     pub reorder: ReorderState,
     pub ai: AiState,
+    pub search_state: Option<SearchState>,
     pub pending_effects: Vec<PendingEffect>,
     /// Terminal size for mouse hit-testing (width, height).
     pub terminal_size: (u16, u16),
@@ -125,6 +139,7 @@ pub enum Mode {
     CreatingProject,
     Moving { subject: MoveSubject },
     ConfirmClose { window_id: String },
+    Searching,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,6 +246,7 @@ impl Model {
                 recently_finished: HashMap::new(),
             },
             pending_effects: Vec::new(),
+            search_state: None,
             terminal_size: (80, 24),
         }
     }
@@ -275,7 +291,10 @@ impl Model {
     /// Hit-test a terminal row against the rendered tree area.
     pub fn item_at_row(&self, row: u16) -> Option<usize> {
         let footer_height: u16 = match self.mode {
-            Mode::Renaming { .. } | Mode::RenamingFolder { .. } | Mode::CreatingProject => 2,
+            Mode::Renaming { .. }
+            | Mode::RenamingFolder { .. }
+            | Mode::CreatingProject
+            | Mode::Searching => 2,
             _ => 1,
         };
         let tree_y = 1;

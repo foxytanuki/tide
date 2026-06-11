@@ -6,6 +6,7 @@ mod ai;
 mod input;
 mod naming;
 mod navigation;
+mod search;
 mod window_list;
 
 use ai::*;

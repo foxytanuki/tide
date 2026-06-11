@@ -6,6 +6,7 @@ use crate::msg::Msg;
 use crate::tree::{get_node, TreeNode};
 
 use super::naming::{collect_folder_children, reconstruct_full_name};
+use super::search;
 use super::navigation::{
     cancel_move, exit_to_normal_mode, handle_move_enter, handle_move_next, handle_move_prev,
 };
@@ -18,6 +19,7 @@ pub(super) fn handle_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
         Mode::RenamingFolder { .. } => handle_renaming_folder_key(model, event),
         Mode::CreatingProject => handle_creating_project_key(model, event),
         Mode::Moving { .. } => handle_moving_key(model, event),
+        Mode::Searching => search::handle_searching_key(model, event),
         Mode::ConfirmClose { .. } => handle_confirm_close_key(model, event),
     }
 }
@@ -33,7 +35,7 @@ fn char_to_byte_offset(s: &str, char_idx: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-fn handle_input_key(model: &mut Model, code: KeyCode) -> Option<Vec<Cmd>> {
+pub(super) fn handle_input_key(model: &mut Model, code: KeyCode) -> Option<Vec<Cmd>> {
     match code {
         KeyCode::Left => {
             if model.input_cursor > 0 {
@@ -105,6 +107,7 @@ fn handle_normal_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
         KeyCode::Char('h') | KeyCode::Left => update(model, Msg::CollapseOrParent),
         KeyCode::Char(' ') => update(model, Msg::ToggleFolder),
         KeyCode::Esc => update(model, Msg::Escape),
+        KeyCode::Char('/') => search::enter_search_mode(model),
         KeyCode::Char('r') => update(model, Msg::RenameWindow),
         KeyCode::Char('x') => update(model, Msg::CloseWindow),
         KeyCode::Char('c') => update(model, Msg::NewWindow),

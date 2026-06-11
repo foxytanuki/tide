@@ -40,7 +40,7 @@ pub(super) fn clear_mode_if_missing_target(model: &mut Model, windows: &[WindowI
                 windows.iter().all(|w| !w.name.starts_with(&folder_prefix))
             }
         },
-        Mode::Normal | Mode::CreatingProject => false,
+        Mode::Normal | Mode::CreatingProject | Mode::Searching => false,
     };
 
     if should_reset {
