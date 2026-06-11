@@ -179,11 +179,10 @@ fn handle_confirm_close_key(model: &mut Model, event: KeyEvent) -> Vec<Cmd> {
                 vec![]
             }
         }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+        _ => {
             model.mode = Mode::Normal;
             vec![Cmd::Render]
         }
-        _ => vec![],
     }
 }
 

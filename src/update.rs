@@ -287,6 +287,23 @@ mod tests {
     }
 
     #[test]
+    fn close_window_confirmation_treats_other_plain_keys_as_no() {
+        let mut model = test_model();
+        let windows = vec![wi("@1", 1, "dev")];
+        update(&mut model, Msg::WindowListLoaded(windows));
+
+        update(&mut model, Msg::CloseWindow);
+        let cmds = update(
+            &mut model,
+            Msg::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+        );
+
+        assert_eq!(model.mode, Mode::Normal);
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Cmd::Render));
+    }
+
+    #[test]
     fn expected_focus_change_clears_suppression() {
         let mut model = test_model();
         model.sidebar.ignore_window_changes = 2;
